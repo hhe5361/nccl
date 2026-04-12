@@ -1,0 +1,939 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NCCL src Architecture Overview</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #eef4f7;
+      --panel: #ffffff;
+      --panel-soft: #f5f8fb;
+      --text: #16212d;
+      --muted: #5a6978;
+      --border: #d6dee8;
+      --accent: #0d5f86;
+      --accent-soft: #e4f3fb;
+      --good: #14604d;
+      --good-soft: #e8f6f0;
+      --warn: #8a5a08;
+      --warn-soft: #fff4e5;
+      --shadow: 0 14px 34px rgba(18, 36, 56, 0.08);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Helvetica, Arial, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(13, 95, 134, 0.08), transparent 24%),
+        linear-gradient(180deg, #f9fbfd 0%, var(--bg) 100%);
+      line-height: 1.64;
+    }
+
+    .page {
+      width: min(1180px, calc(100% - 32px));
+      margin: 24px auto 48px;
+    }
+
+    .hero,
+    .section,
+    .footer {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+    }
+
+    .hero {
+      padding: 30px 32px;
+      margin-bottom: 18px;
+    }
+
+    .section {
+      padding: 28px 30px;
+      margin-bottom: 18px;
+    }
+
+    .footer {
+      padding: 18px 22px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      padding: 0 12px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+
+    h1 {
+      margin: 14px 0 10px;
+      font-size: clamp(30px, 4vw, 44px);
+      line-height: 1.08;
+    }
+
+    h2 {
+      margin: 0 0 14px;
+      font-size: 24px;
+      line-height: 1.2;
+    }
+
+    h3 {
+      margin: 22px 0 10px;
+      font-size: 18px;
+      line-height: 1.3;
+    }
+
+    p {
+      margin: 10px 0 0;
+    }
+
+    ul,
+    ol {
+      margin: 12px 0 0;
+      padding-left: 22px;
+    }
+
+    li + li {
+      margin-top: 8px;
+    }
+
+    code {
+      font-family: Consolas, "SFMono-Regular", Monaco, monospace;
+      font-size: 0.93em;
+      background: #f2f5fa;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      padding: 1px 6px;
+      color: #1d2a39;
+    }
+
+    .subtitle {
+      margin: 0;
+      max-width: 900px;
+      color: var(--muted);
+      font-size: 16px;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 18px;
+    }
+
+    .chip {
+      border: 1px solid var(--border);
+      background: var(--panel-soft);
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 16px;
+    }
+
+    .grid.three {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .card {
+      background: var(--panel-soft);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+    }
+
+    .card h3 {
+      margin-top: 0;
+    }
+
+    .note,
+    .success,
+    .warn {
+      margin-top: 14px;
+      padding: 14px 16px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+    }
+
+    .note {
+      background: var(--accent-soft);
+      border-color: #c9dfee;
+    }
+
+    .success {
+      background: var(--good-soft);
+      border-color: #c7eadf;
+    }
+
+    .warn {
+      background: var(--warn-soft);
+      border-color: #efd5b2;
+    }
+
+    .flow {
+      margin-top: 14px;
+      padding: 16px 18px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      background: #101823;
+      color: #e7eef8;
+      font-family: Consolas, "SFMono-Regular", Monaco, monospace;
+      font-size: 13px;
+      line-height: 1.74;
+      overflow-x: auto;
+      white-space: pre-wrap;
+    }
+
+    .table-wrap {
+      margin-top: 14px;
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 760px;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      overflow: hidden;
+    }
+
+    th,
+    td {
+      padding: 12px 14px;
+      text-align: left;
+      vertical-align: top;
+      border-bottom: 1px solid var(--border);
+    }
+
+    th {
+      background: #f4f7fb;
+      font-weight: 700;
+      font-size: 14px;
+    }
+
+    tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .small {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .columns {
+      columns: 2;
+      column-gap: 24px;
+      margin-top: 12px;
+    }
+
+    .columns ul {
+      margin-top: 0;
+    }
+
+    @media (max-width: 960px) {
+      .grid,
+      .grid.three {
+        grid-template-columns: 1fr;
+      }
+
+      .columns {
+        columns: 1;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <section class="hero">
+      <span class="eyebrow">NCCL src Architecture</span>
+      <h1>NCCL <code>src/</code> 아키텍처 개요</h1>
+      <p class="subtitle">
+        이 문서는 <code>src/</code> 전체를 기능별 계층으로 다시 묶어서 설명한다. 목표는
+        "API 호출이 어디서 계획되고, 어떤 상태가 <code>comm/channel/connector/plan/proxy</code>를 지나
+        GPU kernel과 transport로 흘러가는가"를 큰 그림으로 잡는 것이다.
+      </p>
+      <div class="meta">
+        <span class="chip">분석 범위: <code>src/</code></span>
+        <span class="chip">총 파일 수: 387</span>
+        <span class="chip">핵심 축: init / graph / enqueue / proxy / device / transport</span>
+        <span class="chip">작성일: 2026-04-13</span>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>한 줄 요약</h2>
+      <div class="grid three">
+        <div class="card">
+          <h3>1. Public API</h3>
+          <p>
+            <code>collectives.cc</code>와 <code>group.cc</code>가 사용자 요청을
+            <code>ncclInfo</code>, task queue, group job으로 바꾼다.
+          </p>
+        </div>
+        <div class="card">
+          <h3>2. Communicator / Topology</h3>
+          <p>
+            <code>init.cc</code>, <code>bootstrap.cc</code>, <code>graph/*</code>,
+            <code>channel.cc</code>가 rank 집합, topology, ring/tree/NVLS/CollNet 구조를 만든다.
+          </p>
+        </div>
+        <div class="card">
+          <h3>3. Planner</h3>
+          <p>
+            <code>enqueue.cc</code>가 task를 채널별 work와 proxy op로 분해하고,
+            kernel args와 launch plan을 만든다.
+          </p>
+        </div>
+        <div class="card">
+          <h3>4. Proxy / Transport</h3>
+          <p>
+            <code>proxy.cc</code>와 <code>transport/*</code>가 host-side progress를 수행하며,
+            P2P, SHM, NET, CollNet, NVLS 경로를 실제로 연결한다.
+          </p>
+        </div>
+        <div class="card">
+          <h3>5. Device Kernel</h3>
+          <p>
+            <code>device/*</code>는 채널당 block 단위로 실행되며,
+            loop/chunk/slot 수준의 collective primitive를 수행한다.
+          </p>
+        </div>
+        <div class="card">
+          <h3>6. Cross-Cutting</h3>
+          <p>
+            <code>plugin/*</code>, <code>register/*</code>, <code>rma/*</code>,
+            <code>misc/*</code>, <code>ras/*</code>, <code>include/*</code>가
+            확장성, 버퍼 등록, 진단, 플랫폼 지원을 맡는다.
+          </p>
+        </div>
+      </div>
+      <div class="note">
+        가장 중요한 관찰은 이것이다. <code>NCCL</code>은 단순한 kernel 집합이 아니라,
+        <strong>host planner + proxy progress engine + device primitive library</strong>가
+        결합된 런타임이다.
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>먼저 잡아야 하는 핵심 객체</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>객체</th>
+              <th>어디에 있나</th>
+              <th>역할</th>
+              <th>이 객체를 이해하면 보이는 것</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>ncclComm</code></td>
+              <td><code>include/comm.h</code></td>
+              <td>communicator 전체 상태. topology, channels, planner, proxy, plugin, mem manager를 다 품는다.</td>
+              <td>NCCL이 왜 "상태 머신"처럼 보이는지</td>
+            </tr>
+            <tr>
+              <td><code>ncclChannel</code></td>
+              <td><code>include/comm.h</code></td>
+              <td>실행 lane. ring/tree/NVLS peer 관계와 per-channel peer endpoint를 보유한다.</td>
+              <td>Figure 3의 channel과 kernel의 <code>blockIdx.x</code> 매핑</td>
+            </tr>
+            <tr>
+              <td><code>ncclChannelPeer</code>, <code>ncclConnInfo</code></td>
+              <td><code>include/device.h</code></td>
+              <td>peer별 send/recv endpoint와 slot buffer, head/tail, connFifo 메타데이터를 표현한다.</td>
+              <td>slot pipeline과 transport staging 구조</td>
+            </tr>
+            <tr>
+              <td><code>ncclTask*</code></td>
+              <td><code>include/comm.h</code></td>
+              <td>API 호출이 enqueue 단계에서 변환된 host-side 작업 단위다.</td>
+              <td>user API가 바로 kernel launch로 가지 않는 이유</td>
+            </tr>
+            <tr>
+              <td><code>ncclKernelPlan</code></td>
+              <td><code>include/comm.h</code></td>
+              <td>하나의 launch batch. channel mask, work batch, kernel args, proxy ops를 담는다.</td>
+              <td>planner가 실제 launch 단위로 무엇을 묶는지</td>
+            </tr>
+            <tr>
+              <td><code>ncclProxyOp</code>, <code>ncclProxyArgs</code></td>
+              <td><code>include/proxy.h</code></td>
+              <td>host proxy가 수행할 send/recv/progress 단위다.</td>
+              <td>network progress가 kernel 밖에서 어떻게 계속되는지</td>
+            </tr>
+            <tr>
+              <td><code>Primitives&lt;...&gt;</code></td>
+              <td><code>device/primitives.h</code></td>
+              <td>device-side send/recv/reduce/copy 미세 연산을 protocol별로 구현한다.</td>
+              <td><code>all_reduce.h</code>와 <code>prims_simple.h</code>의 관계</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="success">
+        구조만 먼저 기억하면 된다. <code>comm</code>가 전체 컨테이너이고,
+        <code>channel</code>이 lane이며, <code>connector/conn</code>가 peer endpoint이고,
+        <code>plan</code>이 launch batch이며, <code>proxy</code>가 host progress를 담당한다.
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>초기화 흐름</h2>
+      <p>
+        communicator를 만드는 경로와 collective를 실행하는 경로는 다르다. 먼저 <code>ncclCommInitRank</code>
+        시점에 전체 통신 구조가 만들어진다.
+      </p>
+      <div class="flow">ncclGetUniqueId / ncclCommInitRank
+  -> init.cc : global env init, bootstrap net init
+  -> bootstrap.cc : OOB socket/net bootstrap, peer info exchange
+  -> init.cc : peerInfo allgather, local/node rank derivation
+  -> graph/topo.cc + xml.cc : hardware/topology model build
+  -> graph/paths.cc : GPU/GPU, GPU/NIC path classification, P2P/GDR checks
+  -> graph/search.cc + tuning.cc : ring/tree/CollNet/NVLS graph search and tuning
+  -> graph/connect.cc : prev/next/up/down/head mappings materialized into channels
+  -> channel.cc : host/device channel peer tables allocated
+  -> transport.cc : per peer / per channel transport selection and connect exchange
+  -> proxy.cc + plugin/* : proxy state, net plugin, profiler, tuner, gin init
+  -> devComm copied to GPU memory
+  -> communicator ready</div>
+      <ol>
+        <li><code>collective</code> 이전에 topology와 graph가 먼저 결정된다. 이 단계가 끝나야 어떤 channel이 어떤 peer와 어떤 transport를 쓰는지 정해진다.</li>
+        <li><code>graph/*</code>는 단순 탐색이 아니라, 실제 bandwidth/path 제약을 고려해 ring/tree/NVLS 배치를 산출한다.</li>
+        <li><code>transport.cc</code>는 각 channel-peer에 대해 P2P, SHM, NET, CollNet 중 무엇을 쓸지 선택하고 <code>ncclConnect</code> 정보를 교환한다.</li>
+        <li><code>channel.cc</code>는 이 결과를 host/device 양쪽에서 접근 가능한 channel peer 구조체로 고정한다.</li>
+      </ol>
+    </section>
+
+    <section class="section">
+      <h2>Collective 실행 흐름</h2>
+      <p>
+        초기화가 끝난 뒤 실제 데이터 경로는 <code>API -> task -> plan -> kernel + proxy -> transport</code> 순서로 진행된다.
+      </p>
+      <div class="flow">ncclAllReduce / ncclSend / ncclRecv
+  -> collectives.cc : ncclInfo 생성
+  -> group.cc : group batching, async job orchestration, preconnect
+  -> enqueue.cc : argcheck, algorithm/protocol 결정, task queue 소비
+  -> enqueue.cc : channel partition, work batch 구성, proxy op 생성
+  -> ncclKernelPlan 생성
+  -> launch : kernel args + proxy queue submit
+  -> device/common.h : blockIdx.x -> channelId
+  -> device/all_reduce.h 등 : loop/chunk 단위 collective 알고리즘 수행
+  -> device/prims_*.h : slot 단위 send/recv/reduce/copy
+  -> proxy.cc : host progress thread가 proxy op 소비
+  -> transport/net.cc / p2p.cc / shm.cc / coll_net.cc : 실제 isend/irecv/IPC/SHM progress
+  -> net_ib/p2p.cc 또는 plugin backend : RDMA verbs / socket / offload backend 호출
+  -> completion / head-tail update / next slot reuse
+  -> plan 완료</div>
+      <div class="grid">
+        <div class="card">
+          <h3>Figure 3와의 대응</h3>
+          <p>
+            host planner가 channel별 범위를 나누고, device algorithm 파일이
+            loop와 chunk를 돌며, <code>prims_simple.h</code> 계층이 slot pipeline을 구현한다.
+          </p>
+        </div>
+        <div class="card">
+          <h3>실제 progress 주체</h3>
+          <p>
+            GPU kernel은 데이터 생산/소비와 ready publish를 하고,
+            NIC 주입과 request completion test는 주로 host proxy가 담당한다.
+          </p>
+        </div>
+      </div>
+      <div class="warn">
+        이 구조 때문에 congestion control이나 receiver-driven admission 같은 실험은
+        kernel보다 먼저 <code>proxy</code>와 <code>transport</code>에서 보는 편이 맞다.
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>디렉터리 지도</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>디렉터리</th>
+              <th>파일 수</th>
+              <th>주된 책임</th>
+              <th>언제 읽어야 하나</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>src/</code> 루트</td>
+              <td>22</td>
+              <td>API, init, planner, proxy, build entry</td>
+              <td>가장 먼저</td>
+            </tr>
+            <tr>
+              <td><code>src/include/</code></td>
+              <td>171</td>
+              <td>모든 계층의 상태/ABI/도우미 선언</td>
+              <td>구조체와 인터페이스가 헷갈릴 때</td>
+            </tr>
+            <tr>
+              <td><code>src/transport/</code></td>
+              <td>69</td>
+              <td>P2P, SHM, NET, CollNet, NVLS, IB backend</td>
+              <td>실제 데이터 이동을 보고 싶을 때</td>
+            </tr>
+            <tr>
+              <td><code>src/device/</code></td>
+              <td>34</td>
+              <td>GPU kernel과 collective primitive</td>
+              <td>Figure 3의 loop/chunk/slot을 따라갈 때</td>
+            </tr>
+            <tr>
+              <td><code>src/plugin/</code></td>
+              <td>31</td>
+              <td>외부 net/tuner/profiler/gin plugin loader</td>
+              <td>확장 포인트를 볼 때</td>
+            </tr>
+            <tr>
+              <td><code>src/graph/</code></td>
+              <td>12</td>
+              <td>topology graph 생성, path 분석, ring/tree search, tuning</td>
+              <td>초기화 경로를 이해할 때</td>
+            </tr>
+            <tr>
+              <td><code>src/misc/</code></td>
+              <td>17</td>
+              <td>CUDA/NVML/IB wrapper, socket, utils, params</td>
+              <td>보조 유틸이 궁금할 때</td>
+            </tr>
+            <tr>
+              <td><code>src/ras/</code></td>
+              <td>8</td>
+              <td>RAS monitoring / health / client</td>
+              <td>운영/진단 기능을 볼 때</td>
+            </tr>
+            <tr>
+              <td><code>src/nccl_device/</code></td>
+              <td>6</td>
+              <td>device communication requirements, gin/lsa helper</td>
+              <td>새 device capability API를 볼 때</td>
+            </tr>
+            <tr>
+              <td><code>src/register/</code></td>
+              <td>4</td>
+              <td>registered/direct buffer path 준비</td>
+              <td>user buffer direct path를 볼 때</td>
+            </tr>
+            <tr>
+              <td><code>src/rma/</code></td>
+              <td>4</td>
+              <td>put/signal/waitSignal RMA 경로</td>
+              <td>collective 외 API를 볼 때</td>
+            </tr>
+            <tr>
+              <td><code>src/scheduler/</code></td>
+              <td>3</td>
+              <td>specialized scheduling, symmetric / allgatherv</td>
+              <td>planner의 분기점이 궁금할 때</td>
+            </tr>
+            <tr>
+              <td><code>src/gin/</code></td>
+              <td>3</td>
+              <td>GIN host-side integration and proxy support</td>
+              <td>GIN 기반 offload/control path를 볼 때</td>
+            </tr>
+            <tr>
+              <td><code>src/os/</code></td>
+              <td>3</td>
+              <td>OS abstraction</td>
+              <td>플랫폼 분기만 볼 때</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>루트 파일 맵</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>파일</th>
+              <th>역할</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>CMakeLists.txt</code>, <code>Makefile</code></td><td><code>src/</code> 빌드 엔트리.</td></tr>
+            <tr><td><code>allocator.cc</code></td><td>사용자 메모리 할당 API와 shadow pool / segment allocator 같은 메모리 보조 구조.</td></tr>
+            <tr><td><code>bootstrap.cc</code></td><td>communicator 초기화용 out-of-band bootstrap 네트워크, send/recv/allgather/barrier 구현.</td></tr>
+            <tr><td><code>ce_coll.cc</code></td><td>copy engine 기반 collective 실행 경로.</td></tr>
+            <tr><td><code>channel.cc</code></td><td><code>ncclChannel</code>, peer table, device peer pointer 초기화와 해제.</td></tr>
+            <tr><td><code>collectives.cc</code></td><td>사용자-facing NCCL API 엔트리. <code>ncclAllReduce</code> 같은 함수가 여기 있다.</td></tr>
+            <tr><td><code>debug.cc</code></td><td>로그, debug level, subsystem mask, timestamp, error string 관리.</td></tr>
+            <tr><td><code>dev_runtime.cc</code></td><td>window registration, devComm 생성, device runtime capabilities 노출.</td></tr>
+            <tr><td><code>enhcompat.cc</code></td><td>정적 링크 호환성을 위한 weak CUDA symbol shim.</td></tr>
+            <tr><td><code>enqueue.cc</code></td><td>가장 중요한 planner. task를 channel work, work batch, proxy op, kernel plan으로 바꾼다.</td></tr>
+            <tr><td><code>group.cc</code></td><td><code>ncclGroupStart/End</code>, async job orchestration, preconnect, grouped launch 관리.</td></tr>
+            <tr><td><code>init.cc</code></td><td>communicator lifecycle 전체. topology, graph, transport, plugin, tuner 초기화 중심축.</td></tr>
+            <tr><td><code>init_nvtx.cc</code></td><td>NVTX payload enum/schema 등록.</td></tr>
+            <tr><td><code>libnccl.map</code></td><td>export symbol map.</td></tr>
+            <tr><td><code>mem_manager.cc</code></td><td>persistent/scratch/offload memory tracking과 suspend/resume 지원.</td></tr>
+            <tr><td><code>mnnvl.cc</code></td><td>multi-node NVLink 가능성 체크.</td></tr>
+            <tr><td><code>nccl.h.in</code></td><td>public API header template.</td></tr>
+            <tr><td><code>nccl.pc.in</code></td><td><code>pkg-config</code> template.</td></tr>
+            <tr><td><code>proxy.cc</code></td><td>proxy service/progress thread, op pooling, response tracking, lifecycle 관리.</td></tr>
+            <tr><td><code>sym_kernels.cc</code></td><td>symmetric kernel selection과 device work 변환.</td></tr>
+            <tr><td><code>transport.cc</code></td><td>transport registry와 per-peer / per-channel transport connect orchestration.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2><code>graph/</code> 파일 맵</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>파일</th>
+              <th>역할</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>topo.cc</code></td><td>GPU, NIC, PCI, CPU node를 topology system graph로 만들고 정규화한다.</td></tr>
+            <tr><td><code>xml.cc</code></td><td>topology XML parse/dump/fuse 로직. topology를 파일과 교환할 때 기준이 된다.</td></tr>
+            <tr><td><code>paths.cc</code></td><td>GPU-GPU, GPU-NIC path type과 bandwidth, P2P/GDR 가능 여부를 계산한다.</td></tr>
+            <tr><td><code>search.cc</code></td><td>bandwidth/path 제약 아래에서 ring/tree/NVLS graph를 탐색하고 점수화한다.</td></tr>
+            <tr><td><code>rings.cc</code></td><td>ring 순서를 빌드하는 helper.</td></tr>
+            <tr><td><code>trees.cc</code></td><td>binary/double tree 구조 helper.</td></tr>
+            <tr><td><code>connect.cc</code></td><td>search 결과를 실제 channel의 <code>prev/next/up/down</code> 연결 정보로 materialize한다.</td></tr>
+            <tr><td><code>tuning.cc</code></td><td>algorithm/protocol 성능 모델과 tuning constant 계산.</td></tr>
+            <tr><td><code>rings.h</code>, <code>topo.h</code>, <code>xml.h</code></td><td>graph 계층 public/internal interface.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note">
+        <code>graph/*</code>는 "초기화용 사전 계산기"다. collective가 호출될 때마다 전체 topology를 다시 풀지 않도록,
+        통신 lane 구조를 communicator 생성 시점에 먼저 고정한다.
+      </div>
+    </section>
+
+    <section class="section">
+      <h2><code>transport/</code> 파일 맵</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>파일</th>
+              <th>역할</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>generic.cc</code></td><td>ring/tree/PAT 수준의 generic transport wiring helper.</td></tr>
+            <tr><td><code>p2p.cc</code></td><td>intra-node CUDA P2P / IPC transport.</td></tr>
+            <tr><td><code>shm.cc</code></td><td>shared memory transport. host shared buffer 기반 intra-node 경로.</td></tr>
+            <tr><td><code>net.cc</code></td><td>generic network transport. proxy setup, staging buffer, send/recv progress의 중심 파일.</td></tr>
+            <tr><td><code>coll_net.cc</code></td><td>CollNet offload transport와 관련 proxy progress.</td></tr>
+            <tr><td><code>net_socket.cc</code></td><td>socket 기반 net backend reference implementation.</td></tr>
+            <tr><td><code>nvls.cc</code></td><td>NVLS buffer setup, registration, connect/free 로직.</td></tr>
+            <tr><td><code>profiler.cc</code></td><td>transport라기보다 profiler event polling을 위한 proxy transport hook.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3><code>transport/net_ib/</code> 하위 구현</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>파일</th>
+              <th>역할</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>init.cc</code></td><td>IB/RoCE device discovery, virtual device 구성, net backend 초기화.</td></tr>
+            <tr><td><code>connect.cc</code></td><td>QP/CQ 생성과 RTR/RTS 전이, GID/SL/TC/QP-per-connection 설정.</td></tr>
+            <tr><td><code>common.cc</code>, <code>common.h</code></td><td>IB send/recv comm 공통 상태와 request/CTS FIFO 구조 정의.</td></tr>
+            <tr><td><code>p2p.cc</code></td><td><code>ncclIbIsend</code>, <code>ncclIbIrecv</code>, <code>ncclIbPostFifo</code>. 실제 verbs data path와 CTS path 핵심.</td></tr>
+            <tr><td><code>reg.cc</code></td><td>MR registration / deregistration.</td></tr>
+            <tr><td><code>gdr.cc</code></td><td>GDR, peer memory, DMA-BUF 지원 검사.</td></tr>
+            <tr><td><code>p2p_resiliency.cc</code></td><td>port failover와 completion error 대응.</td></tr>
+            <tr><td><code>gin.cc</code></td><td>GIN over IB 경로.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="success">
+        receiver-driven이나 CTS 실험 관점에서 가장 먼저 볼 파일은
+        <code>transport/net.cc</code>, <code>transport/net_ib/p2p.cc</code>,
+        <code>include/proxy.h</code>다.
+      </div>
+    </section>
+
+    <section class="section">
+      <h2><code>device/</code> 파일 맵</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>파일군</th>
+              <th>역할</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td><code>common.cu</code>, <code>common.h</code>, <code>common_kernel.h</code></td><td>kernel entry, shared memory layout, block/channel 공통 runtime.</td></tr>
+            <tr><td><code>all_reduce.h</code>, <code>all_gather.h</code>, <code>all_gather_v.h</code>, <code>broadcast.h</code>, <code>reduce.h</code>, <code>reduce_scatter.h</code>, <code>sendrecv.h</code></td><td>collective 알고리즘 본체. loop/chunk/rank-step을 여기서 본다.</td></tr>
+            <tr><td><code>primitives.h</code></td><td>protocol-parameterized primitive abstraction의 진입점.</td></tr>
+            <tr><td><code>prims_simple.h</code></td><td>Simple protocol slot FIFO 기반 data path 핵심.</td></tr>
+            <tr><td><code>prims_ll.h</code>, <code>prims_ll128.h</code></td><td>LL / LL128 protocol 구현.</td></tr>
+            <tr><td><code>reduce_kernel.h</code>, <code>op128.h</code></td><td>reduction primitive와 연산 helper.</td></tr>
+            <tr><td><code>onerank.cu</code></td><td>single-rank fast path.</td></tr>
+            <tr><td><code>generate.py</code></td><td>device code generation helper.</td></tr>
+            <tr><td><code>symmetric/*.cuh</code></td><td>symmetric kernel 전용 collective / primitive / scratch helper.</td></tr>
+            <tr><td><code>symmetric/generate.py</code></td><td>symmetric kernel code generation helper.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="note">
+        Figure 3를 실제 코드로 매핑하려면 보통 이 순서가 가장 좋다.
+        <code>enqueue.cc</code>에서 channel 분할을 보고,
+        <code>device/all_reduce.h</code>에서 loop/chunk를 보고,
+        <code>device/prims_simple.h</code>에서 slot pipeline을 본다.
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>보조 서브시스템</h2>
+
+      <h3><code>register/</code></h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>파일</th><th>역할</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>register.cc</code></td><td>buffer registration cache와 public register/deregister API.</td></tr>
+            <tr><td><code>coll_reg.cc</code></td><td>collective direct/reg path용 buffer registration 준비.</td></tr>
+            <tr><td><code>sendrecv_reg.cc</code></td><td>P2P send/recv용 IPC/NET registration helper.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3><code>scheduler/</code></h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>파일</th><th>역할</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>symmetric_sched.cc</code></td><td>symmetric task를 묶어 specialized symmetric kernel로 보내는 scheduler.</td></tr>
+            <tr><td><code>allgatherv_sched.cc</code></td><td>allgatherv/bcast 계열 scheduling helper.</td></tr>
+            <tr><td><code>scheduler.h</code></td><td>scheduler 계층 interface.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3><code>rma/</code></h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>파일</th><th>역할</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>rma.cc</code></td><td>put/signal/waitSignal launch 경로와 CE/proxy 분기.</td></tr>
+            <tr><td><code>rma_ce.cc</code></td><td>copy engine 기반 RMA path.</td></tr>
+            <tr><td><code>rma_proxy.cc</code></td><td>GIN 기반 proxy-side RMA progress와 registration.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3><code>plugin/</code></h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>파일군</th><th>역할</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>plugin_open.cc</code></td><td>동적 plugin open/close helper.</td></tr>
+            <tr><td><code>net.cc</code></td><td>external net/collnet plugin load, assign, finalize.</td></tr>
+            <tr><td><code>tuner.cc</code></td><td>external tuner plugin loader.</td></tr>
+            <tr><td><code>profiler.cc</code></td><td>profiler plugin integration.</td></tr>
+            <tr><td><code>gin.cc</code></td><td>GIN plugin loader.</td></tr>
+            <tr><td><code>env.cc</code></td><td>env plugin 초기화.</td></tr>
+            <tr><td><code>plugin/net/*</code>, <code>plugin/tuner/*</code>, <code>plugin/profiler/*</code>, <code>plugin/gin/*</code></td><td>버전별 compatibility wrapper.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3><code>gin/</code> 와 <code>nccl_device/</code></h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>파일</th><th>역할</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>gin/gin_host.cc</code></td><td>GIN host-side connect/register/signal/counter allocator.</td></tr>
+            <tr><td><code>gin/gin_host_proxy.cc</code></td><td>GIN host proxy context 생성과 progress.</td></tr>
+            <tr><td><code>nccl_device/core.cc</code></td><td>device requirements core.</td></tr>
+            <tr><td><code>nccl_device/ll_a2a.cc</code></td><td>LL all-to-all capability requirement.</td></tr>
+            <tr><td><code>nccl_device/gin_barrier.cc</code>, <code>gin_scratch.cc</code>, <code>lsa_barrier.cc</code></td><td>GIN/LSA 관련 device requirement helper.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3><code>misc/</code>, <code>os/</code>, <code>ras/</code></h3>
+      <div class="grid">
+        <div class="card">
+          <h3><code>misc/</code></h3>
+          <p class="small">주요 파일군</p>
+          <ul>
+            <li><code>argcheck.cc</code>, <code>param.cc</code>, <code>utils.cc</code>: 공통 helper와 env parameter.</li>
+            <li><code>cudawrap.cc</code>, <code>gdrwrap.cc</code>, <code>ibvwrap.cc</code>, <code>mlx5dvwrap.cc</code>, <code>nvmlwrap.cc</code>: runtime symbol loading wrapper.</li>
+            <li><code>ibvsymbols.cc</code>, <code>mlx5dvsymbols.cc</code>, <code>git_version.cc</code>: symbol/version helper.</li>
+            <li><code>socket.cc</code>, <code>ipcsocket.cc</code>, <code>shmutils.cc</code>, <code>strongstream.cc</code>: IPC, socket, stream utility.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3><code>os/</code></h3>
+          <ul>
+            <li><code>linux.cc</code>: Linux-specific OS utility.</li>
+            <li><code>windows.cc</code>: Windows-specific OS utility.</li>
+            <li><code>os.h</code>: OS abstraction interface.</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3><code>ras/</code></h3>
+          <ul>
+            <li><code>ras.cc</code>: RAS core service.</li>
+            <li><code>collectives.cc</code>: RAS collective query aggregation.</li>
+            <li><code>peers.cc</code>: peer update and dead peer handling.</li>
+            <li><code>rasnet.cc</code>: connection/socket/link management.</li>
+            <li><code>client.cc</code>, <code>client_support.cc</code>: external RAS client CLI and support.</li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2><code>include/</code> 헤더 패밀리</h2>
+      <p>
+        <code>include/</code>는 파일 수가 171개로 가장 크다. 여기서는 파일 하나씩이 아니라 인터페이스 계층으로 보는 것이 맞다.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>패밀리</th>
+              <th>대표 파일</th>
+              <th>의미</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Core runtime state</td>
+              <td><code>comm.h</code>, <code>device.h</code>, <code>collectives.h</code>, <code>proxy.h</code></td>
+              <td>NCCL 전체 구조체 계층. 가장 먼저 봐야 하는 헤더군.</td>
+            </tr>
+            <tr>
+              <td>API / lifecycle</td>
+              <td><code>group.h</code>, <code>enqueue.h</code>, <code>channel.h</code>, <code>bootstrap.h</code></td>
+              <td>API 호출이 init/planner로 넘어가는 경계.</td>
+            </tr>
+            <tr>
+              <td>Transport / network</td>
+              <td><code>transport.h</code>, <code>net.h</code>, <code>coll_net.h</code>, <code>p2p.h</code>, <code>shm.h</code></td>
+              <td>transport backend interface와 capability.</td>
+            </tr>
+            <tr>
+              <td>Topology / tuning</td>
+              <td><code>graph.h</code>, <code>trees.h</code>, <code>tuner.h</code></td>
+              <td>topology graph와 tuning model interface.</td>
+            </tr>
+            <tr>
+              <td>Runtime / memory / registration</td>
+              <td><code>allocator.h</code>, <code>alloc.h</code>, <code>mem_manager.h</code>, <code>register.h</code>, <code>dev_runtime.h</code>, <code>ce_coll.h</code></td>
+              <td>memory, registration, dev runtime, copy engine 지원.</td>
+            </tr>
+            <tr>
+              <td>Diagnostics / wrappers</td>
+              <td><code>debug.h</code>, <code>param.h</code>, <code>utils.h</code>, <code>cudawrap.h</code>, <code>nvmlwrap.h</code>, <code>ibvwrap.h</code>, <code>os.h</code></td>
+              <td>보조 기능과 플랫폼 wrapper.</td>
+            </tr>
+            <tr>
+              <td>Subdirectory families</td>
+              <td><code>include/plugin/*</code>, <code>include/gin/*</code>, <code>include/rma/*</code>, <code>include/nccl_device/*</code></td>
+              <td>확장 기능별 세부 ABI.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>어디서부터 읽으면 좋은가</h2>
+      <div class="grid">
+        <div class="card">
+          <h3>초기화 경로를 보고 싶다면</h3>
+          <ol>
+            <li><code>init.cc</code></li>
+            <li><code>bootstrap.cc</code></li>
+            <li><code>graph/topo.cc</code> -> <code>paths.cc</code> -> <code>search.cc</code> -> <code>connect.cc</code></li>
+            <li><code>channel.cc</code></li>
+            <li><code>transport.cc</code></li>
+          </ol>
+        </div>
+        <div class="card">
+          <h3>AllReduce 실행 경로를 보고 싶다면</h3>
+          <ol>
+            <li><code>collectives.cc</code></li>
+            <li><code>group.cc</code></li>
+            <li><code>enqueue.cc</code></li>
+            <li><code>device/all_reduce.h</code></li>
+            <li><code>device/prims_simple.h</code></li>
+            <li><code>transport/net.cc</code> 또는 <code>transport/p2p.cc</code></li>
+          </ol>
+        </div>
+        <div class="card">
+          <h3>receiver-driven / CTS 실험을 하고 싶다면</h3>
+          <ol>
+            <li><code>include/proxy.h</code></li>
+            <li><code>transport/net.cc</code></li>
+            <li><code>transport/net_ib/p2p.cc</code></li>
+            <li><code>device/prims_simple.h</code></li>
+            <li><code>enqueue.cc</code></li>
+          </ol>
+        </div>
+      </div>
+      <div class="warn">
+        처음부터 <code>device/*</code>만 보면 큰 그림을 놓치기 쉽다. NCCL은 kernel 라이브러리라기보다
+        <strong>planner와 proxy가 강하게 결합된 통신 런타임</strong>이기 때문에,
+        host-side 상태와 transport 계층을 함께 봐야 구조가 맞게 잡힌다.
+      </div>
+    </section>
+
+    <section class="footer">
+      이 문서는 <code>src/</code>를 아키텍처 관점에서 재구성한 지도다. 다음 단계로는
+      <code>AllReduce</code> 하나를 골라 <code>collectives.cc -> enqueue.cc -> device/all_reduce.h -> prims_simple.h -> transport/net.cc -> transport/net_ib/p2p.cc</code>
+      call chain을 순서대로 추적하면 된다.
+    </section>
+  </div>
+</body>
+</html>

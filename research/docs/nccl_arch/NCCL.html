@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NCCL Paper</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --text: #18212f;
+      --muted: #5f6b7a;
+      --border: #d7dfeb;
+      --accent: #0b63ce;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Helvetica, Arial, sans-serif;
+      background: linear-gradient(180deg, #eef3fb 0%, var(--bg) 100%);
+      color: var(--text);
+    }
+
+    .page {
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 16px;
+      padding: 20px;
+    }
+
+    .header {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px 18px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .title {
+      margin: 0;
+      font-size: 20px;
+      line-height: 1.2;
+    }
+
+    .subtitle {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 40px;
+      padding: 0 14px;
+      border-radius: 10px;
+      border: 1px solid var(--accent);
+      background: var(--accent);
+      color: #fff;
+      text-decoration: none;
+      font-weight: 600;
+    }
+
+    .button.secondary {
+      background: #fff;
+      color: var(--accent);
+    }
+
+    .viewer {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      overflow: hidden;
+      min-height: 0;
+    }
+
+    .viewer object {
+      display: block;
+      width: 100%;
+      height: calc(100vh - 122px);
+      border: 0;
+      background: #e9eef6;
+    }
+
+    .fallback {
+      padding: 24px;
+      color: var(--muted);
+      font-size: 15px;
+    }
+
+    @media (max-width: 720px) {
+      .page {
+        padding: 12px;
+      }
+
+      .viewer object {
+        height: calc(100vh - 150px);
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="header">
+      <div>
+        <h1 class="title">NCCL Paper</h1>
+        <p class="subtitle">HTML wrapper for <code>NCCL.pdf</code></p>
+      </div>
+      <div class="actions">
+        <a class="button" href="./NCCL.pdf" target="_blank" rel="noopener noreferrer">Open PDF</a>
+        <a class="button secondary" href="./NCCL.pdf" download>Download PDF</a>
+      </div>
+    </header>
+
+    <main class="viewer">
+      <object data="./NCCL.pdf" type="application/pdf">
+        <div class="fallback">
+          This browser cannot render the embedded PDF. Use
+          <a href="./NCCL.pdf">this link</a> to open it directly.
+        </div>
+      </object>
+    </main>
+  </div>
+</body>
+</html>
