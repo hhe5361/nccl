@@ -18,6 +18,7 @@ enum ncclIbRequestMatchingScheme {
 NCCL_PARAM(IbArThreshold, "IB_AR_THRESHOLD", 8192);
 // By default, use ncclIbRequestMatchingScheme::BY_INDEX matching scheme.
 NCCL_PARAM(IbReceiverSideMatchingScheme, "IB_RECEIVER_SIDE_MATCHING_SCHEME", 0);
+extern int64_t ncclParamPhase0Log();
 
 const char* ncclIbReqTypeStr[] = { "Unused", "Send", "Recv", "Flush", "IPut" };
 
@@ -253,6 +254,20 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
 
   TRACE(NCCL_NET, "NET/IB: %s: Send request posted (req=%p, comm=%p, id=%ld, slot=%d, nreqs=%d, wr_id=%ld)", __func__, reqs[0], reqs[0]->base, reqs[0]->id, slot, nreqs, wr_id);
 
+  if (ncclParamPhase0Log()) {
+    size_t totalSize = 0;
+    for (int r = 0; r < nreqs; r++) totalSize += reqs[r]->send.size;
+    INFO(NCCL_NET,
+        "PHASE0 event=IB_SEND_POST reqId=%llu slot=%d nreqs=%d size=%llu remoteIdx=%llu tag=%d comm=%p",
+        (unsigned long long)reqs[0]->id,
+        slot,
+        nreqs,
+        (unsigned long long)totalSize,
+        (unsigned long long)slots[0].idx,
+        slots[0].tag,
+        reqs[0]->base);
+  }
+
   return ncclSuccess;
 }
 
@@ -405,6 +420,20 @@ ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, struct ncclIbRequest* r
   NCCLCHECK(wrap_ibv_post_send(ctsQp->qp, &wr, &bad_wr));
 
   TRACE(NCCL_NET, "NET/IB: %s: CTS posted (req=%p, comm=%p, id=%ld, slot=%d, nreqs=%d, wr_id=%ld, opcode=%d, send_flags=%d, qp_num=%u)", __func__, req, req->base, req->id, slot, req->nreqs, wr.wr_id, wr.opcode, wr.send_flags, ctsQp->qp->qp_num);
+
+  if (ncclParamPhase0Log()) {
+    INFO(NCCL_NET,
+        "PHASE0 event=IB_CTS_ISSUE reqId=%llu slot=%d nreqs=%d ctsBytes=%u idx=%llu addr=0x%llx rkey=0x%x qp=%u comm=%p",
+        (unsigned long long)req->id,
+        slot,
+        req->nreqs,
+        wr.sg_list[0].length,
+        (unsigned long long)localElem[0].idx,
+        (unsigned long long)localElem[0].addr,
+        localElem[0].rkeys[0],
+        ctsQp->qp->qp_num,
+        req->base);
+  }
 
   return ncclSuccess;
 }
@@ -616,6 +645,15 @@ static inline ncclResult_t ncclIbRequestComplete(struct ncclIbRequest* r, int* d
         NCCLCHECK(ncclProfilerFunction(&r->pInfo[0].qpEventHandles[j], ncclProfilerNetEventStop, NULL, 0, NULL));
       }
   #endif
+    }
+    if (ncclParamPhase0Log()) {
+      INFO(NCCL_NET,
+          "PHASE0 event=IB_SEND_COMPLETE reqId=%llu slot=%d size=%llu nreqs=%d comm=%p",
+          (unsigned long long)r->id,
+          (int)(r->id % NET_IB_MAX_REQUESTS),
+          (unsigned long long)r->send.size,
+          r->nreqs,
+          r->base);
     }
     int slot = r->id % NET_IB_MAX_REQUESTS;
     struct ncclIbSendComm* sendComm = (struct ncclIbSendComm*)r->base;

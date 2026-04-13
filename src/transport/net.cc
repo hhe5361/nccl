@@ -166,6 +166,7 @@ static ncclResult_t canConnect(int* ret, struct ncclComm* comm, struct ncclTopoG
 
 NCCL_PARAM(NetSharedBuffers, "NET_SHARED_BUFFERS", -2);
 NCCL_PARAM(NetSharedComms, "NET_SHARED_COMMS", 1);
+NCCL_PARAM(Phase0Log, "PHASE0_LOG", 0);
 
 struct setupReq {
   int tpRank;
@@ -180,6 +181,34 @@ struct setupReq {
 };
 
 NCCL_PARAM(NetOptionalRecvCompletion, "NET_OPTIONAL_RECV_COMPLETION", 1);
+
+static inline void phase0ProxyLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    const char* event,
+    int slot,
+    ssize_t size) {
+  if (ncclParamPhase0Log() == 0) return;
+  INFO(NCCL_NET,
+      "PHASE0 event=%s rank=%d peer=%d channel=%d slot=%d coll=%s collApi=%s algo=%s proto=%s size=%lld base=%llu posted=%llu received=%llu transmitted=%llu done=%llu nsteps=%d",
+      event,
+      proxyState->tpRank,
+      sub->peer,
+      sub->channelId,
+      slot,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol),
+      (long long)size,
+      (unsigned long long)sub->base,
+      (unsigned long long)sub->posted,
+      (unsigned long long)sub->received,
+      (unsigned long long)sub->transmitted,
+      (unsigned long long)sub->done,
+      sub->nsteps);
+}
 
 static_assert(sizeof(ncclNetHandle_t) + sizeof(int) <= CONNECT_SIZE, "Not large enough ncclConnect to hold ncclNetHandle_t and useGdr flag");
 
@@ -1343,6 +1372,7 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
             if (sub->requests[buffSlot] != NULL) {
               TRACE(NCCL_NET, "sendProxy [%ld/%d/%d] Isend posted, req %p, buff %p, size %d, proto %d, myRank %d, channelId %d, mhandle %p", sub->transmitted, buffSlot, sub->nsteps, sub->requests[buffSlot], buff, size, p, proxyState->tpRank, sub->channelId, sub->sendMhandle);
               sub->transSize = size;
+              phase0ProxyLog(proxyState, args, sub, "PROXY_SEND_POST", buffSlot, size);
               sub->transmitted += args->sliceSteps;
               ncclProfilerRecordProxyStepEventState(s, args, transmittedStepId, ncclProfilerProxyStepSendWait);
               args->idle = 0;
@@ -1362,6 +1392,7 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
           connFifo[buffSlot].size = -1;
           std::atomic_thread_fence(std::memory_order_seq_cst);
           TRACE(NCCL_NET, "sendProxy [%ld/%d/%d] request %p done", sub->done, buffSlot, sub->nsteps, sub->requests[buffSlot]);
+          phase0ProxyLog(proxyState, args, sub, "PROXY_SEND_DONE", buffSlot, size);
           sub->done += args->sliceSteps;
           ncclProfilerStopProxyStepEvent(s, args, doneStepId);
 
@@ -1507,6 +1538,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             struct ncclProxySubArgs* sub = subGroup+i;
             int postedStepId = sub->posted;
             TRACE(NCCL_NET, "recvProxy [%ld/%ld/%d] Irecv posted, buff %p, size %ld, myRank %d, channelId %d, mhandle %p", sub->posted, (sub->base + sub->posted) % NCCL_STEPS, sub->nsteps, ptrs[i], sizes[i], proxyState->tpRank, sub->channelId, mhandles[i]);
+            phase0ProxyLog(proxyState, args, sub, "PROXY_RECV_POST", (sub->base + sub->posted) % NCCL_STEPS, sizes[i]);
             sub->posted += args->sliceSteps;
             ncclProfilerRecordProxyStepEventState(s+i, args, postedStepId, ncclProfilerProxyStepRecvWait);
           }
@@ -1538,6 +1570,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             volatile struct ncclConnFifo* connFifo = (volatile struct ncclConnFifo*)resources->recvMem->connFifo;
             connFifo[buffSlot].size = -1;
             sub->transSize = sizes[i];
+            phase0ProxyLog(proxyState, args, sub, "PROXY_RECV_NET_DONE", buffSlot, sizes[i]);
             sub->received += args->sliceSteps;
             ncclProfilerRecordProxyStepEventState(s+i, args, receivedStepId, ncclProfilerProxyStepRecvFlushWait);
             if (step < sub->nsteps) {
@@ -1610,6 +1643,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
               *recvTail = sub->base + sub->transmitted;
               if (resources->gdcSync) wc_store_fence(); // Flush out WC write
             }
+            phase0ProxyLog(proxyState, args, sub, "PROXY_RECV_VISIBLE", (sub->base + transmittedStepId) % NCCL_STEPS, sub->transSize);
           }
           args->idle = 0;
         }
@@ -1636,6 +1670,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
               subGroup->recvRequestsCache[sub->done%NCCL_STEPS] = NULL;
             }
             int doneStepId = sub->done;
+            phase0ProxyLog(proxyState, args, sub, "PROXY_RECV_CONSUMED", (sub->base + sub->done) % NCCL_STEPS, sub->transSize);
             sub->done += args->sliceSteps;
             ncclProfilerStopProxyStepEvent(s+i, args, doneStepId);
             args->idle = 0;
