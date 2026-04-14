@@ -477,6 +477,68 @@ sendMem.head / recvMem.tail / connFifo[slot]</div>
           </tbody>
         </table>
       </div>
+
+      <h3>숫자로 보는 Outer Loop / Chunk / Slot</h3>
+      <p>
+        예를 들어 <code>nranks = 8</code>, 어떤 channel이 맡은 구간이
+        <code>channelCount = 256K elements</code>, 그리고 kernel이 고른
+        <code>chunkCount = 32K elements</code>라고 하자.
+        그러면 Ring AllReduce에서는 <code>loopCount = nranks * chunkCount = 256K</code>가 되므로
+        outer loop는 1회만 돈다.
+      </p>
+
+      <div class="flow">channelCount = 256K
+chunkCount   = 32K
+nranks       = 8
+loopCount    = 8 * 32K = 256K
+
+outer loop iteration 0
+-> chunk 0 : [0, 32K)
+-> chunk 1 : [32K, 64K)
+-> chunk 2 : [64K, 96K)
+-> chunk 3 : [96K, 128K)
+-> chunk 4 : [128K, 160K)
+-> chunk 5 : [160K, 192K)
+-> chunk 6 : [192K, 224K)
+-> chunk 7 : [224K, 256K)</div>
+
+      <p>
+        즉 outer loop 1회는 이 channel이 맡은 256K 전체를 처리하고,
+        그 내부에서 다시 <code>nranks</code>개의 chunk가 만들어져 ring step 순서로 이동한다.
+        이때 <code>loopCount</code>는 "outer loop 한 바퀴가 먹는 총 element 수"이고,
+        <code>chunkCount</code>는 "그 안에서 rank별로 나뉘는 chunk 크기"다.
+      </p>
+
+      <p>
+        반대로 같은 <code>nranks = 8</code>, <code>chunkCount = 32K</code>인데
+        <code>channelCount = 640K</code>라면 <code>loopCount</code>는 그대로 256K이므로
+        outer loop는 3회 돈다.
+      </p>
+
+      <div class="flow">iteration 0 -> elements [0, 256K)
+iteration 1 -> elements [256K, 512K)
+iteration 2 -> elements [512K, 640K)</div>
+
+      <div class="warn">
+        여기서 <code>chunk = slot</code>으로 보면 안 된다.
+        <code>chunk</code>는 ring 알고리즘이 다루는 데이터 단위이고,
+        <code>slot</code>은 그 데이터가 실제로 흐를 때 사용하는 원형 buffer 위치다.
+        현재 코드는 <code>step % NCCL_STEPS</code>로 slot을 고른다.
+      </div>
+
+      <p>
+        따라서 chunk 하나가 slot 하나에 통째로 들어간다고 보면 틀리다.
+        더 정확히는 chunk가 내부적으로 slice와 step으로 나뉘어 pipeline 되고,
+        그 step들이 slot ring을 통해 흐른다.
+        AllReduce는 <code>CHUNKSTEPS</code>와 <code>SLICESTEPS</code>를 따로 두므로,
+        chunk와 slot은 같은 층위의 개념이 아니다.
+      </p>
+
+      <div class="note">
+        Figure 3를 읽을 때의 계층은
+        <code>channelCount -&gt; outer loop(loopCount) -&gt; chunk(chunkCount) -&gt; slice/step -&gt; slot</code>
+        순서라고 보면 된다.
+      </div>
     </section>
 
     <section class="section">

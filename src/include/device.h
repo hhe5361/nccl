@@ -140,7 +140,7 @@ struct ncclConnInfo {
   void **ptrExchange; // Pointer exchange for direct communication
   uint64_t* redOpArgExchange; // PreOp scaler exchange for direct pull case
 
-  struct ncclConnFifo* connFifo; // Used for GPU - Proxy communication
+  struct ncclConnFifo* connFifo; // Used for GPU - Proxy communication //slot 별 메타데이터를 담고 있음. 
 
   uint64_t step;      // Keep where we are
   uint64_t llLastCleaning;
@@ -410,6 +410,7 @@ struct ncclDevChannelPeer {
   struct ncclConnInfo send[NCCL_MAX_CONNS];
   struct ncclConnInfo recv[NCCL_MAX_CONNS];
 };
+
 
 struct alignas(16) ncclDevChannel {
   struct ncclDevChannelPeer** peers;
