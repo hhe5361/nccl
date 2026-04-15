@@ -11,7 +11,11 @@ NCCL_TESTS_DIR=${NCCL_TESTS_DIR:-${WORKSPACE_ROOT}/nccl-tests}
 PYTORCH_DIR=${PYTORCH_DIR:-${WORKSPACE_ROOT}/pytorch}
 PYTORCH_REF=${PYTORCH_REF:-v2.4.1}
 VENV_DIR=${VENV_DIR:-${WORKSPACE_ROOT}/venvs/torch-cu121-custom}
-MAX_JOBS=${MAX_JOBS:-$(nproc)}
+DEFAULT_MAX_JOBS=$(nproc)
+if [[ "${DEFAULT_MAX_JOBS}" -gt 4 ]]; then
+  DEFAULT_MAX_JOBS=4
+fi
+MAX_JOBS=${MAX_JOBS:-${DEFAULT_MAX_JOBS}}
 NVCC_GENCODE_DEFAULT="-gencode=arch=compute_61,code=sm_61"
 NVCC_GENCODE=${NVCC_GENCODE:-${NVCC_GENCODE_DEFAULT}}
 
@@ -30,29 +34,32 @@ Targets:
   tests    Clone and build nccl-tests against the custom NCCL.
   pytorch  Clone and build PyTorch against the custom NCCL.
   all      Run nccl, tests, pytorch in order.
+
+Environment:
+  MAX_JOBS   Parallel build jobs. Defaults to min(nproc, 4).
 USAGE
 }
 
 build_nccl() {
-  echo "[bootstrap] building NCCL at ${REPO_ROOT}"
-  make -C "${REPO_ROOT}" -j src.build \
+  echo "[bootstrap] building NCCL at ${REPO_ROOT} with MAX_JOBS=${MAX_JOBS}"
+  make -C "${REPO_ROOT}" -j"${MAX_JOBS}" src.build \
     CUDA_HOME="${CUDA_HOME}" \
     NVCC_GENCODE="${NVCC_GENCODE}"
 }
 
 build_tests() {
-  echo "[bootstrap] building nccl-tests at ${NCCL_TESTS_DIR}"
+  echo "[bootstrap] building nccl-tests at ${NCCL_TESTS_DIR} with MAX_JOBS=${MAX_JOBS}"
   if [[ ! -d "${NCCL_TESTS_DIR}/.git" ]]; then
     git clone https://github.com/NVIDIA/nccl-tests.git "${NCCL_TESTS_DIR}"
   fi
-  make -C "${NCCL_TESTS_DIR}" -j \
+  make -C "${NCCL_TESTS_DIR}" -j"${MAX_JOBS}" \
     MPI=1 \
     CUDA_HOME="${CUDA_HOME}" \
     NCCL_HOME="${NCCL_HOME}"
 }
 
 build_pytorch() {
-  echo "[bootstrap] building PyTorch at ${PYTORCH_DIR}"
+  echo "[bootstrap] building PyTorch at ${PYTORCH_DIR} with MAX_JOBS=${MAX_JOBS}"
   if [[ ! -d "${PYTORCH_DIR}/.git" ]]; then
     git clone --recursive https://github.com/pytorch/pytorch "${PYTORCH_DIR}"
   fi
