@@ -4,13 +4,24 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/../.." && pwd)
 
+infer_node_rank() {
+  local worker_name=$1
+  if [[ "${worker_name}" =~ ^worker([0-9]+)$ ]]; then
+    local idx=${BASH_REMATCH[1]}
+    echo $((10#${idx} - 1))
+    return 0
+  fi
+  echo "cannot infer NODE_RANK from WORKER_NAME='${worker_name}'" >&2
+  return 1
+}
+
 RUN_ID=${RUN_ID:-phase0_$(date +%y%m%d_%H%M%S)}
 MASTER_ADDR=${MASTER_ADDR:-172.16.0.101}
 MASTER_PORT=${MASTER_PORT:-29500}
 NNODES=${NNODES:-8}
 NPROC_PER_NODE=${NPROC_PER_NODE:-1}
-NODE_RANK=${NODE_RANK:?NODE_RANK must be set}
 WORKER_NAME=${WORKER_NAME:-$(hostname -s)}
+NODE_RANK=${NODE_RANK:-$(infer_node_rank "${WORKER_NAME}")}
 LOG_ROOT=${LOG_ROOT:-/mnt/nfs_share/cts_experiments/${RUN_ID}/${WORKER_NAME}}
 TARGET_SCRIPT=${TARGET_SCRIPT:-research/code/phase0/ring_allreduce_loop.py}
 TORCH_ENV=${TORCH_ENV:-/workspace/venvs/torch-cu121-custom/bin/activate}

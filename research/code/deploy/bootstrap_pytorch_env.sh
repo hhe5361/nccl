@@ -98,7 +98,7 @@ build_pytorch() {
   python3 -m venv "${VENV_DIR}"
   # shellcheck disable=SC1090
   source "${VENV_DIR}/bin/activate"
-  pip install --upgrade pip setuptools wheel ninja cmake
+  pip install --upgrade pip setuptools wheel ninja "cmake<4"
   pip install -r "${PYTORCH_DIR}/requirements.txt"
 
   export USE_CUDA=1
