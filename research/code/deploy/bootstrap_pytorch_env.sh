@@ -18,6 +18,23 @@ fi
 MAX_JOBS=${MAX_JOBS:-${DEFAULT_MAX_JOBS}}
 NVCC_GENCODE_DEFAULT="-gencode=arch=compute_61,code=sm_61"
 NVCC_GENCODE=${NVCC_GENCODE:-${NVCC_GENCODE_DEFAULT}}
+MPI_HOME=${MPI_HOME:-}
+if [[ -z "${MPI_HOME}" ]]; then
+  if [[ -d /usr/lib/x86_64-linux-gnu/openmpi ]]; then
+    MPI_HOME=/usr/lib/x86_64-linux-gnu/openmpi
+  elif command -v mpicc >/dev/null 2>&1; then
+    MPI_COMPILE_FLAGS=$(mpicc --showme:compile 2>/dev/null || true)
+    for flag in ${MPI_COMPILE_FLAGS}; do
+      case "${flag}" in
+        -I*/include)
+          MPI_INCLUDE_DIR=${flag#-I}
+          MPI_HOME=$(dirname "${MPI_INCLUDE_DIR}")
+          break
+          ;;
+      esac
+    done
+  fi
+fi
 
 export CUDA_HOME
 export PATH="${CUDA_HOME}/bin:${PATH}"
@@ -37,6 +54,7 @@ Targets:
 
 Environment:
   MAX_JOBS   Parallel build jobs. Defaults to min(nproc, 4).
+  MPI_HOME   MPI installation prefix for nccl-tests. Auto-detected when possible.
 USAGE
 }
 
@@ -52,8 +70,17 @@ build_tests() {
   if [[ ! -d "${NCCL_TESTS_DIR}/.git" ]]; then
     git clone https://github.com/NVIDIA/nccl-tests.git "${NCCL_TESTS_DIR}"
   fi
+
+  local mpi_args=(MPI=1)
+  if [[ -n "${MPI_HOME}" ]]; then
+    echo "[bootstrap] using MPI_HOME=${MPI_HOME}"
+    mpi_args+=(MPI_HOME="${MPI_HOME}")
+  else
+    echo "[bootstrap] MPI_HOME not detected; nccl-tests MPI build may fail"
+  fi
+
   make -C "${NCCL_TESTS_DIR}" -j"${MAX_JOBS}" \
-    MPI=1 \
+    "${mpi_args[@]}" \
     CUDA_HOME="${CUDA_HOME}" \
     NCCL_HOME="${NCCL_HOME}"
 }

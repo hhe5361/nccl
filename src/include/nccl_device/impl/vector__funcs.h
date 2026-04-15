@@ -846,29 +846,16 @@ NCCL_DEVICE_INLINE EltPack<half, 2> reducePack(OpSum<half> const& /* red */, Elt
 }
 
 #if defined(__CUDA_BF16_TYPES_EXIST__)
-// Specialization for __nv_bfloat16 with OpSum - uses __hadd2 SIMD intrinsic
-// Architecture check: __CUDA_ARCH__ >= 530 && __CUDA_ARCH__ != 610
+// Specialization for __nv_bfloat16 with OpSum.
+// Keep a conservative scalar fallback for broad compiler/arch compatibility,
+// including Pascal targets and host-side consumers like nccl-tests.
 template<>
 NCCL_DEVICE_INLINE EltPack<__nv_bfloat16, 2> reducePack(OpSum<__nv_bfloat16> const& /* red */, EltPack<__nv_bfloat16, 2> a, EltPack<__nv_bfloat16, 2> b) {
-  #if __CUDA_ARCH__ >= 530 && __CUDA_ARCH__ != 610
-    union Bf16PackAccess2 {
-      EltPack<__nv_bfloat16, 2> pack;
-      __nv_bfloat162 pair;
-    };
-    Bf16PackAccess2 aa;
-    Bf16PackAccess2 bb;
-    Bf16PackAccess2 out;
-    aa.pack = a;
-    bb.pack = b;
-    out.pair = __hadd2(aa.pair, bb.pair);
-    return out.pack;
-  #else
-    EltPack<__nv_bfloat16, 2> out{};
-    OpSum<__nv_bfloat16> red{};
-    out.elts()[0] = red(a.elts()[0], b.elts()[0]);
-    out.elts()[1] = red(a.elts()[1], b.elts()[1]);
-    return out;
-  #endif
+  EltPack<__nv_bfloat16, 2> out{};
+  OpSum<__nv_bfloat16> red{};
+  out.elts()[0] = red(a.elts()[0], b.elts()[0]);
+  out.elts()[1] = red(a.elts()[1], b.elts()[1]);
+  return out;
 }
 #endif
 
