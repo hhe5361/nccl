@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Cumulative CTS for Receiver-Driven Admission</title>
+  <title>Adaptive CTS Window for Receiver-Driven Admission</title>
   <style>
     :root {
       color-scheme: light;
@@ -22,9 +22,7 @@
       --shadow: 0 14px 34px rgba(16, 32, 48, 0.08);
     }
 
-    * {
-      box-sizing: border-box;
-    }
+    * { box-sizing: border-box; }
 
     body {
       margin: 0;
@@ -41,9 +39,7 @@
       margin: 24px auto 48px;
     }
 
-    .hero,
-    .section,
-    .footer {
+    .hero, .section, .footer {
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 18px;
@@ -101,7 +97,7 @@
       margin: 10px 0 0;
     }
 
-    ul {
+    ul, ol {
       margin: 10px 0 0;
       padding-left: 20px;
     }
@@ -112,7 +108,7 @@
 
     .subtitle {
       margin: 0;
-      max-width: 860px;
+      max-width: 880px;
       color: var(--muted);
       font-size: 16px;
     }
@@ -140,6 +136,13 @@
       margin-top: 16px;
     }
 
+    .metric {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 16px;
+    }
+
     .card {
       background: var(--panel-soft);
       border: 1px solid var(--border);
@@ -147,8 +150,13 @@
       padding: 16px;
     }
 
-    .flow,
-    .pseudo {
+    .card strong {
+      display: block;
+      margin-top: 8px;
+      font-size: 24px;
+    }
+
+    .flow, .pseudo {
       margin-top: 14px;
       padding: 16px 18px;
       border-radius: 14px;
@@ -162,29 +170,16 @@
       white-space: pre-wrap;
     }
 
-    .note,
-    .success,
-    .warn {
+    .note, .success, .warn {
       margin-top: 14px;
       padding: 14px 16px;
       border-radius: 14px;
       border: 1px solid var(--border);
     }
 
-    .note {
-      background: var(--accent-soft);
-      border-color: #c9e7ea;
-    }
-
-    .success {
-      background: var(--good-soft);
-      border-color: #cce9d8;
-    }
-
-    .warn {
-      background: var(--warn-soft);
-      border-color: #efd7b7;
-    }
+    .note { background: var(--accent-soft); border-color: #c9e7ea; }
+    .success { background: var(--good-soft); border-color: #cce9d8; }
+    .warn { background: var(--warn-soft); border-color: #efd7b7; }
 
     .table-wrap {
       margin-top: 14px;
@@ -200,8 +195,7 @@
       overflow: hidden;
     }
 
-    th,
-    td {
+    th, td {
       padding: 12px 14px;
       text-align: left;
       vertical-align: top;
@@ -227,22 +221,8 @@
       color: #1d2b3a;
     }
 
-    .metric {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 12px;
-      margin-top: 16px;
-    }
-
-    .metric .card strong {
-      display: block;
-      font-size: 24px;
-      margin-top: 8px;
-    }
-
     @media (max-width: 860px) {
-      .grid,
-      .metric {
+      .grid, .metric {
         grid-template-columns: 1fr;
       }
     }
@@ -252,288 +232,151 @@
   <div class="page">
     <header class="hero">
       <div class="eyebrow">NCCL Internal Notes</div>
-      <h1>Cumulative CTS 아이디어 정리</h1>
+      <h1>Adaptive CTS Window 아이디어 정리</h1>
       <p class="subtitle">
-        기존의 <code>per-slot CTS</code>를 <code>cumulative / window CTS</code>로 일반화하는 아이디어를 정리한 문서다.
-        핵심은 receiver-driven admission은 유지하되, control granularity를 바꿔 reverse control overhead와 sender stall을 줄이는 것이다.
+        이 아이디어의 핵심은 단순한 <code>cumulative CTS</code>가 아니라,
+        <code>topology + collective + algorithm + protocol + receiver occupancy</code>를 보고
+        receiver가 <strong>CTS window <code>W</code></strong>를 동적으로 조절하는 것이다.
+        구현은 먼저 <code>fake cumulative</code>로 시작하고, 필요하면 이후 <code>real cumulative</code>로 확장한다.
       </p>
       <div class="meta">
-        <div class="chip">Topic: receiver-driven admission</div>
-        <div class="chip">Focus: per-slot CTS vs cumulative CTS</div>
-        <div class="chip">Context: NCCL / IB transport / slot pipeline</div>
+        <div class="chip">Main idea: adaptive CTS window</div>
+        <div class="chip">First prototype: fake cumulative</div>
+        <div class="chip">Extension: real cumulative CTS</div>
       </div>
     </header>
 
     <section class="section">
       <h2>1. 문제의식</h2>
       <p>
-        기존 <code>per-slot CTS</code>는 receiver가 slot 하나를 비울 때마다, 그 slot 하나에 대한
-        <code>CTS(addr, rkey, size, idx)</code>를 sender에게 보낸다. 이 구조는 가장 정확하지만,
-        데이터 진행 단위와 control 단위가 거의 1:1로 묶인다는 문제가 있다.
+        incast 위험은 모든 collective에서 같지 않다. 같은 receiver-driven admission이라도
+        어떤 workload는 큰 window가 pipeline 유지에 유리하고, 어떤 workload는 작은 window가 burst 억제에 필수적이다.
       </p>
-      <div class="flow">Per-slot CTS
-receiver frees slot k
-  -> send CTS(k)
-  -> sender waits for CTS(k)
-  -> sender sends data for slot k
-  -> repeat
+      <div class="flow">low-risk case
+intra-rack + AllReduce + Ring + LL/LL128
+  -> fan-in pressure relatively low
+  -> pipeline occupancy is more important
+  -> larger W is acceptable
 
-Cumulative CTS
-receiver has W free slots
-  -> send one grant: [k, k+W-1]
-  -> sender can keep sending inside this window
-  -> receiver extends grant later</div>
+high-risk case
+cross-rack + AllToAll + Simple
+  -> many-to-many + large step payload
+  -> ingress burst and uplink pressure are high
+  -> smaller W is safer</div>
       <div class="note">
-        핵심 차이는 <strong>receiver-driven 여부</strong>가 아니라,
-        <strong>receiver가 grant를 어느 granularity로 발급하느냐</strong>다.
+        따라서 본체는 "CTS를 줄이자"가 아니라
+        <strong>"incast risk에 따라 서로 다른 CTS window를 주자"</strong>다.
       </div>
     </section>
 
     <section class="section">
-      <h2>2. Cumulative CTS의 핵심 아이디어</h2>
-      <p>
-        receiver는 더 이상 매 slot마다 CTS를 보내지 않고, 미래의 연속된 slot 구간에 대해
-        하나의 누적 grant를 보낸다. sender는 그 범위 안에서는 추가 CTS 없이 계속 전송한다.
-      </p>
+      <h2>2. 설계 원칙</h2>
       <div class="grid">
         <div class="card">
           <h3>Per-slot CTS</h3>
           <ul>
             <li><code>CTS 1개 = slot 1개 허가</code></li>
-            <li>정밀도는 높지만 control 빈도가 높다</li>
-            <li>reverse path 지연에 민감하다</li>
+            <li>정밀도는 높음</li>
+            <li>reverse path jitter에 민감함</li>
           </ul>
         </div>
         <div class="card">
-          <h3>Cumulative CTS</h3>
+          <h3>Fake Cumulative</h3>
           <ul>
-            <li><code>CTS 1개 = 여러 slot window 허가</code></li>
-            <li>control 빈도를 낮출 수 있다</li>
-            <li>sender pipeline을 덜 자주 끊는다</li>
+            <li>첫 구현 대상</li>
+            <li>per-slot CTS는 유지</li>
+            <li>receiver가 W개 slot을 미리 열어둠</li>
+            <li>CTS 패킷 수는 그대로지만 jitter 흡수 가능</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>Real Cumulative</h3>
+          <ul>
+            <li>확장 구현 대상</li>
+            <li><code>CTS 1개 = 여러 future slot 허가</code></li>
+            <li>CTS packet/byte 감소 가능</li>
+            <li>IB control format 변경 필요</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>정책의 본체</h3>
+          <ul>
+            <li>receiver가 <code>W</code>를 결정</li>
+            <li>high-risk 조합에는 작은 <code>W</code></li>
+            <li>low-risk 조합에는 큰 <code>W</code></li>
+            <li>occupancy가 높으면 future grant shrink</li>
           </ul>
         </div>
       </div>
       <div class="success">
-        receiver-driven admission의 철학은 그대로 유지된다.
-        sender가 자율적으로 보내는 것이 아니라, 여전히 receiver가 <code>grant_until</code>을 결정한다.
+        즉 "cumulative"는 구현 형식이고, 실제 아이디어의 본체는
+        <strong>incast-risk-aware adaptive CTS window policy</strong>다.
       </div>
     </section>
 
     <section class="section">
-      <h2>3. 기대되는 장점</h2>
-      <div class="metric">
-        <div class="card">
-          <div>Control Messages</div>
-          <strong>감소</strong>
-          <p>slot마다 보내던 CTS를 window 단위로 줄일 수 있다.</p>
-        </div>
-        <div class="card">
-          <div>Sender Stall</div>
-          <strong>완화</strong>
-          <p>reverse control 지연이 곧바로 send idle로 이어지는 빈도를 줄인다.</p>
-        </div>
-        <div class="card">
-          <div>Pipeline Occupancy</div>
-          <strong>향상</strong>
-          <p>여러 slot을 미리 열어두어 steady-state를 더 잘 유지할 수 있다.</p>
-        </div>
-        <div class="card">
-          <div>Policy Knob</div>
-          <strong>확장</strong>
-          <p><code>W</code>를 조절해 conservative/aggressive admission을 연속적으로 바꿀 수 있다.</p>
-        </div>
-      </div>
-      <h3>3.1 CTS 패킷 수 관점</h3>
+      <h2>3. 입력 파라미터</h2>
       <p>
-        이상적으로는 grant window가 <code>W</code>라면, 동일한 총 전송량에 대해 CTS 수를 대략
-        <code>1/W</code> 수준으로 줄일 수 있다.
-      </p>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>총 slot 수</th>
-              <th>Per-slot CTS</th>
-              <th>Cumulative CTS (W=4)</th>
-              <th>Cumulative CTS (W=8)</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>64</td>
-              <td>64 CTS</td>
-              <td>16 CTS</td>
-              <td>8 CTS</td>
-            </tr>
-            <tr>
-              <td>128</td>
-              <td>128 CTS</td>
-              <td>32 CTS</td>
-              <td>16 CTS</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-      <div class="warn">
-        실제 수치는 partial grant, peer skew, slot reuse timing 때문에 달라질 수 있다.
-        위 표는 직관을 위한 단순 모델이다.
-      </div>
-    </section>
-
-    <section class="section">
-      <h2>4. 왜 좋은가</h2>
-      <h3>4.1 reverse control path 부담 완화</h3>
-      <p>
-        기존 구조는 data path가 아니라 control path의 작은 지연에도 민감하다.
-        receiver가 slot을 비웠더라도 CTS가 늦게 도착하면 sender는 다음 전송을 못 한다.
-        cumulative CTS는 sender가 이미 받은 grant 범위 안에서 계속 보낼 수 있게 만들어,
-        reverse path jitter를 흡수한다.
-      </p>
-      <h3>4.2 bounded pipeline 유지</h3>
-      <p>
-        NCCL의 slot pipeline은 유한 깊이의 파이프라인이다.
-        좋은 throughput은 pipeline depth만큼 slot이 미리 열려 있을 때 나온다.
-        cumulative CTS는 receiver가 free slot 수를 기반으로 한 번에 여러 slot을 열어둘 수 있게 한다.
-      </p>
-      <h3>4.3 collective-aware policy와 결합 가능</h3>
-      <p>
-        grant window <code>W</code>는 workload semantics를 반영하는 좋은 정책 파라미터가 된다.
-      </p>
-      <ul>
-        <li><code>AllToAll + Simple</code>: incast burst를 줄이기 위해 <code>W</code>를 작게</li>
-        <li><code>AllReduce + Ring + LL</code>: pipeline 유지가 중요하므로 <code>W</code>를 크게</li>
-        <li>receiver free slots가 충분하지 않으면 <code>W</code> 축소</li>
-        <li>contention이 낮으면 <code>W</code> 확대</li>
-      </ul>
-    </section>
-
-    <section class="section">
-      <h2>5. Per-Slot CTS 의사코드</h2>
-      <div class="pseudo">struct CTS {
-  uint64_t idx;
-  uint64_t addr;
-  uint32_t rkey;
-  size_t size;
-};
-
-// receiver
-void issue_cts_for_one_slot(int slot, uint64_t idx) {
-  CTS msg;
-  msg.idx  = idx;
-  msg.addr = recv_slot_addr(slot);
-  msg.rkey = recv_slot_rkey(slot);
-  msg.size = recv_slot_size(slot);
-  rdma_write_to_sender_cts_fifo(slot, msg);
-}
-
-// sender
-void try_send_one_slot(int slot, uint64_t expected_idx) {
-  if (!gpu_local_slot_ready(slot)) return;
-  if (!cts_fifo[slot].valid) return;
-  if (cts_fifo[slot].idx != expected_idx) return;
-
-  rdma_write_data(local_slot_addr(slot),
-                  cts_fifo[slot].addr,
-                  cts_fifo[slot].rkey,
-                  min(local_slot_size(slot), cts_fifo[slot].size));
-}</div>
-      <div class="note">
-        장점은 가장 정확하다는 점이고, 단점은 slot마다 reverse control을 요구한다는 점이다.
-      </div>
-    </section>
-
-    <section class="section">
-      <h2>6. Proposed Cumulative CTS 의사코드</h2>
-      <div class="pseudo">struct CumulativeCTS {
-  uint64_t epoch;
-  uint64_t grant_from_idx;
-  uint64_t grant_until_idx;
-  uint64_t recv_base_addr;
-  uint32_t rkey;
-  size_t step_size;
-};
-
-// receiver
-void try_extend_grant() {
-  int free_slots = count_free_recv_slots();
-  int W = compute_grant_window(collAPI, algorithm, protocol, free_slots);
-
-  uint64_t new_grant_until = min(next_idx + W - 1, max_receivable_idx());
-  if (new_grant_until <= grant_until_idx) return;
-
-  CumulativeCTS msg;
-  msg.epoch = epoch;
-  msg.grant_from_idx = grant_until_idx + 1;
-  msg.grant_until_idx = new_grant_until;
-  msg.recv_base_addr = recv_slot_base_addr();
-  msg.rkey = recv_slot_rkey_base();
-  msg.step_size = recv_step_size();
-
-  send_cumulative_cts(msg);
-  grant_until_idx = new_grant_until;
-}
-
-// sender
-void try_send() {
-  if (local_send_idx > remote_grant_until) return;
-  int local_slot = (local_send_idx - 1) % NCCL_STEPS;
-  if (!gpu_local_slot_ready(local_slot)) return;
-
-  int remote_slot = (local_send_idx - 1) % NCCL_STEPS;
-  uint64_t remote_addr = remote_base_addr + remote_slot * remote_step_size;
-
-  rdma_write_data(local_slot_addr(local_slot),
-                  remote_addr,
-                  remote_rkey,
-                  local_slot_size(local_slot));
-  local_send_idx++;
-}</div>
-      <div class="success">
-        이 설계는 <code>receiver free slots</code> 기반 receiver-driven admission을 유지하면서,
-        control granularity만 slot 단위에서 window 단위로 바꾼다.
-      </div>
-    </section>
-
-    <section class="section">
-      <h2>7. 정책 파라미터 예시</h2>
-      <p>
-        cumulative CTS의 핵심 제어 변수는 grant window <code>W</code>다.
-        이 값을 정적으로 둘 수도 있고, workload-aware policy로 동적으로 바꿀 수도 있다.
+        정적 한 변수만으로는 window를 정하기 어렵다. 첫 버전에서 최소한 아래 입력은 같이 봐야 한다.
       </p>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
               <th>파라미터</th>
+              <th>예시 값</th>
               <th>의미</th>
               <th><code>W</code>에 주는 영향</th>
             </tr>
           </thead>
           <tbody>
             <tr>
-              <td><code>collAPI</code></td>
-              <td>AllReduce, AllToAll, AllGather 등</td>
-              <td>AllToAll은 incast 위험이 크므로 보수적으로</td>
+              <td><code>topologyClass</code></td>
+              <td>intra-rack, cross-rack</td>
+              <td>Clos에서 uplink를 타는지 여부</td>
+              <td>cross-rack일수록 작게</td>
             </tr>
             <tr>
-              <td><code>algorithm/pattern</code></td>
-              <td>Ring, Tree, PAT, P2P-expanded AllToAll</td>
-              <td>fan-in/fan-out 구조에 따라 조정</td>
+              <td><code>collAPI</code></td>
+              <td>AllReduce, AllToAll, AllGather, ReduceScatter</td>
+              <td>fan-in / fan-out / many-to-many 구조</td>
+              <td>AllToAll일수록 작게</td>
+            </tr>
+            <tr>
+              <td><code>algorithm</code></td>
+              <td>Ring, Tree</td>
+              <td>collective 내부 traffic shape</td>
+              <td>Tree fan-in 시 더 보수적으로</td>
             </tr>
             <tr>
               <td><code>protocol</code></td>
               <td>Simple, LL, LL128</td>
-              <td>Simple은 burst가 크므로 작은 window가 유리</td>
+              <td>step payload와 burst granularity 차이</td>
+              <td>Simple일수록 작게</td>
             </tr>
             <tr>
-              <td><code>free_slots</code></td>
-              <td>receiver-side available credit</td>
-              <td>실제 grant의 상한</td>
+              <td><code>msgSizeClass</code></td>
+              <td>small, medium, large</td>
+              <td>latency-bound / throughput-bound 구분</td>
+              <td>large일수록 더 조심</td>
             </tr>
             <tr>
-              <td><code>active_senders</code></td>
-              <td>AllToAll류에서 동시에 들어오는 sender 수</td>
-              <td>aggregate incast 위험이 클수록 축소</td>
+              <td><code>activeSenders</code></td>
+              <td>1, 2, 4, 8</td>
+              <td>receiver에 동시에 몰리는 sender 수</td>
+              <td>많을수록 작게</td>
+            </tr>
+            <tr>
+              <td><code>freeSlots</code></td>
+              <td>0..N</td>
+              <td>receiver가 실제로 열 수 있는 공간</td>
+              <td>최종 upper bound</td>
+            </tr>
+            <tr>
+              <td><code>occSlots</code></td>
+              <td>0..N</td>
+              <td>current occupancy / backpressure 수준</td>
+              <td>높을수록 shrink</td>
             </tr>
           </tbody>
         </table>
@@ -541,48 +384,220 @@ void try_send() {
     </section>
 
     <section class="section">
-      <h2>8. 언제 효과가 클까</h2>
+      <h2>4. W 계산식</h2>
+      <p>
+        첫 버전은 학습 기반보다, 구현 가능한 위험 점수 기반 heuristic이 적절하다.
+      </p>
+      <div class="pseudo">R = topoRisk
+  + collRisk
+  + algoRisk
+  + protoRisk
+  + sizeRisk
+  + senderRisk
+  + occRisk
+
+Wbase = lookup_window_from_risk(R)
+
+W = min(Wbase, freeSlots, perPeerCap, globalCap)
+
+if (occSlots >= HIGH_WATERMARK) W = 1
+else if (occSlots <= LOW_WATERMARK) W = min(W + 1, Wmax)
+
+W = max(W, 1)</div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Risk score</th>
+              <th>추천 <code>Wbase</code></th>
+              <th>의미</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>0-2</td>
+              <td>8</td>
+              <td>낮은 incast 위험, pipeline 우선</td>
+            </tr>
+            <tr>
+              <td>3-4</td>
+              <td>4</td>
+              <td>중간 위험, 균형</td>
+            </tr>
+            <tr>
+              <td>5-6</td>
+              <td>2</td>
+              <td>높은 위험, 보수적 admission</td>
+            </tr>
+            <tr>
+              <td>7 이상</td>
+              <td>1</td>
+              <td>매우 높은 위험, 사실상 per-slot 수준</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="warn">
+        <code>freeSlots</code>만 보고 window를 키우면 cross-rack AllToAll에서도 너무 공격적인 grant가 나올 수 있다.
+        반드시 workload semantics와 topology risk를 같이 봐야 한다.
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>5. 초기 Heuristic Table</h2>
+      <p>
+        첫 구현에서 쓸 수 있는 보수적인 초기값이다. 이후 실험으로 조정하면 된다.
+      </p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Topology</th>
+              <th>Collective / Algorithm</th>
+              <th>Protocol</th>
+              <th>초기 <code>W</code></th>
+              <th>이유</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>intra-rack</td>
+              <td>AllReduce / Ring</td>
+              <td>LL, LL128</td>
+              <td>8</td>
+              <td>burst risk가 낮고 pipeline 유지 이득이 큼</td>
+            </tr>
+            <tr>
+              <td>intra-rack</td>
+              <td>AllReduce / Ring</td>
+              <td>Simple</td>
+              <td>4</td>
+              <td>payload는 크지만 topology risk는 낮음</td>
+            </tr>
+            <tr>
+              <td>cross-rack</td>
+              <td>AllReduce / Ring</td>
+              <td>Simple</td>
+              <td>2</td>
+              <td>uplink pressure를 고려해 shrink</td>
+            </tr>
+            <tr>
+              <td>cross-rack</td>
+              <td>AllReduce / Tree</td>
+              <td>Simple</td>
+              <td>2</td>
+              <td>Tree fan-in과 큰 payload가 겹침</td>
+            </tr>
+            <tr>
+              <td>intra-rack</td>
+              <td>AllToAll</td>
+              <td>LL, LL128</td>
+              <td>2</td>
+              <td>many-to-many라 기본적으로 보수적</td>
+            </tr>
+            <tr>
+              <td>cross-rack</td>
+              <td>AllToAll</td>
+              <td>Simple</td>
+              <td>1</td>
+              <td>가장 높은 incast/burst 위험 조합</td>
+            </tr>
+            <tr>
+              <td>cross-rack</td>
+              <td>AllGather, ReduceScatter</td>
+              <td>Simple</td>
+              <td>2</td>
+              <td>AllReduce보다 조심, AllToAll보다는 완화</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>6. 구현 경로</h2>
       <div class="grid">
         <div class="card">
-          <h3>효과가 큰 경우</h3>
+          <h3>Phase A: Fake Cumulative</h3>
+          <p>
+            <code>recvProxyProgress()</code>에서 dynamic window로 <code>irecv</code>를 W개 미리 열어둔다.
+            IB transport는 기존처럼 per-slot CTS를 계속 발급한다.
+          </p>
           <ul>
-            <li>inter-node RDMA / RoCE 환경</li>
-            <li>AllToAll, Gather/Scatter처럼 fan-in 또는 many-to-many가 큰 경우</li>
-            <li>Simple protocol 비중이 큰 큰 메시지</li>
-            <li>reverse control path 지연이 sender idle로 이어지는 경우</li>
+            <li>장점: 구현이 쉽다</li>
+            <li>장점: adaptive window 정책 자체를 검증할 수 있다</li>
+            <li>한계: CTS 패킷 수는 줄지 않는다</li>
           </ul>
         </div>
         <div class="card">
-          <h3>효과가 제한적이거나 주의가 필요한 경우</h3>
+          <h3>Phase B: Real Cumulative</h3>
+          <p>
+            <code>net_ib/common.h</code>와 <code>net_ib/p2p.cc</code>를 바꿔,
+            CTS 하나가 여러 future slot을 허가하게 만든다.
+          </p>
           <ul>
-            <li>low-contention 환경</li>
-            <li>작은 메시지</li>
-            <li>grant를 너무 크게 잡아 다시 burst를 키우는 경우</li>
-            <li>direct/register path처럼 recv target이 규칙적이지 않은 경우</li>
+            <li>장점: CTS packet/byte 감소 가능</li>
+            <li>한계: wire/control format 수정 필요</li>
+            <li>한계: direct/register path는 더 복잡하다</li>
           </ul>
         </div>
       </div>
-    </section>
-
-    <section class="section">
-      <h2>9. tradeoff</h2>
-      <ul>
-        <li><strong>장점:</strong> CTS 패킷 수 감소, reverse path overhead 감소, sender stall 완화, pipeline occupancy 향상</li>
-        <li><strong>단점:</strong> grant를 너무 일찍 많이 주면 per-slot CTS보다 admission 정밀도가 떨어질 수 있음</li>
-        <li><strong>구현 난이도:</strong> staged path는 비교적 쉽고, direct/register path는 hybrid metadata 방식이 필요할 수 있음</li>
-        <li><strong>논문 관점:</strong> 단순 piggyback보다 “receiver-driven admission의 control granularity를 적응적으로 바꾼다”는 framing이 더 좋음</li>
-      </ul>
-      <div class="warn">
-        따라서 이 아이디어의 핵심 claim은 “항상 throughput이 증가한다”가 아니라,
-        “receiver-driven semantics를 유지하면서 control frequency를 낮추고, 적절한 <code>W</code> 선택 시 congested case에서 goodput과 stability를 개선한다”가 되어야 한다.
+      <div class="note">
+        첫 논문/프로토타입의 중심 기여는
+        <strong>adaptive CTS window policy</strong>로 두고, real cumulative은 확장 설계로 두는 것이 안전하다.
       </div>
     </section>
 
     <section class="section">
-      <h2>10. 한 문장 요약</h2>
+      <h2>7. 기대 효과</h2>
+      <div class="metric">
+        <div class="card">
+          <div>Traffic Shape Awareness</div>
+          <strong>강화</strong>
+          <p>topology와 protocol 차이를 window policy에 반영할 수 있다.</p>
+        </div>
+        <div class="card">
+          <div>Sender Stall</div>
+          <strong>완화</strong>
+          <p>fake cumulative만으로도 reverse path jitter 민감도를 줄일 수 있다.</p>
+        </div>
+        <div class="card">
+          <div>Pipeline Occupancy</div>
+          <strong>향상</strong>
+          <p>낮은 위험 workload에서는 큰 window로 pipeline을 더 잘 채운다.</p>
+        </div>
+        <div class="card">
+          <div>Safety</div>
+          <strong>유지</strong>
+          <p>높은 위험 workload에서는 작은 window로 burst를 억제한다.</p>
+        </div>
+      </div>
       <div class="success">
-        <strong>Cumulative CTS</strong>는 기존의 per-slot CTS를 여러 slot에 대한 bounded future grant로 일반화한 방식이며,
-        receiver-driven admission은 유지한 채 control overhead와 sender idle을 줄이기 위한 설계다.
+        real cumulative까지 가면 여기에 <strong>CTS packet/byte 감소</strong>가 추가된다.
+        하지만 정책 아이디어 자체는 fake cumulative만으로도 충분히 검증 가능하다.
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>8. tradeoff</h2>
+      <ul>
+        <li><strong>장점:</strong> high-risk workload를 더 보수적으로 제어하고, low-risk workload에서는 pipeline을 더 공격적으로 유지할 수 있다.</li>
+        <li><strong>핵심 리스크:</strong> naive하게 큰 <code>W</code>를 주면 cross-rack AllToAll에서 burst를 키울 수 있다.</li>
+        <li><strong>필수 안전장치:</strong> <code>freeSlots</code> cap, <code>perPeerCap</code>, <code>globalCap</code>, high/low watermark hysteresis</li>
+        <li><strong>구현 난이도:</strong> fake cumulative은 비교적 쉽고, real cumulative은 IB control format 변경이 필요하다.</li>
+      </ul>
+      <div class="warn">
+        강한 claim은 "항상 throughput이 증가한다"가 아니라,
+        <strong>"incast risk가 다른 workload에 서로 다른 CTS window를 주는 것이 더 좋은 tradeoff를 만든다"</strong>가 되어야 한다.
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>9. 한 문장 요약</h2>
+      <div class="success">
+        이 아이디어의 본체는 <strong>cumulative CTS 자체</strong>가 아니라,
+        <strong>topology / collective / algorithm / protocol / occupancy를 보고 receiver가 CTS window <code>W</code>를 동적으로 결정하는 adaptive admission policy</strong>다.
       </div>
     </section>
 

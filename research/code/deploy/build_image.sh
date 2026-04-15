@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-IMAGE_TAG=${IMAGE_TAG:-nccl-cu118-dev:latest}
+IMAGE_TAG=${IMAGE_TAG:-nccl-cu121-dev:latest}
 HOST_UID=${HOST_UID:-$(id -u)}
 HOST_GID=${HOST_GID:-$(id -g)}
 HOST_USER=${HOST_USER:-$(id -un)}

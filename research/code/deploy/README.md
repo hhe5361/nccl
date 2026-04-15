@@ -1,12 +1,12 @@
 # Docker Deployment Scripts
 
-This directory packages a CUDA 11.8 development container for the custom NCCL
+This directory packages a CUDA 12.1 development container for the custom NCCL
 workflow discussed in `research/docs`.
 
 ## Files
 
 - `Dockerfile`
-  - CUDA 11.8 devel image with RDMA, OpenMPI, Python, and build dependencies.
+  - CUDA 12.1 devel image with RDMA, OpenMPI, Python, and build dependencies.
 - `build_image.sh`
   - Builds the dev image with the current host UID/GID mapped into the image.
 - `run_dev_container.sh`
