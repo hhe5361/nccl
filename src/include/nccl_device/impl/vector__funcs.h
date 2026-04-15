@@ -485,6 +485,11 @@ NCCL_DEVICE_INLINE EltPack<float, 1> castPack(EltPack<__nv_bfloat16, 1> x) {
 
 template<>
 NCCL_DEVICE_INLINE EltPack<float, 2> castPack(EltPack<__nv_bfloat16, 2> x) {
+  EltPack<float, 2> out{};
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+  out.elts()[0] = __bfloat162float(x.elts()[0]);
+  out.elts()[1] = __bfloat162float(x.elts()[1]);
+#else
   union Bf162PackAccess {
     EltPack<__nv_bfloat16, 2> pack;
     __nv_bfloat162 pair;
@@ -494,10 +499,12 @@ NCCL_DEVICE_INLINE EltPack<float, 2> castPack(EltPack<__nv_bfloat16, 2> x) {
     float2 pair;
   };
   Bf162PackAccess in;
-  Float2PackAccess out;
+  Float2PackAccess vec;
   in.pack = x;
-  out.pair = __bfloat1622float2(in.pair);
-  return out.pack;
+  vec.pair = __bfloat1622float2(in.pair);
+  out = vec.pack;
+#endif
+  return out;
 }
 
 // Specialization for float -> __nv_bfloat16 conversion (downcast from accumulation type)
@@ -510,6 +517,11 @@ NCCL_DEVICE_INLINE EltPack<__nv_bfloat16, 1> castPack(EltPack<float, 1> x) {
 
 template<>
 NCCL_DEVICE_INLINE EltPack<__nv_bfloat16, 2> castPack(EltPack<float, 2> x) {
+  EltPack<__nv_bfloat16, 2> out{};
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+  out.elts()[0] = __float2bfloat16_rn(x.elts()[0]);
+  out.elts()[1] = __float2bfloat16_rn(x.elts()[1]);
+#else
   union Bf162PackAccess {
     EltPack<__nv_bfloat16, 2> pack;
     __nv_bfloat162 pair;
@@ -519,10 +531,12 @@ NCCL_DEVICE_INLINE EltPack<__nv_bfloat16, 2> castPack(EltPack<float, 2> x) {
     float2 pair;
   };
   Float2PackAccess in;
-  Bf162PackAccess out;
+  Bf162PackAccess vec;
   in.pack = x;
-  out.pair = __float22bfloat162_rn(in.pair);
-  return out.pack;
+  vec.pair = __float22bfloat162_rn(in.pair);
+  out = vec.pack;
+#endif
+  return out;
 }
 #endif
 

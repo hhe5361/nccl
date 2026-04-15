@@ -242,17 +242,47 @@ struct Apply_Cast<float, __half, /*EltPerPack=*/2> {
   }
 };
 
-#if defined(__CUDA_BF16_TYPES_EXIST__) && (CUDART_RUNTIME >= 12000 || __CUDA_ARCH__ >= 800)
+#if defined(__CUDA_BF16_TYPES_EXIST__)
 template<>
 struct Apply_Cast<__nv_bfloat16, float, /*EltPerPack=*/2> {
   __device__ __forceinline__ static BytePack<4*2> cast(BytePack<2*2> a) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    union In {
+      BytePack<2*2> pack;
+      __nv_bfloat16 elts[2];
+    } in;
+    union Out {
+      BytePack<4*2> pack;
+      float elts[2];
+    } out;
+    in.pack = a;
+    out.elts[0] = __bfloat162float(in.elts[0]);
+    out.elts[1] = __bfloat162float(in.elts[1]);
+    return out.pack;
+#else
     return toPack(__bfloat1622float2(fromPack<__nv_bfloat162>(a)));
+#endif
   }
 };
 template<>
 struct Apply_Cast<float ,__nv_bfloat16, /*EltPerPack=*/2> {
   __device__ __forceinline__ static BytePack<2*2> cast(BytePack<4*2> a) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    union In {
+      BytePack<4*2> pack;
+      float elts[2];
+    } in;
+    union Out {
+      BytePack<2*2> pack;
+      __nv_bfloat16 elts[2];
+    } out;
+    in.pack = a;
+    out.elts[0] = __float2bfloat16_rn(in.elts[0]);
+    out.elts[1] = __float2bfloat16_rn(in.elts[1]);
+    return out.pack;
+#else
     return toPack(__float22bfloat162_rn(fromPack<float2>(a)));
+#endif
   }
 };
 #endif
