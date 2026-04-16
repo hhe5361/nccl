@@ -1,0 +1,705 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Phase 1 B1 Static Fake Cumulative Plan</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #eef3f7;
+      --panel: #ffffff;
+      --panel-soft: #f7f9fc;
+      --text: #18212b;
+      --muted: #5a6675;
+      --border: #d9e1ea;
+      --accent: #0b5fa5;
+      --accent-soft: #e7f1fb;
+      --good: #10664d;
+      --good-soft: #e8f7f0;
+      --warn: #8a4b00;
+      --warn-soft: #fff2e2;
+      --danger: #8f1d2c;
+      --danger-soft: #fdecef;
+      --shadow: 0 14px 30px rgba(17, 31, 48, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Helvetica, Arial, sans-serif;
+      color: var(--text);
+      line-height: 1.65;
+      background:
+        radial-gradient(circle at top left, rgba(11, 95, 165, 0.08), transparent 28%),
+        linear-gradient(180deg, #f8fafc 0%, var(--bg) 100%);
+    }
+    .page {
+      width: min(1180px, calc(100% - 32px));
+      margin: 24px auto 48px;
+    }
+    .hero, .section, .footer {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+    }
+    .hero {
+      padding: 30px 32px;
+      margin-bottom: 18px;
+    }
+    .section {
+      padding: 26px 28px;
+      margin-bottom: 18px;
+    }
+    .footer {
+      padding: 16px 20px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      padding: 0 12px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+    h1 {
+      margin: 14px 0 10px;
+      font-size: clamp(30px, 4vw, 42px);
+      line-height: 1.08;
+    }
+    h2 {
+      margin: 0 0 14px;
+      font-size: 24px;
+      line-height: 1.2;
+    }
+    h3 {
+      margin: 22px 0 10px;
+      font-size: 18px;
+      line-height: 1.3;
+    }
+    p { margin: 10px 0 0; }
+    ul, ol { margin: 10px 0 0; padding-left: 20px; }
+    li + li { margin-top: 8px; }
+    .subtitle {
+      margin: 0;
+      max-width: 980px;
+      color: var(--muted);
+      font-size: 16px;
+    }
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 18px;
+    }
+    .chip {
+      border: 1px solid var(--border);
+      background: var(--panel-soft);
+      border-radius: 999px;
+      padding: 8px 12px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .grid-2, .grid-3, .grid-4 {
+      display: grid;
+      gap: 14px;
+      margin-top: 16px;
+    }
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .card {
+      background: var(--panel-soft);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+    }
+    .card h3 { margin-top: 0; }
+    .note, .success, .warn, .danger {
+      margin-top: 14px;
+      padding: 14px 16px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+    }
+    .note { background: var(--accent-soft); border-color: #cbdcf5; }
+    .success { background: var(--good-soft); border-color: #c9eadb; }
+    .warn { background: var(--warn-soft); border-color: #efd7b7; }
+    .danger { background: var(--danger-soft); border-color: #f1c7cf; }
+    .code {
+      margin-top: 14px;
+      padding: 16px 18px;
+      border-radius: 14px;
+      border: 1px solid var(--border);
+      background: #101925;
+      color: #e8eef8;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      font-family: Consolas, "SFMono-Regular", Monaco, monospace;
+      font-size: 13px;
+      line-height: 1.7;
+    }
+    .table-wrap {
+      margin-top: 14px;
+      overflow-x: auto;
+    }
+    table {
+      width: 100%;
+      min-width: 780px;
+      border-collapse: collapse;
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      overflow: hidden;
+    }
+    th, td {
+      padding: 12px 14px;
+      text-align: left;
+      vertical-align: top;
+      border-bottom: 1px solid var(--border);
+    }
+    th {
+      background: #f4f7fb;
+      font-weight: 700;
+    }
+    td { background: #fff; }
+    code.inline {
+      font-family: Consolas, "SFMono-Regular", Monaco, monospace;
+      font-size: 0.93em;
+      background: #f2f5fa;
+      border: 1px solid #e1e7f0;
+      border-radius: 6px;
+      padding: 1px 6px;
+      color: #1d2b3a;
+    }
+    @media (max-width: 920px) {
+      .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <div class="eyebrow">Phase 1 / B1</div>
+      <h1>Static Fake Cumulative 구현 및 실험 계획</h1>
+      <p class="subtitle">
+        B1의 목적은 wire format을 바꾸지 않고 receiver proxy가 미리 열어두는 recv depth를
+        고정 <code class="inline">W = 1, 2, 4, 8</code>로 제한하는 것이다.
+        이 단계는 <strong>CTS packet 수 감소</strong> 실험이 아니라,
+        <strong>window shaping이 burst / occupancy / throughput에 주는 영향</strong>을 보는 단계다.
+      </p>
+      <div class="meta">
+        <div class="chip">Main implementation: fake cumulative</div>
+        <div class="chip">Sweep: W=1,2,4,8</div>
+        <div class="chip">Cluster: 8 nodes / 2 racks / Clos / RoCE v2</div>
+        <div class="chip">Deployment target: custom NCCL + nccl-tests or PyTorch DDP</div>
+      </div>
+    </header>
+
+    <section class="section">
+      <h2>1. B1에서 정확히 바꾸는 것</h2>
+      <div class="grid-3">
+        <div class="card">
+          <h3>바꾸는 것</h3>
+          <p>receiver proxy와 send proxy가 동시에 열어둘 수 있는 effective window를 고정값 <code class="inline">W</code>로 제한한다.</p>
+        </div>
+        <div class="card">
+          <h3>안 바꾸는 것</h3>
+          <p>IB CTS packet format, <code class="inline">ncclIbSendFifo</code>, <code class="inline">ncclIbPostFifo()</code> 경로는 그대로 둔다.</p>
+        </div>
+        <div class="card">
+          <h3>의미</h3>
+          <p>CTS는 여전히 per-slot로 발급되지만, receiver가 미리 여는 step 수를 제한해서 aggregate inflight burst를 shaping한다.</p>
+        </div>
+      </div>
+      <div class="success">
+        즉 B1은 "real cumulative CTS"가 아니라
+        <strong>static recv-post / CTS window shaping</strong>이다.
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>2. 수정 파일 목록</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>파일</th>
+              <th>필수/선택</th>
+              <th>수정 이유</th>
+              <th>변경 내용</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code class="inline">src/transport/net.cc</code></td>
+              <td>필수</td>
+              <td>B1의 핵심 로직 위치</td>
+              <td>
+                <code class="inline">NCCL_PHASE1_STATIC_W</code> 파라미터 추가,
+                <code class="inline">sendProxyProgress()</code>와
+                <code class="inline">recvProxyProgress()</code>의
+                <code class="inline">maxDepth</code>를 <code class="inline">W_eff</code>로 대체,
+                로그 필드 및 stall 이벤트 추가
+              </td>
+            </tr>
+            <tr>
+              <td><code class="inline">src/include/proxy.h</code></td>
+              <td>권장</td>
+              <td>stall 로그 중복 방지</td>
+              <td>
+                sub 단위 상태 플래그 추가:
+                <code class="inline">phase1SendWstall</code>,
+                <code class="inline">phase1RecvWstall</code>,
+                <code class="inline">phase1WindowCfgLogged</code>
+              </td>
+            </tr>
+            <tr>
+              <td><code class="inline">src/transport/net_ib/p2p.cc</code></td>
+              <td>권장</td>
+              <td>시간 기반 분석 정확도 개선</td>
+              <td>
+                기존 <code class="inline">IB_CTS_ISSUE</code>, <code class="inline">IB_SEND_POST</code>
+                로그에 <code class="inline">tNs</code> 추가
+              </td>
+            </tr>
+            <tr>
+              <td><code class="inline">research/code/phase1/...</code></td>
+              <td>선택</td>
+              <td>후처리 및 시각화</td>
+              <td>Phase 1 로그 파서와 plotting script 추가</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="warn">
+        B1에서는 <code class="inline">sharedBuffSlot = posted % W_eff</code>로 modulo를 바꿔도 안전하다.
+        이유는 <code class="inline">W</code>가 op 도중 바뀌지 않는 static 값이기 때문이다.
+        반대로 B2/B3처럼 adaptive window를 같은 op 안에서 바꾸려면 shared buffer indexing 정책을 다시 설계해야 한다.
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>3. 실제 코드 변경 포인트</h2>
+      <h3>3.1 새 파라미터 추가</h3>
+      <div class="code">NCCL_PARAM(Phase1StaticW, "PHASE1_STATIC_W", 0);</div>
+      <p>
+        해석:
+      </p>
+      <ul>
+        <li><code class="inline">0</code> 또는 unset: stock NCCL 동작</li>
+        <li><code class="inline">1,2,4,8</code>: B1 static fake cumulative depth</li>
+      </ul>
+
+      <h3>3.2 helper 추가</h3>
+      <div class="code">baseDepth = min(NCCL_STEPS, NCCL_SHARED_STEPS / args->nsubs)
+cfgW = ncclParamPhase1StaticW()
+W_eff = (cfgW &gt; 0) ? max(1, min(baseDepth, cfgW)) : baseDepth</div>
+      <p>
+        이 helper는 send/recv proxy 양쪽에서 같은 값을 써야 한다.
+        shared buffer 경로가 <code class="inline">posted % depth</code>에 의존하기 때문이다.
+      </p>
+
+      <h3>3.3 sendProxyProgress() 수정</h3>
+      <p>수정 포인트:</p>
+      <ul>
+        <li><code class="inline">int maxDepth = ...</code>를 <code class="inline">int W_eff = ...</code>로 치환</li>
+        <li><code class="inline">sub-&gt;posted &lt; sub-&gt;done + maxDepth</code>를 <code class="inline">... + W_eff</code>로 변경</li>
+        <li><code class="inline">sharedBuffSlot = sub-&gt;posted % maxDepth</code>를 <code class="inline">% W_eff</code>로 변경</li>
+        <li>window 때문에 더 못 여는 경우 <code class="inline">PROXY_SEND_WSTALL</code> 로그 추가</li>
+      </ul>
+
+      <h3>3.4 recvProxyProgress() 수정</h3>
+      <p>수정 포인트:</p>
+      <ul>
+        <li><code class="inline">int maxDepth = ...</code>를 <code class="inline">int W_eff = ...</code>로 치환</li>
+        <li><code class="inline">sub-&gt;posted &gt;= sub-&gt;done + maxDepth</code>를 <code class="inline">... + W_eff</code>로 변경</li>
+        <li><code class="inline">sharedBuffSlot = sub-&gt;posted % maxDepth</code>를 <code class="inline">% W_eff</code>로 변경</li>
+        <li>window 때문에 더 못 여는 경우 <code class="inline">PROXY_RECV_WSTALL</code> 로그 추가</li>
+      </ul>
+
+      <h3>3.5 기존 로그 확장</h3>
+      <p>
+        현재 <code class="inline">phase0ProxyLog()</code>에는 base/posted/received/transmitted/done만 있다.
+        B1에서는 아래 필드를 추가하는 것이 좋다.
+      </p>
+      <div class="code">tNs=
+wBase=
+wCfg=
+wEff=
+occPd=posted-done
+occTr=transmitted-done</div>
+      <p>
+        <code class="inline">tNs</code>는 <code class="inline">clockNano()</code>를 사용하면 된다.
+      </p>
+    </section>
+
+    <section class="section">
+      <h2>4. 추천 로그 포맷 초안</h2>
+      <h3>4.1 op 시작 시 설정 로그</h3>
+      <div class="code">PHASE1 event=PROXY_WINDOW_CFG
+tNs=&lt;clockNano&gt;
+rank=&lt;rank&gt;
+peer=&lt;peer&gt;
+channel=&lt;channelId&gt;
+coll=&lt;coll&gt;
+collApi=&lt;collApi&gt;
+algo=&lt;algo&gt;
+proto=&lt;proto&gt;
+nsubs=&lt;nsubs&gt;
+wBase=&lt;baseDepth&gt;
+wCfg=&lt;cfgW&gt;
+wEff=&lt;W_eff&gt;
+shared=&lt;0|1&gt;</div>
+
+      <h3>4.2 recv stall 로그</h3>
+      <div class="code">PHASE1 event=PROXY_RECV_WSTALL
+tNs=&lt;clockNano&gt;
+rank=&lt;rank&gt;
+peer=&lt;peer&gt;
+channel=&lt;channelId&gt;
+slot=&lt;(base+posted)%NCCL_STEPS&gt;
+wEff=&lt;W_eff&gt;
+posted=&lt;posted&gt;
+done=&lt;done&gt;
+occPd=&lt;posted-done&gt;
+nsteps=&lt;nsteps&gt;</div>
+
+      <h3>4.3 send stall 로그</h3>
+      <div class="code">PHASE1 event=PROXY_SEND_WSTALL
+tNs=&lt;clockNano&gt;
+rank=&lt;rank&gt;
+peer=&lt;peer&gt;
+channel=&lt;channelId&gt;
+slot=&lt;(base+posted)%NCCL_STEPS&gt;
+wEff=&lt;W_eff&gt;
+posted=&lt;posted&gt;
+done=&lt;done&gt;
+occPd=&lt;posted-done&gt;
+nsteps=&lt;nsteps&gt;</div>
+
+      <h3>4.4 기존 event 확장</h3>
+      <div class="code">PHASE0 event=PROXY_RECV_POST ...
+tNs=
+wBase=
+wCfg=
+wEff=
+occPd=
+occTr=</div>
+      <p>
+        같은 필드를 <code class="inline">PROXY_SEND_POST</code>, <code class="inline">PROXY_SEND_DONE</code>,
+        <code class="inline">PROXY_RECV_NET_DONE</code>, <code class="inline">PROXY_RECV_VISIBLE</code>,
+        <code class="inline">IB_CTS_ISSUE</code>, <code class="inline">IB_SEND_POST</code>에도 붙이는 것을 권장한다.
+      </p>
+      <div class="success">
+        시간 기반 binning, occupancy timeline, stall duration을 보려면
+        <code class="inline">tNs</code>는 사실상 필수다.
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>5. 수집할 데이터</h2>
+      <div class="grid-2">
+        <div class="card">
+          <h3>성능 데이터</h3>
+          <ul>
+            <li>throughput</li>
+            <li>latency</li>
+            <li>p95 / p99 latency</li>
+            <li>goodput</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>proxy / transport 데이터</h3>
+          <ul>
+            <li><code class="inline">W_eff</code> per run</li>
+            <li><code class="inline">posted-done</code>, <code class="inline">transmitted-done</code></li>
+            <li><code class="inline">PROXY_RECV_WSTALL</code>, <code class="inline">PROXY_SEND_WSTALL</code></li>
+            <li><code class="inline">IB_CTS_ISSUE</code>, <code class="inline">IB_SEND_POST</code></li>
+          </ul>
+        </div>
+      </div>
+
+      <h3>5.1 대표 지표</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>지표</th>
+              <th>정의</th>
+              <th>왜 보는가</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Throughput</td>
+              <td>benchmark reported throughput</td>
+              <td>W 축소의 성능 손실 측정</td>
+            </tr>
+            <tr>
+              <td>p99 latency</td>
+              <td>benchmark reported p99</td>
+              <td>tail 성능 확인</td>
+            </tr>
+            <tr>
+              <td>Max receiver occupancy</td>
+              <td><code class="inline">max(posted-done)</code></td>
+              <td>실제 in-flight depth 축소 확인</td>
+            </tr>
+            <tr>
+              <td>Peak send burst</td>
+              <td><code class="inline">max(sum(IB_SEND_POST.size) per 100us bin)</code></td>
+              <td>burst 완화 확인</td>
+            </tr>
+            <tr>
+              <td>Burstiness index</td>
+              <td><code class="inline">p99(bin_bytes) / mean(bin_bytes)</code></td>
+              <td>평균이 아닌 burst shape 비교</td>
+            </tr>
+            <tr>
+              <td>Window stall ratio</td>
+              <td><code class="inline">stall_events / (stall_events + recv_posts)</code> 또는 시간 기반 비율</td>
+              <td>W가 실제로 제어를 건 정도 측정</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>5.2 추가 추천 지표</h3>
+      <ul>
+        <li><code class="inline">CTS issue count / 100us</code></li>
+        <li><code class="inline">recv post count / 100us</code></li>
+        <li><code class="inline">IB_CTS_ISSUE - IB_SEND_POST</code> delta</li>
+        <li><code class="inline">PROXY_RECV_POST - PROXY_RECV_VISIBLE</code> delta</li>
+      </ul>
+      <div class="warn">
+        B1은 fake cumulative이므로, 총 CTS packet 수 감소를 기대하면 안 된다.
+        대신 시간축에서 <strong>얼마나 덜 몰려서 나가느냐</strong>를 봐야 한다.
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>6. 데이터 수집 방식</h2>
+      <h3>6.1 로그 저장 경로</h3>
+      <div class="code">/mnt/nfs_share/cts_experiments/
+  phase1_YYMMDD_HHMMSS/
+    B0/
+    W1/
+    W2/
+    W4/
+    W8/
+      &lt;workload_name&gt;/
+        worker01/
+        worker02/
+        ...
+        summary/</div>
+
+      <h3>6.2 한 run의 최소 산출물</h3>
+      <ul>
+        <li>raw NCCL log per worker</li>
+        <li>benchmark stdout/stderr</li>
+        <li>run metadata JSON or TXT
+          <br>예: collective, algo, proto, msg size, placement, W, hostname list</li>
+        <li>parsed CSV
+          <br><code class="inline">run_summary.csv</code>,
+          <code class="inline">event_timeseries.csv</code>,
+          <code class="inline">occupancy_summary.csv</code>,
+          <code class="inline">stall_summary.csv</code></li>
+      </ul>
+
+      <h3>6.3 권장 parser 출력</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>파일</th>
+              <th>행 단위</th>
+              <th>주요 컬럼</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code class="inline">run_summary.csv</code></td>
+              <td>run 하나</td>
+              <td>workload, W, throughput, p99, peak_send_burst, max_occ, stall_ratio</td>
+            </tr>
+            <tr>
+              <td><code class="inline">event_timeseries.csv</code></td>
+              <td>time bin 하나</td>
+              <td>bin_start_ns, send_post_bytes, cts_issue_count, recv_post_count</td>
+            </tr>
+            <tr>
+              <td><code class="inline">occupancy_summary.csv</code></td>
+              <td>rank/channel or run</td>
+              <td>max_posted_done, p99_posted_done, max_trans_done</td>
+            </tr>
+            <tr>
+              <td><code class="inline">stall_summary.csv</code></td>
+              <td>run 하나</td>
+              <td>send_wstall_count, recv_wstall_count, stall_time_ratio</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>7. 시각화 계획</h2>
+      <h3>7.1 꼭 그릴 그림</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Figure</th>
+              <th>x축</th>
+              <th>y축</th>
+              <th>목적</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>F1. W sweep throughput</td>
+              <td><code class="inline">W</code></td>
+              <td>throughput</td>
+              <td>작은 W의 성능 비용 측정</td>
+            </tr>
+            <tr>
+              <td>F2. W sweep burst</td>
+              <td><code class="inline">W</code></td>
+              <td>peak_send_burst 또는 burstiness index</td>
+              <td>W 축소가 burst를 줄였는지 확인</td>
+            </tr>
+            <tr>
+              <td>F3. W sweep occupancy</td>
+              <td><code class="inline">W</code></td>
+              <td>max / p99 posted-done</td>
+              <td>inflight depth가 실제로 제한되는지 확인</td>
+            </tr>
+            <tr>
+              <td>F4. Timeline comparison</td>
+              <td>time</td>
+              <td>occupancy와 send_post_bytes</td>
+              <td><code class="inline">W=1</code> vs <code class="inline">W=8</code> 직관적 비교</td>
+            </tr>
+            <tr>
+              <td>F5. Pareto plot</td>
+              <td>peak_send_burst</td>
+              <td>throughput</td>
+              <td>burst와 throughput의 tradeoff 시각화</td>
+            </tr>
+            <tr>
+              <td>F6. Best-W heatmap</td>
+              <td>workload</td>
+              <td>best fixed W</td>
+              <td>workload마다 best W가 다름을 입증</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>7.2 추천 시각화 대상 workload</h3>
+      <ul>
+        <li>가장 공격적인 workload 1개
+          <br>예: <code class="inline">cross-rack + AllToAll + Simple + 32MB or 256MB</code></li>
+        <li>중간 workload 1개
+          <br>예: <code class="inline">cross-rack + AllReduce + Ring + Simple</code></li>
+        <li>낮은 위험 workload 1개
+          <br>예: <code class="inline">intra-rack + AllReduce + Ring + LL128</code></li>
+      </ul>
+    </section>
+
+    <section class="section">
+      <h2>8. B1 해석 기준</h2>
+      <div class="grid-4">
+        <div class="card">
+          <h3><code class="inline">W=1</code></h3>
+          <p>가장 보수적이다. burst는 가장 작아져야 하지만 throughput 손실이 가장 크다.</p>
+        </div>
+        <div class="card">
+          <h3><code class="inline">W=2</code></h3>
+          <p>high-risk workload에서 타협점이 될 가능성이 높다.</p>
+        </div>
+        <div class="card">
+          <h3><code class="inline">W=4</code></h3>
+          <p>중간 위험 workload에서 균형점이 될 가능성이 높다.</p>
+        </div>
+        <div class="card">
+          <h3><code class="inline">W=8</code></h3>
+          <p>stock과 가장 가깝다. throughput은 좋지만 burst/occupancy가 가장 높을 가능성이 크다.</p>
+        </div>
+      </div>
+      <div class="success">
+        B1의 결론은 "어떤 W가 항상 최고다"가 아니다.
+        <strong>best fixed W is workload-dependent</strong>를 입증하는 것이 Phase 1의 목적이다.
+      </div>
+      <div class="warn">
+        따라서 논문 메시지는 "B1이 정답"이 아니라,
+        <strong>B1 결과가 B2/B3 adaptive policy의 필요성을 만든다</strong>로 써야 한다.
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>9. 추천 실험 순서</h2>
+      <ol>
+        <li>B0 baseline 먼저 1회 확보</li>
+        <li><code class="inline">AllReduce / Ring / Simple / 32MB</code>로 <code class="inline">W=1,2,4,8</code> smoke sweep</li>
+        <li>같은 workload에서 intra-rack vs cross-rack 비교</li>
+        <li><code class="inline">LL128</code> variant 추가</li>
+        <li><code class="inline">AllToAll</code> 가능 시 same sweep 수행</li>
+        <li>크기 sweep: <code class="inline">4MB, 32MB, 256MB</code></li>
+        <li>파서로 CSV 생성 후 F1~F6 그림 생성</li>
+      </ol>
+    </section>
+
+    <section class="section">
+      <h2>10. Deploy 요약</h2>
+      <h3>10.1 추천 방식</h3>
+      <p>
+        기존 [deploy scripts](/mnt/c/users/hyoeun/dev/nccl/research/code/deploy/README.md) 기반으로
+        custom NCCL을 빌드한 뒤, <code class="inline">nccl-tests</code> 또는 PyTorch DDP에서
+        <code class="inline">LD_PRELOAD</code> 또는 source-built PyTorch로 실험하는 것이 가장 안전하다.
+      </p>
+
+      <h3>10.2 간단한 deploy 절차</h3>
+      <ol>
+        <li>실험 브랜치를 worker 노드에 배포</li>
+        <li>custom NCCL 빌드</li>
+        <li><code class="inline">nccl-tests</code> 또는 PyTorch 환경에서 custom <code class="inline">libnccl.so</code> 링크</li>
+        <li><code class="inline">NCCL_PHASE0_LOG=1</code>, <code class="inline">NCCL_PHASE1_STATIC_W=&lt;1|2|4|8&gt;</code> 설정</li>
+        <li><code class="inline">NCCL_DEBUG_FILE</code>를 NFS 경로로 지정</li>
+        <li>run metadata와 raw logs를 함께 저장</li>
+      </ol>
+
+      <h3>10.3 예시 환경변수</h3>
+      <div class="code">export NCCL_PHASE0_LOG=1
+export NCCL_PHASE1_STATIC_W=4
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=NET
+export NCCL_DEBUG_FILE=/mnt/nfs_share/cts_experiments/phase1_YYMMDD_HHMMSS/W4/&lt;workload&gt;/worker%h/nccl.%p.log
+
+# protocol / algorithm sweep
+export NCCL_ALGO=Ring
+export NCCL_PROTO=Simple</div>
+
+      <h3>10.4 주의점</h3>
+      <ul>
+        <li>PyTorch DDP로 돌릴 경우 실제로 custom NCCL이 로드됐는지 반드시 확인</li>
+        <li>모든 노드에서 같은 commit / 같은 env로 실행</li>
+        <li>placement가 바뀌지 않도록 hostfile 또는 rank mapping을 고정</li>
+      </ul>
+    </section>
+
+    <section class="footer">
+      <strong>요약</strong><br>
+      B1은 static fake cumulative window sweep 단계다. 구현 핵심은
+      <code class="inline">send/recv proxy의 effective window를 W=1,2,4,8로 제한</code>하는 것이고,
+      실험 핵심은 throughput 자체보다 <strong>burst / occupancy / throughput tradeoff</strong>를 보는 것이다.
+    </section>
+  </div>
+</body>
+</html>

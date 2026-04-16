@@ -1,0 +1,68 @@
+Phase 1 / B1 static fake cumulative execution order
+
+0. Preparation
+- Check custom NCCL build works on one worker first.
+- Confirm custom libnccl.so is actually loaded by nccl-tests or PyTorch.
+- Create run root:
+  /mnt/nfs_share/cts_experiments/phase1_YYMMDD_HHMMSS
+
+1. Implement B1
+- Add NCCL_PHASE1_STATIC_W parameter.
+- Replace maxDepth with W_eff in sendProxyProgress() and recvProxyProgress().
+- Replace sharedBuffSlot modulo maxDepth with modulo W_eff.
+- Add logs:
+  - PROXY_WINDOW_CFG
+  - PROXY_RECV_WSTALL
+  - PROXY_SEND_WSTALL
+  - extend existing PHASE0 logs with tNs, wBase, wCfg, wEff, occPd, occTr
+
+2. Smoke test
+- Run B0 and W=4 on a small AllReduce ring simple case.
+- Verify correctness and no deadlock.
+- Verify logs contain W_eff and stall events.
+
+3. Baseline runs
+- Collect B0 first for every workload before sweeping W.
+- Keep placement and env fixed.
+
+4. Primary B1 sweep
+- Workload A:
+  AllReduce / Ring / Simple / 32MB
+  - intra-rack: worker01-04
+  - cross-rack: worker01-08
+  - sweep W=1,2,4,8
+
+5. Secondary sweep
+- Workload B:
+  AllReduce / Ring / LL128 / 32MB
+  - intra-rack and cross-rack
+  - sweep W=1,2,4,8
+
+6. Large message sweep
+- Repeat A and B with 256MB.
+
+7. Optional aggressive workload
+- AllToAll / Simple / 32MB and 256MB
+- Prefer cross-rack first.
+- Sweep W=1,2,4,8.
+
+8. Data extraction
+- Parse raw logs into:
+  - run_summary.csv
+  - event_timeseries.csv
+  - occupancy_summary.csv
+  - stall_summary.csv
+
+9. Figures
+- F1: W vs throughput
+- F2: W vs peak send burst
+- F3: W vs max/p99 receiver occupancy
+- F4: timeline comparison for W=1 vs W=8
+- F5: Pareto plot (peak burst vs throughput)
+- F6: workload -> best fixed W heatmap
+
+10. Interpretation
+- Expect W=1 to minimize burst but hurt throughput.
+- Expect W=8 to maximize throughput but increase burst and occupancy.
+- Goal is to show best fixed W depends on workload.
+- Use this result to justify B2/B3 adaptive policy.
