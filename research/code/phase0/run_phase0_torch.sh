@@ -52,7 +52,22 @@ echo "[phase0] TARGET_SCRIPT=${TARGET_SCRIPT}"
 echo "[phase0] NCCL_DEBUG_FILE=${NCCL_DEBUG_FILE}"
 echo "[phase0] NCCL_ALGO=${NCCL_ALGO} NCCL_PROTO=${NCCL_PROTO} NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL}"
 
-torchrun \
+if command -v torchrun >/dev/null 2>&1; then
+  LAUNCHER=(torchrun)
+elif python - <<'PYTORCHCHECK' >/dev/null 2>&1
+import importlib.util
+import sys
+sys.exit(0 if importlib.util.find_spec('torch.distributed.run') else 1)
+PYTORCHCHECK
+then
+  LAUNCHER=(python -m torch.distributed.run)
+else
+  echo "[phase0] PyTorch launcher not found in current environment." >&2
+  echo "[phase0] Verify the venv first: python -c 'import torch; print(torch.__version__)'" >&2
+  exit 1
+fi
+
+"${LAUNCHER[@]}" \
   --nnodes="${NNODES}" \
   --nproc_per_node="${NPROC_PER_NODE}" \
   --node_rank="${NODE_RANK}" \
