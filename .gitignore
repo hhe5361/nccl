@@ -3,5 +3,5 @@
 *.gcov
 /coverage/
 research/docs/
-research/code/phase0/output/
+research/code/*/output/
 *.html
