@@ -167,6 +167,7 @@ static ncclResult_t canConnect(int* ret, struct ncclComm* comm, struct ncclTopoG
 NCCL_PARAM(NetSharedBuffers, "NET_SHARED_BUFFERS", -2);
 NCCL_PARAM(NetSharedComms, "NET_SHARED_COMMS", 1);
 NCCL_PARAM(Phase0Log, "PHASE0_LOG", 0);
+NCCL_PARAM(Phase1StaticW, "PHASE1_STATIC_W", 0);
 
 struct setupReq {
   int tpRank;
@@ -188,11 +189,15 @@ static inline void phase0ProxyLog(
     struct ncclProxySubArgs* sub,
     const char* event,
     int slot,
-    ssize_t size) {
+    ssize_t size,
+    int wBase,
+    int wCfg,
+    int wEff) {
   if (ncclParamPhase0Log() == 0) return;
   INFO(NCCL_NET,
-      "PHASE0 event=%s rank=%d peer=%d channel=%d slot=%d coll=%s collApi=%s algo=%s proto=%s size=%lld base=%llu posted=%llu received=%llu transmitted=%llu done=%llu nsteps=%d",
+      "PHASE0 event=%s tNs=%llu rank=%d peer=%d channel=%d slot=%d coll=%s collApi=%s algo=%s proto=%s size=%lld base=%llu posted=%llu received=%llu transmitted=%llu done=%llu nsteps=%d wBase=%d wCfg=%d wEff=%d occPd=%llu occTr=%llu",
       event,
+      (unsigned long long)clockNano(),
       proxyState->tpRank,
       sub->peer,
       sub->channelId,
@@ -207,7 +212,12 @@ static inline void phase0ProxyLog(
       (unsigned long long)sub->received,
       (unsigned long long)sub->transmitted,
       (unsigned long long)sub->done,
-      sub->nsteps);
+      sub->nsteps,
+      wBase,
+      wCfg,
+      wEff,
+      (unsigned long long)(sub->posted - sub->done),
+      (unsigned long long)(sub->transmitted - sub->done));
 }
 
 static_assert(sizeof(ncclNetHandle_t) + sizeof(int) <= CONNECT_SIZE, "Not large enough ncclConnect to hold ncclNetHandle_t and useGdr flag");
@@ -663,6 +673,87 @@ static ncclResult_t recvFree(struct ncclComm* comm, struct ncclConnector* recv) 
 }
 
 #define NCCL_SHARED_STEPS 16
+
+static inline int phase1WindowBaseDepth(struct ncclProxyArgs* args) {
+  return std::min(NCCL_STEPS, NCCL_SHARED_STEPS/args->nsubs);
+}
+
+static inline int phase1WindowCfg() {
+  return ncclParamPhase1StaticW();
+}
+
+static inline int phase1WindowEff(struct ncclProxyArgs* args) {
+  int wBase = phase1WindowBaseDepth(args);
+  int wCfg = phase1WindowCfg();
+  return (wCfg > 0) ? std::min(wBase, std::max(1, wCfg)) : wBase;
+}
+
+static inline void phase1ProxyWindowCfgLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    int shared,
+    int wBase,
+    int wCfg,
+    int wEff) {
+  if (ncclParamPhase0Log() == 0 || sub->phase1WindowCfgLogged) return;
+  INFO(NCCL_NET,
+      "PHASE1 event=PROXY_WINDOW_CFG tNs=%llu rank=%d peer=%d channel=%d coll=%s collApi=%s algo=%s proto=%s shared=%d nsubs=%d base=%llu nsteps=%d wBase=%d wCfg=%d wEff=%d",
+      (unsigned long long)clockNano(),
+      proxyState->tpRank,
+      sub->peer,
+      sub->channelId,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol),
+      shared,
+      args->nsubs,
+      (unsigned long long)sub->base,
+      sub->nsteps,
+      wBase,
+      wCfg,
+      wEff);
+  sub->phase1WindowCfgLogged = 1;
+}
+
+static inline void phase1ProxyWstallLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    const char* event,
+    int slot,
+    int wBase,
+    int wCfg,
+    int wEff,
+    uint8_t* stallFlag) {
+  if (ncclParamPhase0Log() == 0 || *stallFlag) return;
+  INFO(NCCL_NET,
+      "PHASE1 event=%s tNs=%llu rank=%d peer=%d channel=%d slot=%d coll=%s collApi=%s algo=%s proto=%s base=%llu posted=%llu received=%llu transmitted=%llu done=%llu nsteps=%d wBase=%d wCfg=%d wEff=%d occPd=%llu occTr=%llu",
+      event,
+      (unsigned long long)clockNano(),
+      proxyState->tpRank,
+      sub->peer,
+      sub->channelId,
+      slot,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol),
+      (unsigned long long)sub->base,
+      (unsigned long long)sub->posted,
+      (unsigned long long)sub->received,
+      (unsigned long long)sub->transmitted,
+      (unsigned long long)sub->done,
+      sub->nsteps,
+      wBase,
+      wCfg,
+      wEff,
+      (unsigned long long)(sub->posted - sub->done),
+      (unsigned long long)(sub->transmitted - sub->done));
+  *stallFlag = 1;
+}
+
 static ncclResult_t sharedNetBuffersInit(struct ncclProxyState* proxyState, int cuda, int tpLocalRank, int type, int sameProcess,
     int nChannels, char** gpuPtr, char** cpuPtr, int* size, ncclIpcDesc *ipcDesc) {
   if (cuda == 0 && sameProcess == 0) {
@@ -1274,6 +1365,9 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
       // Set step base for next op
       resources->step = sub->base + sub->nsteps;
       sub->posted = sub->transmitted = sub->done = 0;
+      sub->phase1WindowCfgLogged = 0;
+      sub->phase1SendWstall = 0;
+      sub->phase1RecvWstall = 0;
       ncclProfilerRecordProxyOpEventState(s, args, ncclProfilerProxyOpInProgress_v4);
       if (!sub->reg)
         sub->sendMhandle = resources->mhandles[args->protocol];
@@ -1283,7 +1377,9 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
   args->idle = 1;
   if (args->state == ncclProxyOpProgress) {
     int p = args->protocol;
-    int maxDepth = std::min(NCCL_STEPS, NCCL_SHARED_STEPS/args->nsubs);
+    int wBase = phase1WindowBaseDepth(args);
+    int wCfg = phase1WindowCfg();
+    int wEff = phase1WindowEff(args);
     for (int s=0; s<args->nsubs; s++) {
       struct ncclProxySubArgs* sub = args->subs+s;
       int postedStepId = sub->posted;
@@ -1294,13 +1390,15 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
       volatile struct ncclConnFifo* connFifo = (volatile struct ncclConnFifo*)resources->recvMem->connFifo;
       int stepSize = resources->buffSizes[p] / NCCL_STEPS;
       char* localBuff = NCCL_NET_MAP_GET_POINTER(&resources->map, cpu, buffs[p]);
+      phase1ProxyWindowCfgLog(proxyState, args, sub, resources->shared, wBase, wCfg, wEff);
       // Post buffers to the GPU
-      if (sub->posted < sub->nsteps && sub->posted < sub->done + maxDepth) {
+      if (sub->posted < sub->nsteps && sub->posted < sub->done + wEff) {
+        sub->phase1SendWstall = 0;
         ncclProfilerStartSendProxyStepEvent(s, args, postedStepId);
         int buffSlot = (sub->base+sub->posted)%NCCL_STEPS;
         if (resources->shared) {
           if (!sub->reg) {
-            int sharedBuffSlot = sub->posted%maxDepth;
+            int sharedBuffSlot = sub->posted%wEff;
             int offset;
             NCCLCHECK(sharedBuffersGet(proxyState, sub->channelId, sharedBuffSlot*args->nsubs+s, &offset, NULL));
             resources->recvMem->connFifo[buffSlot].offset = offset;
@@ -1316,6 +1414,8 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
         ncclProfilerRecordProxyStepEventState(s, args, postedStepId, ncclProfilerProxyStepSendGPUWait);
         args->idle = 0;
         continue;
+      } else if (sub->posted < sub->nsteps) {
+        phase1ProxyWstallLog(proxyState, args, sub, "PROXY_SEND_WSTALL", (sub->base+sub->posted)%NCCL_STEPS, wBase, wCfg, wEff, &sub->phase1SendWstall);
       }
       // Check whether we received data from the GPU and send it to the network
       if (sub->transmitted < sub->posted && sub->transmitted < sub->done + NCCL_STEPS) {
@@ -1372,7 +1472,7 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
             if (sub->requests[buffSlot] != NULL) {
               TRACE(NCCL_NET, "sendProxy [%ld/%d/%d] Isend posted, req %p, buff %p, size %d, proto %d, myRank %d, channelId %d, mhandle %p", sub->transmitted, buffSlot, sub->nsteps, sub->requests[buffSlot], buff, size, p, proxyState->tpRank, sub->channelId, sub->sendMhandle);
               sub->transSize = size;
-              phase0ProxyLog(proxyState, args, sub, "PROXY_SEND_POST", buffSlot, size);
+              phase0ProxyLog(proxyState, args, sub, "PROXY_SEND_POST", buffSlot, size, wBase, wCfg, wEff);
               sub->transmitted += args->sliceSteps;
               ncclProfilerRecordProxyStepEventState(s, args, transmittedStepId, ncclProfilerProxyStepSendWait);
               args->idle = 0;
@@ -1392,7 +1492,7 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
           connFifo[buffSlot].size = -1;
           std::atomic_thread_fence(std::memory_order_seq_cst);
           TRACE(NCCL_NET, "sendProxy [%ld/%d/%d] request %p done", sub->done, buffSlot, sub->nsteps, sub->requests[buffSlot]);
-          phase0ProxyLog(proxyState, args, sub, "PROXY_SEND_DONE", buffSlot, size);
+          phase0ProxyLog(proxyState, args, sub, "PROXY_SEND_DONE", buffSlot, size, wBase, wCfg, wEff);
           sub->done += args->sliceSteps;
           ncclProfilerStopProxyStepEvent(s, args, doneStepId);
 
@@ -1456,6 +1556,9 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
       resources->step = sub->base + sub->nsteps;
       sub->posted = sub->received = sub->transmitted = sub->done = 0;
       sub->regBufferReady = 0;
+      sub->phase1WindowCfgLogged = 0;
+      sub->phase1SendWstall = 0;
+      sub->phase1RecvWstall = 0;
       for (int i=0; i<groupSize; i++) sub[-i].groupSize = groupSize;
       ncclProfilerRecordProxyOpEventState(s, args, ncclProfilerProxyOpInProgress_v4);
       if (!sub->reg)
@@ -1466,7 +1569,9 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
   args->idle = 1;
   if (args->state == ncclProxyOpProgress) {
     int p = args->protocol;
-    int maxDepth = std::min(NCCL_STEPS, NCCL_SHARED_STEPS/args->nsubs);
+    int wBase = phase1WindowBaseDepth(args);
+    int wCfg = phase1WindowCfg();
+    int wEff = phase1WindowEff(args);
     for (int s=0; s<args->nsubs; s+=args->subs[s].groupSize) {
       struct ncclProxySubArgs* subGroup = args->subs+s;
       int subCount = 0;
@@ -1479,9 +1584,15 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
         struct ncclProxySubArgs* sub = subGroup + i;
         int postedStepId = sub->posted;
         if (sub->posted < sub->nsteps) {
-          if (sub->posted >= sub->done + maxDepth) { subCount = 0; break; }
-          ncclProfilerStartRecvProxyStepEvent(s+i, args, postedStepId);
           struct recvNetResources* resources = (struct recvNetResources*) (sub->connection->transportResources);
+          phase1ProxyWindowCfgLog(proxyState, args, sub, resources->shared, wBase, wCfg, wEff);
+          if (sub->posted >= sub->done + wEff) {
+            phase1ProxyWstallLog(proxyState, args, sub, "PROXY_RECV_WSTALL", (sub->base+sub->posted)%NCCL_STEPS, wBase, wCfg, wEff, &sub->phase1RecvWstall);
+            subCount = 0;
+            break;
+          }
+          sub->phase1RecvWstall = 0;
+          ncclProfilerStartRecvProxyStepEvent(s+i, args, postedStepId);
           int stepSize = resources->buffSizes[p] / NCCL_STEPS;
           char* localBuff = NCCL_NET_MAP_GET_POINTER(&resources->map, cpu, buffs[p]);
           int buffSlot = (sub->base+sub->posted)%NCCL_STEPS;
@@ -1495,7 +1606,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
                 ptrs[subCount] = sub->recvbuff + sub->posted * NCCL_MAX_NET_SIZE;
                 sizes[subCount] = std::min(NCCL_MAX_NET_SIZE, (ssize_t)(sub->nbytes - sub->posted * NCCL_MAX_NET_SIZE));
               } else {
-                int sharedBuffSlot = sub->posted % maxDepth;
+                int sharedBuffSlot = sub->posted % wEff;
                 int offset;
                 NCCLCHECK(sharedBuffersGet(proxyState, sub->channelId, sharedBuffSlot * args->nsubs + s + i, &offset, sizes + subCount));
                 connFifo[buffSlot].offset = offset;
@@ -1538,7 +1649,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             struct ncclProxySubArgs* sub = subGroup+i;
             int postedStepId = sub->posted;
             TRACE(NCCL_NET, "recvProxy [%ld/%ld/%d] Irecv posted, buff %p, size %ld, myRank %d, channelId %d, mhandle %p", sub->posted, (sub->base + sub->posted) % NCCL_STEPS, sub->nsteps, ptrs[i], sizes[i], proxyState->tpRank, sub->channelId, mhandles[i]);
-            phase0ProxyLog(proxyState, args, sub, "PROXY_RECV_POST", (sub->base + sub->posted) % NCCL_STEPS, sizes[i]);
+            phase0ProxyLog(proxyState, args, sub, "PROXY_RECV_POST", (sub->base + sub->posted) % NCCL_STEPS, sizes[i], wBase, wCfg, wEff);
             sub->posted += args->sliceSteps;
             ncclProfilerRecordProxyStepEventState(s+i, args, postedStepId, ncclProfilerProxyStepRecvWait);
           }
@@ -1570,7 +1681,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             volatile struct ncclConnFifo* connFifo = (volatile struct ncclConnFifo*)resources->recvMem->connFifo;
             connFifo[buffSlot].size = -1;
             sub->transSize = sizes[i];
-            phase0ProxyLog(proxyState, args, sub, "PROXY_RECV_NET_DONE", buffSlot, sizes[i]);
+            phase0ProxyLog(proxyState, args, sub, "PROXY_RECV_NET_DONE", buffSlot, sizes[i], wBase, wCfg, wEff);
             sub->received += args->sliceSteps;
             ncclProfilerRecordProxyStepEventState(s+i, args, receivedStepId, ncclProfilerProxyStepRecvFlushWait);
             if (step < sub->nsteps) {
@@ -1643,7 +1754,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
               *recvTail = sub->base + sub->transmitted;
               if (resources->gdcSync) wc_store_fence(); // Flush out WC write
             }
-            phase0ProxyLog(proxyState, args, sub, "PROXY_RECV_VISIBLE", (sub->base + transmittedStepId) % NCCL_STEPS, sub->transSize);
+            phase0ProxyLog(proxyState, args, sub, "PROXY_RECV_VISIBLE", (sub->base + transmittedStepId) % NCCL_STEPS, sub->transSize, wBase, wCfg, wEff);
           }
           args->idle = 0;
         }
@@ -1670,7 +1781,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
               subGroup->recvRequestsCache[sub->done%NCCL_STEPS] = NULL;
             }
             int doneStepId = sub->done;
-            phase0ProxyLog(proxyState, args, sub, "PROXY_RECV_CONSUMED", (sub->base + sub->done) % NCCL_STEPS, sub->transSize);
+            phase0ProxyLog(proxyState, args, sub, "PROXY_RECV_CONSUMED", (sub->base + sub->done) % NCCL_STEPS, sub->transSize, wBase, wCfg, wEff);
             sub->done += args->sliceSteps;
             ncclProfilerStopProxyStepEvent(s+i, args, doneStepId);
             args->idle = 0;

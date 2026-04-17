@@ -258,7 +258,8 @@ ncclResult_t ncclIbMultiSend(struct ncclIbSendComm* comm, int slot) {
     size_t totalSize = 0;
     for (int r = 0; r < nreqs; r++) totalSize += reqs[r]->send.size;
     INFO(NCCL_NET,
-        "PHASE0 event=IB_SEND_POST reqId=%llu slot=%d nreqs=%d size=%llu remoteIdx=%llu tag=%d comm=%p",
+        "PHASE0 event=IB_SEND_POST tNs=%llu reqId=%llu slot=%d nreqs=%d size=%llu remoteIdx=%llu tag=%d comm=%p",
+        (unsigned long long)clockNano(),
         (unsigned long long)reqs[0]->id,
         slot,
         nreqs,
@@ -423,7 +424,8 @@ ncclResult_t ncclIbPostFifo(struct ncclIbRecvComm* comm, struct ncclIbRequest* r
 
   if (ncclParamPhase0Log()) {
     INFO(NCCL_NET,
-        "PHASE0 event=IB_CTS_ISSUE reqId=%llu slot=%d nreqs=%d ctsBytes=%u idx=%llu addr=0x%llx rkey=0x%x qp=%u comm=%p",
+        "PHASE0 event=IB_CTS_ISSUE tNs=%llu reqId=%llu slot=%d nreqs=%d ctsBytes=%u idx=%llu addr=0x%llx rkey=0x%x qp=%u comm=%p",
+        (unsigned long long)clockNano(),
         (unsigned long long)req->id,
         slot,
         req->nreqs,
