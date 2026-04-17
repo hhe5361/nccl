@@ -100,6 +100,22 @@ build_pytorch() {
   source "${VENV_DIR}/bin/activate"
   pip install --upgrade pip setuptools wheel ninja "cmake<4"
   pip install -r "${PYTORCH_DIR}/requirements.txt"
+  # Prefer PyTorch's bundled pybind11 CMake package over any pip-installed one.
+  pip uninstall -y pybind11 >/dev/null 2>&1 || true
+
+  if ! python - <<'PYEOF'
+import pathlib, sysconfig
+inc = pathlib.Path(sysconfig.get_paths()["include"])
+header = inc / "Python.h"
+raise SystemExit(0 if header.exists() else 1)
+PYEOF
+  then
+    echo "[bootstrap] Python development headers are missing for $(python -V 2>&1). Install python3-dev in the container or rebuild the image." >&2
+    return 1
+  fi
+
+  local pyexe
+  pyexe=$(command -v python)
 
   export USE_CUDA=1
   export USE_DISTRIBUTED=1
@@ -108,6 +124,7 @@ build_pytorch() {
   export NCCL_ROOT="${NCCL_HOME}"
   export NCCL_INCLUDE_DIR="${NCCL_HOME}/include"
   export NCCL_LIB_DIR="${NCCL_HOME}/lib"
+  export CMAKE_ARGS="${CMAKE_ARGS:-} -DBUILD_PYTHON=ON -DPython_EXECUTABLE=${pyexe} -DPython3_EXECUTABLE=${pyexe} -DPython_FIND_STRATEGY=LOCATION -DPython3_FIND_STRATEGY=LOCATION"
 
   (cd "${PYTORCH_DIR}" && python setup.py develop)
 }
