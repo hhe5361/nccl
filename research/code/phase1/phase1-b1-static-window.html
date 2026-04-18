@@ -403,6 +403,333 @@ occTr=</div>
     </section>
 
     <section class="section">
+      <h2>4.5 Phase 0 / Phase 1 이벤트 로그 상세 설명</h2>
+      <p>
+        B1 실험에서 실제로 쓰는 로그는 <strong>PHASE0</strong>와 <strong>PHASE1</strong> 두 계층이다.
+        <code class="inline">PHASE0</code>는 기존 proxy / transport 진행 상태를 관찰하기 위한 로그이고,
+        <code class="inline">PHASE1</code>는 static window 실험에서 추가한 window 설정 / stall 로그다.
+      </p>
+
+      <h3>4.5.1 공통 해석 원칙</h3>
+      <ul>
+        <li><code class="inline">PHASE0</code>는 “실제 데이터 / control path가 어디까지 진행됐는가”를 보여준다.</li>
+        <li><code class="inline">PHASE1</code>는 “window 때문에 왜 더 못 나아갔는가”를 보여준다.</li>
+        <li><code class="inline">posted</code>, <code class="inline">received</code>, <code class="inline">transmitted</code>, <code class="inline">done</code>은 모두 <strong>step frontier</strong>다. slot 주소 포인터가 아니다.</li>
+        <li><code class="inline">slot</code>은 보통 <code class="inline">(base + frontier) % NCCL_STEPS</code>로 계산된 현재 물리 slot이다.</li>
+        <li><code class="inline">occPd = posted - done</code>, <code class="inline">occTr = transmitted - done</code>은 proxy 입장에서 현재 outstanding depth를 보는 지표다.</li>
+      </ul>
+
+      <div class="note">
+        <strong>중요:</strong> “빈 slot을 직접 스캔해서 CTS를 보내는가?”에 대한 답은 아니다.
+        현재 구현은 <code class="inline">conn.buffs[]</code>를 훑어서 빈칸을 찾는 구조가 아니라,
+        <code class="inline">recvProxyProgress()</code>가
+        <code class="inline">posted &lt; done + W_eff</code> 조건을 만족할 때 다음 recv를 post하고,
+        그 결과로 <code class="inline">ncclNet-&gt;irecv()</code>가 호출되며,
+        IB 경로에서는 그 시점에 <code class="inline">IB_CTS_ISSUE</code>가 발생한다.
+      </div>
+
+      <h3>4.5.2 공통 필드 사전</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>필드</th>
+              <th>의미</th>
+              <th>해석 팁</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code class="inline">tNs</code></td>
+              <td><code class="inline">clockNano()</code> 기반 timestamp</td>
+              <td>time binning, event delta, timeline plot의 기준</td>
+            </tr>
+            <tr>
+              <td><code class="inline">rank</code></td>
+              <td>해당 proxy를 실행하는 transport rank</td>
+              <td>worker-level aggregation에 사용</td>
+            </tr>
+            <tr>
+              <td><code class="inline">peer</code></td>
+              <td>현재 connection이 연결된 remote peer</td>
+              <td>per-peer burst / stall 분석에 사용</td>
+            </tr>
+            <tr>
+              <td><code class="inline">channel</code></td>
+              <td>현재 proxy sub가 속한 channel ID</td>
+              <td>channel별 hotspot 여부 확인 가능</td>
+            </tr>
+            <tr>
+              <td><code class="inline">slot</code></td>
+              <td>현재 step이 매핑된 물리 slot index</td>
+              <td><code class="inline">NCCL_STEPS</code> 내 modulo 위치</td>
+            </tr>
+            <tr>
+              <td><code class="inline">coll</code></td>
+              <td>실제 내부 op type</td>
+              <td>예: Send/Recv, AllReduce 등</td>
+            </tr>
+            <tr>
+              <td><code class="inline">collApi</code></td>
+              <td>사용자 관점의 API collectives</td>
+              <td>P2P로 쪼개진 경우에도 원래 API 문맥을 유지</td>
+            </tr>
+            <tr>
+              <td><code class="inline">algo</code></td>
+              <td>NCCL algorithm</td>
+              <td>B1에서는 보통 <code class="inline">Ring</code></td>
+            </tr>
+            <tr>
+              <td><code class="inline">proto</code></td>
+              <td>NCCL protocol</td>
+              <td>B1 기본은 <code class="inline">Simple</code></td>
+            </tr>
+            <tr>
+              <td><code class="inline">size</code></td>
+              <td>현재 event가 다룬 payload size</td>
+              <td>proxy post/done, IB send post/complete와 함께 burst 계산에 사용</td>
+            </tr>
+            <tr>
+              <td><code class="inline">base</code></td>
+              <td>현재 op/sub의 시작 step base</td>
+              <td><code class="inline">slot = (base + frontier) % NCCL_STEPS</code> 계산의 기준</td>
+            </tr>
+            <tr>
+              <td><code class="inline">posted</code></td>
+              <td>proxy가 post한 step 수</td>
+              <td>recv에서는 얼마나 미리 receive를 열어뒀는지, send에서는 GPU에 얼마나 credit를 열어줬는지</td>
+            </tr>
+            <tr>
+              <td><code class="inline">received</code></td>
+              <td>네트워크 수신 완료된 step 수</td>
+              <td>recv path에서만 의미가 크다</td>
+            </tr>
+            <tr>
+              <td><code class="inline">transmitted</code></td>
+              <td>다음 stage로 visible / posted 된 step 수</td>
+              <td>send에서는 NIC로 post된 step, recv에서는 GPU visible 된 step</td>
+            </tr>
+            <tr>
+              <td><code class="inline">done</code></td>
+              <td>완전히 recycle / consumed 된 step 수</td>
+              <td>window의 반환 frontier</td>
+            </tr>
+            <tr>
+              <td><code class="inline">nsteps</code></td>
+              <td>이 sub op가 총 처리해야 하는 step 수</td>
+              <td>해당 sub의 전체 길이</td>
+            </tr>
+            <tr>
+              <td><code class="inline">wBase</code></td>
+              <td>stock NCCL 기준 기본 depth</td>
+              <td><code class="inline">min(NCCL_STEPS, NCCL_SHARED_STEPS / nsubs)</code></td>
+            </tr>
+            <tr>
+              <td><code class="inline">wCfg</code></td>
+              <td>환경변수로 준 static W</td>
+              <td><code class="inline">NCCL_PHASE1_STATIC_W</code> 값</td>
+            </tr>
+            <tr>
+              <td><code class="inline">wEff</code></td>
+              <td>실제로 적용된 effective window</td>
+              <td><code class="inline">min(wBase, wCfg)</code>로 clamp된 값</td>
+            </tr>
+            <tr>
+              <td><code class="inline">occPd</code></td>
+              <td><code class="inline">posted - done</code></td>
+              <td>proxy가 현재 얼마나 앞질러 가 있는지</td>
+            </tr>
+            <tr>
+              <td><code class="inline">occTr</code></td>
+              <td><code class="inline">transmitted - done</code></td>
+              <td>실제 전송 / visible 기준 outstanding depth</td>
+            </tr>
+            <tr>
+              <td><code class="inline">reqId</code></td>
+              <td>IB send/recv request ID</td>
+              <td>IB-level lifecycle 매칭용</td>
+            </tr>
+            <tr>
+              <td><code class="inline">nreqs</code></td>
+              <td>multi-send / multi-recv 묶음 개수</td>
+              <td>grouped receive일 때 1보다 커질 수 있다</td>
+            </tr>
+            <tr>
+              <td><code class="inline">remoteIdx</code>, <code class="inline">idx</code></td>
+              <td>CTS가 가리키는 remote receive step ID</td>
+              <td>sender가 기다리는 expected receive target</td>
+            </tr>
+            <tr>
+              <td><code class="inline">ctsBytes</code></td>
+              <td>CTS payload bytes</td>
+              <td>control traffic overhead 측정용</td>
+            </tr>
+            <tr>
+              <td><code class="inline">addr</code>, <code class="inline">rkey</code></td>
+              <td>receiver가 sender에게 알려주는 실제 remote target 정보</td>
+              <td>IB CTS가 “빈 slot 알림”이 아니라 “recv target ready”라는 점을 보여준다</td>
+            </tr>
+            <tr>
+              <td><code class="inline">qp</code></td>
+              <td>CTS를 보낸 IB QP 번호</td>
+              <td>reverse path QP 추적용</td>
+            </tr>
+            <tr>
+              <td><code class="inline">shared</code></td>
+              <td>shared buffer path 여부</td>
+              <td>shared path에선 <code class="inline">sharedBuffSlot = posted % W_eff</code>가 중요하다</td>
+            </tr>
+            <tr>
+              <td><code class="inline">nsubs</code></td>
+              <td>현재 op를 구성하는 proxy sub 개수</td>
+              <td><code class="inline">wBase</code> 계산에 직접 영향</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>4.5.3 이벤트별 상세 설명</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>이벤트</th>
+              <th>계층</th>
+              <th>발생 위치</th>
+              <th>정확한 의미</th>
+              <th>실험 해석</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code class="inline">PROXY_WINDOW_CFG</code></td>
+              <td>PHASE1</td>
+              <td><code class="inline">sendProxyProgress()</code>, <code class="inline">recvProxyProgress()</code> 시작부</td>
+              <td>해당 sub op에서 이번에 어떤 window가 적용됐는지 1회 기록</td>
+              <td><code class="inline">wBase</code>, <code class="inline">wCfg</code>, <code class="inline">wEff</code> sanity check용. 실험이 의도대로 걸렸는지 확인하는 첫 로그</td>
+            </tr>
+            <tr>
+              <td><code class="inline">PROXY_SEND_WSTALL</code></td>
+              <td>PHASE1</td>
+              <td><code class="inline">sendProxyProgress()</code></td>
+              <td><code class="inline">posted &gt;= done + W_eff</code>라서 sender 쪽에서 더 이상 GPU/slot credit를 열 수 없음</td>
+              <td>작은 <code class="inline">W</code>가 sender side pipeline을 얼마나 자주 막는지 보여준다</td>
+            </tr>
+            <tr>
+              <td><code class="inline">PROXY_RECV_WSTALL</code></td>
+              <td>PHASE1</td>
+              <td><code class="inline">recvProxyProgress()</code></td>
+              <td><code class="inline">posted &gt;= done + W_eff</code>라서 receiver 쪽에서 더 이상 새로운 recv를 post하지 못함</td>
+              <td>B1의 핵심 제어 효과를 직접 보여주는 로그. recv window가 실제로 얼마나 자주 bind되는지 측정</td>
+            </tr>
+            <tr>
+              <td><code class="inline">PROXY_SEND_POST</code></td>
+              <td>PHASE0</td>
+              <td><code class="inline">sendProxyProgress()</code>에서 <code class="inline">ncclNet-&gt;isend()</code> 성공 직후</td>
+              <td>sender proxy가 현재 slot payload를 NIC/transport에 실제로 post했음</td>
+              <td>데이터 plane send injection 이벤트. <code class="inline">size</code> 합으로 send burst를 계산</td>
+            </tr>
+            <tr>
+              <td><code class="inline">PROXY_SEND_DONE</code></td>
+              <td>PHASE0</td>
+              <td><code class="inline">sendProxyProgress()</code>에서 <code class="inline">ncclNet-&gt;test()</code> 완료 후</td>
+              <td>보낸 step이 transport 완료되어 slot을 recycle 가능하게 됨</td>
+              <td>sender 측 completion frontier. <code class="inline">done</code> 증가와 함께 credit 반환을 의미</td>
+            </tr>
+            <tr>
+              <td><code class="inline">PROXY_RECV_POST</code></td>
+              <td>PHASE0</td>
+              <td><code class="inline">recvProxyProgress()</code>에서 <code class="inline">ncclNet-&gt;irecv()</code> 성공 직후</td>
+              <td>receiver proxy가 다음 recv target을 열었음</td>
+              <td>IB path에서는 이 직후 <code class="inline">IB_CTS_ISSUE</code>가 이어진다. “CTS는 빈 slot 스캔 이벤트가 아니라 recv post 결과”라는 점이 중요</td>
+            </tr>
+            <tr>
+              <td><code class="inline">PROXY_RECV_NET_DONE</code></td>
+              <td>PHASE0</td>
+              <td><code class="inline">recvProxyProgress()</code>에서 <code class="inline">ncclNet-&gt;test()</code> 완료 후</td>
+              <td>NIC 입장에서 해당 recv step의 데이터 도착이 완료됨</td>
+              <td>network receive completion. 아직 GPU가 볼 수 있는 상태는 아니다</td>
+            </tr>
+            <tr>
+              <td><code class="inline">PROXY_RECV_VISIBLE</code></td>
+              <td>PHASE0</td>
+              <td><code class="inline">recvProxyProgress()</code>에서 <code class="inline">recvTail</code>을 밀어준 직후</td>
+              <td>도착한 데이터를 GPU가 읽을 수 있도록 publish함</td>
+              <td>recv path에서 “network done”과 “GPU visible”을 구분해준다. flush/GDR 영향이 이 사이에 들어간다</td>
+            </tr>
+            <tr>
+              <td><code class="inline">PROXY_RECV_CONSUMED</code></td>
+              <td>PHASE0</td>
+              <td><code class="inline">recvProxyProgress()</code>에서 <code class="inline">sendMem-&gt;head</code> 확인 후</td>
+              <td>GPU가 해당 step을 실제로 소비 완료해서 slot을 recycle할 수 있게 됨</td>
+              <td>receiver-side credit return. 이 이벤트가 있어야 <code class="inline">done</code>이 전진하고 window가 다시 열린다</td>
+            </tr>
+            <tr>
+              <td><code class="inline">IB_CTS_ISSUE</code></td>
+              <td>PHASE0 / IB</td>
+              <td><code class="inline">ncclIbPostFifo()</code></td>
+              <td>receiver가 sender의 CTS FIFO로 RDMA write를 날려 recv target(<code class="inline">addr/rkey/size/idx</code>)을 광고함</td>
+              <td>reverse control path 핵심 이벤트. 총 개수보다 <code class="inline">tNs</code> 기반 시간 분포와 send post와의 거리 해석이 중요</td>
+            </tr>
+            <tr>
+              <td><code class="inline">IB_SEND_POST</code></td>
+              <td>PHASE0 / IB</td>
+              <td><code class="inline">ncclIbMultiSend()</code> 성공 후</td>
+              <td>sender가 matching CTS를 확인하고 실제 IB send / RDMA write를 올림</td>
+              <td>실제 fabric injection 이벤트. burst size 계산은 주로 이 로그 기준으로 한다</td>
+            </tr>
+            <tr>
+              <td><code class="inline">IB_SEND_COMPLETE</code></td>
+              <td>PHASE0 / IB</td>
+              <td><code class="inline">ncclIbRequestComplete()</code></td>
+              <td>IB send request completion</td>
+              <td>IB transport 차원의 완료. proxy의 <code class="inline">PROXY_SEND_DONE</code>와 함께 보면 send completion chain을 해석할 수 있다</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>4.5.4 정상 경로에서의 시간축 순서</h3>
+      <div class="code">recvProxyProgress()
+  -> PHASE1 PROXY_WINDOW_CFG
+  -> PHASE0 PROXY_RECV_POST
+  -> PHASE0 IB_CTS_ISSUE
+
+sendProxyProgress()
+  -> PHASE0 IB_SEND_POST
+  -> PHASE0 PROXY_SEND_POST
+  -> PHASE0 IB_SEND_COMPLETE
+  -> PHASE0 PROXY_SEND_DONE
+
+recvProxyProgress()
+  -> PHASE0 PROXY_RECV_NET_DONE
+  -> PHASE0 PROXY_RECV_VISIBLE
+  -> PHASE0 PROXY_RECV_CONSUMED</div>
+      <p>
+        위 순서는 “대표적인” 정상 경로다. 실제 로그에서는 여러 sub, channel, peer가 겹쳐서 섞여 보인다.
+        그래서 해석할 때는 항상 <code class="inline">peer</code>, <code class="inline">channel</code>,
+        <code class="inline">slot</code>, <code class="inline">reqId</code>를 같이 봐야 한다.
+      </p>
+
+      <h3>4.5.5 B1 해석에서 특히 중요한 이벤트</h3>
+      <ul>
+        <li><code class="inline">PROXY_WINDOW_CFG</code>: 이번 run에서 실제로 어떤 <code class="inline">wEff</code>가 걸렸는지 확인</li>
+        <li><code class="inline">PROXY_RECV_WSTALL</code>, <code class="inline">PROXY_SEND_WSTALL</code>: 작은 <code class="inline">W</code>가 pipeline을 얼마나 자주 막았는지 측정</li>
+        <li><code class="inline">IB_SEND_POST</code>: 실제 send injection burst 계산의 기준</li>
+        <li><code class="inline">PROXY_RECV_POST</code>: receiver가 얼마나 공격적으로 미리 recv를 열었는지 측정</li>
+        <li><code class="inline">PROXY_RECV_CONSUMED</code>: window가 실제로 다시 열리는 속도 측정</li>
+      </ul>
+
+      <div class="warn">
+        이번 B1은 <strong>fake cumulative</strong>이므로
+        <code class="inline">IB_CTS_ISSUE</code> 총 개수 자체는 거의 바뀌지 않을 수 있다.
+        대신 <strong>언제 얼마나 몰려서</strong> <code class="inline">PROXY_RECV_POST</code>,
+        <code class="inline">IB_CTS_ISSUE</code>, <code class="inline">IB_SEND_POST</code>가 발생하는지와
+        <code class="inline">WSTALL</code>, <code class="inline">occPd</code>, <code class="inline">occTr</code>를 같이 봐야 한다.
+      </div>
+    </section>
+
+    <section class="section">
       <h2>5. 수집할 데이터</h2>
       <div class="grid-2">
         <div class="card">

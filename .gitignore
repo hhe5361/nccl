@@ -2,6 +2,6 @@
 /build
 *.gcov
 /coverage/
-research/docs/
-research/code/*/output/
+research/code/phase1/output/
+research/code/phase0/output/
 *.html
