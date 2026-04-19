@@ -23,6 +23,98 @@ KV_RE = re.compile(r"(\w+)=([^\s]+)")
 WORKER_RE = re.compile(r"worker(\d+)$")
 W_DIR_RE = re.compile(r"^W(\d+)$")
 
+RUN_SUMMARY_FIELD_HELP = {
+    "run_tag": "실험 식별자. 각 W run을 구분하는 tag.",
+    "phase1_w": "NCCL_PHASE1_STATIC_W로 설정한 고정 window 크기.",
+    "world_size": "분산 rank 총 개수.",
+    "steps": "전체 step 수.",
+    "effective_steps": "warmup을 제외하고 요약에 사용한 step 수.",
+    "param_mb": "Ring AllReduce DDP workload에서 모델 파라미터 총 크기(MiB).",
+    "payload_mb": "AllToAll workload에서 rank당 총 send payload 크기(MiB).",
+    "dtype": "통신 tensor dtype.",
+    "bucket_cap_mb": "DDP gradient bucket cap size(MiB).",
+    "step_ms_avg": "rank max 기준 step latency 평균(ms).",
+    "step_ms_p50": "rank max 기준 step latency p50(ms).",
+    "step_ms_p95": "rank max 기준 step latency p95(ms).",
+    "backward_ms_avg": "rank max 기준 backward 구간 평균(ms). Ring DDP에선 gradient all-reduce 지배 구간.",
+    "backward_ms_p95": "rank max 기준 backward 구간 p95(ms).",
+    "ring_gbps_avg": "Ring AllReduce 예상 traffic volume을 backward time으로 나눈 근사 처리량(Gbps).",
+    "ring_gbps_p95": "step별 ring_gbps_est의 p95(Gbps).",
+    "alltoall_gbps_avg": "AllToAll 예상 aggregate volume을 step time으로 나눈 근사 처리량(Gbps).",
+    "alltoall_gbps_p95": "step별 alltoall_gbps_est의 p95(Gbps).",
+}
+
+NCCL_SUMMARY_FIELD_HELP = {
+    "recv_wstall_count": "PROXY_RECV_WSTALL 총 개수. receiver가 window 상한 때문에 추가 recv post를 못 한 횟수.",
+    "send_wstall_count": "PROXY_SEND_WSTALL 총 개수. sender가 window 상한 때문에 추가 send-side post를 못 한 횟수.",
+    "max_occ_pd": "전체 로그에서 관측된 최대 posted-done.",
+    "p99_occ_pd": "posted-done의 p99. proxy가 얼마나 앞질러 가는지.",
+    "max_occ_tr": "전체 로그에서 관측된 최대 transmitted-done.",
+    "p99_occ_tr": "transmitted-done의 p99. 실제 visible/send outstanding 깊이.",
+    "w_eff_values": "로그에서 관측된 effective window 값 집합.",
+}
+
+PLOT_EXPLANATIONS_SINGLE = [
+    (
+        "step_timeline.png",
+        "Step / Backward / Forward / Optimizer Timeline",
+        "입력 데이터: rank 0가 기록한 *_step_metrics.jsonl",
+        "step_ms_max, backward_ms_max, forward_ms_max, optimizer_ms_max를 step 축으로 그린다. "
+        "작은 W가 전체 step을 늘리는지, 병목이 backward인지 즉시 볼 수 있다.",
+    ),
+    (
+        "ring_gbps_timeline.png",
+        "Per-step Ring Throughput Estimate",
+        "입력 데이터: *_step_metrics.jsonl",
+        "ring_gbps_est를 step별로 그린다. W에 따라 ring pipeline이 얼마나 채워지는지 확인한다.",
+    ),
+    (
+        "event_counts.png",
+        "Top NCCL Event Counts",
+        "입력 데이터: workerXX/nccl.*.log 의 PHASE0/PHASE1 event",
+        "이벤트 총량 분포를 본다. fake cumulative에선 총 CTS 수보다 WSTALL과 proxy event 분포 차이가 더 중요하다.",
+    ),
+    (
+        "wstall_by_worker.png",
+        "WSTALL by Worker",
+        "입력 데이터: PROXY_RECV_WSTALL, PROXY_SEND_WSTALL 이벤트",
+        "worker별 stall 편차를 본다. 특정 worker/rack만 과도하게 막히는지 확인할 수 있다.",
+    ),
+    (
+        "occupancy_timeline.png",
+        "Outstanding Depth Timeline",
+        "입력 데이터: PHASE0/PHASE1 로그의 occPd, occTr",
+        "posted-done과 transmitted-done의 시간축 변화를 본다. W가 실제 inflight depth를 어떻게 제한하는지 보여준다.",
+    ),
+]
+
+PLOT_EXPLANATIONS_SWEEP = [
+    (
+        "sweep_step_ms.png",
+        "W Sweep - Step Latency",
+        "입력 데이터: 각 W의 *_summary.json",
+        "step_ms_avg, step_ms_p95, backward_ms_p95를 비교한다. 작은 W가 성능을 얼마나 깎는지 보여준다.",
+    ),
+    (
+        "sweep_ring_gbps.png",
+        "W Sweep - Ring Throughput Estimate",
+        "입력 데이터: 각 W의 *_summary.json",
+        "ring_gbps_avg, ring_gbps_p95를 비교한다. pipeline이 충분히 찬 W 이후 포화 구간이 있는지 보여준다.",
+    ),
+    (
+        "sweep_wstall.png",
+        "W Sweep - Window Stall Counts",
+        "입력 데이터: PHASE0/PHASE1 로그 집계",
+        "recv/send WSTALL 총량을 비교한다. W를 줄였을 때 실제로 admission이 더 자주 걸렸는지 확인한다.",
+    ),
+    (
+        "sweep_occupancy.png",
+        "W Sweep - Outstanding Depth",
+        "입력 데이터: PHASE0/PHASE1 로그의 occPd, occTr 집계",
+        "p99/max occupancy를 비교한다. W가 inflight depth를 어느 정도 줄이는지 확인한다.",
+    ),
+]
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render Phase 1 PNG plots and HTML report")
@@ -72,6 +164,12 @@ def mean(values: Iterable[float]) -> float:
     if not values:
         return 0.0
     return sum(values) / len(values)
+
+
+def positive_ylim(max_value: float) -> Tuple[float, float] | None:
+    if max_value <= 0:
+        return None
+    return 0.0, max_value * 1.05
 
 
 def worker_sort_key(name: str) -> Tuple[int, str]:
@@ -215,12 +313,17 @@ def save_line_plot(
     if not xs or not any(values for _, values, _ in series):
         return
     fig, ax = plt.subplots(figsize=(11.0, 4.5))
+    max_value = 0.0
     for label, values, color in series:
         if values:
             ax.plot(xs[:len(values)], values, label=label, linewidth=2.0, color=color)
+            max_value = max(max_value, max(values))
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
+    ylim = positive_ylim(max_value)
+    if ylim:
+        ax.set_ylim(*ylim)
     ax.grid(True, linestyle="--", alpha=0.3)
     ax.legend()
     fig.tight_layout()
@@ -235,6 +338,9 @@ def save_bar_chart(path: Path, title: str, labels: List[str], values: List[float
     bars = ax.bar(labels, values, color="#0c5fb0", alpha=0.9)
     ax.set_title(title)
     ax.set_ylabel(ylabel)
+    ylim = positive_ylim(max(values))
+    if ylim:
+        ax.set_ylim(*ylim)
     ax.grid(axis="y", linestyle="--", alpha=0.25)
     ax.set_axisbelow(True)
     ax.tick_params(axis="x", rotation=30)
@@ -253,6 +359,8 @@ def save_horizontal_bar(path: Path, title: str, labels: List[str], values: List[
     bars = ax.barh(labels, values, color="#136245", alpha=0.9)
     ax.set_title(title)
     ax.set_xlabel(xlabel)
+    if values:
+        ax.set_xlim(0.0, max(values) * 1.05)
     ax.grid(axis="x", linestyle="--", alpha=0.25)
     ax.set_axisbelow(True)
     for bar, value in zip(bars, values):
@@ -274,6 +382,16 @@ def render_table(headers: List[str], rows: List[List[object]]) -> str:
     return (
         '<table class="report-table"><thead><tr>' + head + "</tr></thead><tbody>" + "".join(body) + "</tbody></table>"
     )
+
+
+def render_field_help(title: str, mapping: Dict[str, str], used_fields: List[str]) -> str:
+    rows = [[field, mapping.get(field, "")] for field in used_fields]
+    return '<div class="card"><h2>' + html.escape(title) + '</h2>' + render_table(["field", "meaning"], rows) + '</div>'
+
+
+def render_plot_help(title: str, items: List[Tuple[str, str, str, str]]) -> str:
+    rows = [[filename, plot_title, source, meaning] for filename, plot_title, source, meaning in items]
+    return '<div class="card"><h2>' + html.escape(title) + '</h2>' + render_table(["plot", "title", "source", "meaning"], rows) + '</div>'
 
 
 def render_html(title: str, sections: List[str]) -> str:
@@ -441,6 +559,9 @@ def build_single_w_report(w_dir: Path, output_dir: Path) -> Path:
         ax.set_xticks(xs, workers)
         ax.set_title(f"{w_dir.name} WSTALL by Worker")
         ax.set_ylabel("count")
+        ylim = positive_ylim(max(recv_values + send_values) if (recv_values or send_values) else 0.0)
+        if ylim:
+            ax.set_ylim(*ylim)
         ax.grid(axis="y", linestyle="--", alpha=0.25)
         ax.set_axisbelow(True)
         ax.legend()
@@ -451,19 +572,25 @@ def build_single_w_report(w_dir: Path, output_dir: Path) -> Path:
     p_occ = plots_dir / "occupancy_timeline.png"
     if nccl["t_points_pd"] or nccl["t_points_tr"]:
         fig, ax = plt.subplots(figsize=(11.0, 4.8))
+        max_occ = 0.0
         if nccl["t_points_pd"]:
             t0 = min(t for t, _ in nccl["t_points_pd"])
             xs_pd = [(t - t0) / 1e6 for t, _ in nccl["t_points_pd"]]
             ys_pd = [v for _, v in nccl["t_points_pd"]]
             ax.plot(xs_pd, ys_pd, ".", markersize=2, alpha=0.55, label="occPd", color="#0c5fb0")
+            max_occ = max(max_occ, max(ys_pd))
         if nccl["t_points_tr"]:
             t0_tr = min(t for t, _ in nccl["t_points_tr"])
             xs_tr = [(t - t0_tr) / 1e6 for t, _ in nccl["t_points_tr"]]
             ys_tr = [v for _, v in nccl["t_points_tr"]]
             ax.plot(xs_tr, ys_tr, ".", markersize=2, alpha=0.55, label="occTr", color="#d97706")
+            max_occ = max(max_occ, max(ys_tr))
         ax.set_title(f"{w_dir.name} Outstanding Depth Timeline")
         ax.set_xlabel("time since first event (ms)")
         ax.set_ylabel("outstanding depth")
+        ylim = positive_ylim(max_occ)
+        if ylim:
+            ax.set_ylim(*ylim)
         ax.grid(True, linestyle="--", alpha=0.25)
         ax.legend()
         fig.tight_layout()
@@ -498,7 +625,17 @@ def build_single_w_report(w_dir: Path, output_dir: Path) -> Path:
 
     sections = [
         '<div class="card"><h2>Run Summary</h2>' + render_table(["field", "value"], summary_rows) + "</div>",
+        render_field_help(
+            "Run Summary Field Meanings",
+            RUN_SUMMARY_FIELD_HELP,
+            [field for field, _ in summary_rows],
+        ),
         '<div class="card"><h2>NCCL Summary</h2>' + render_table(["field", "value"], nccl_rows) + "</div>",
+        render_field_help(
+            "NCCL Summary Field Meanings",
+            NCCL_SUMMARY_FIELD_HELP,
+            [field for field, _ in nccl_rows],
+        ),
         '<div class="card"><h2>Plots</h2><div class="plot-grid">'
         + f'<figure><img src="{html.escape(relpath(p_step, output_dir))}" alt="step timeline"><figcaption>step / backward / forward / optimizer timeline</figcaption></figure>'
         + f'<figure><img src="{html.escape(relpath(p_bw, output_dir))}" alt="ring gbps"><figcaption>per-step ring throughput estimate</figcaption></figure>'
@@ -506,6 +643,7 @@ def build_single_w_report(w_dir: Path, output_dir: Path) -> Path:
         + (f'<figure><img src="{html.escape(relpath(p_wstall, output_dir))}" alt="wstall by worker"><figcaption>worker별 recv/send WSTALL count</figcaption></figure>' if p_wstall.exists() else "")
         + (f'<figure><img src="{html.escape(relpath(p_occ, output_dir))}" alt="occupancy timeline"><figcaption>occPd / occTr timeline</figcaption></figure>' if p_occ.exists() else "")
         + "</div></div>",
+        render_plot_help("Plot Descriptions", PLOT_EXPLANATIONS_SINGLE),
     ]
 
     html_path = output_dir / "phase1_report.html"
@@ -617,6 +755,9 @@ def build_run_root_report(run_root: Path, output_dir: Path) -> Path:
     ax.set_xlabel("W")
     ax.set_ylabel("count")
     ax.set_title("W Sweep - Window Stall Counts")
+    ylim = positive_ylim(max(recv_vals + send_vals) if (recv_vals or send_vals) else 0.0)
+    if ylim:
+        ax.set_ylim(*ylim)
     ax.grid(axis="y", linestyle="--", alpha=0.25)
     ax.set_axisbelow(True)
     ax.legend()
@@ -688,12 +829,29 @@ def build_run_root_report(run_root: Path, output_dir: Path) -> Path:
     )
     sections = [
         '<div class="card"><h2>W Sweep Summary</h2>' + table_html + "</div>",
+        render_field_help(
+            "Sweep Summary Field Meanings",
+            {
+                "W": "NCCL_PHASE1_STATIC_W 값.",
+                "step_ms_avg": "해당 W의 rank max step latency 평균(ms).",
+                "step_ms_p95": "해당 W의 rank max step latency p95(ms).",
+                "backward_ms_p95": "해당 W의 backward 구간 p95(ms).",
+                "ring_gbps_avg": "해당 W의 근사 ring throughput 평균(Gbps).",
+                "recv_wstall": "PROXY_RECV_WSTALL 총 개수.",
+                "send_wstall": "PROXY_SEND_WSTALL 총 개수.",
+                "p99_occ_pd": "posted-done의 p99.",
+                "p99_occ_tr": "transmitted-done의 p99.",
+                "detail": "해당 W의 상세 HTML 리포트 링크.",
+            },
+            ["W", "step_ms_avg", "step_ms_p95", "backward_ms_p95", "ring_gbps_avg", "recv_wstall", "send_wstall", "p99_occ_pd", "p99_occ_tr", "detail"],
+        ),
         '<div class="card"><h2>Plots</h2><div class="plot-grid">'
         + f'<figure><img src="{html.escape(relpath(p_step, output_dir))}" alt="step sweep"><figcaption>step / backward latency vs W</figcaption></figure>'
         + f'<figure><img src="{html.escape(relpath(p_bw, output_dir))}" alt="ring gbps sweep"><figcaption>estimated ring throughput vs W</figcaption></figure>'
         + f'<figure><img src="{html.escape(relpath(p_wstall, output_dir))}" alt="wstall sweep"><figcaption>recv/send WSTALL count vs W</figcaption></figure>'
         + f'<figure><img src="{html.escape(relpath(p_occ, output_dir))}" alt="occupancy sweep"><figcaption>outstanding depth vs W</figcaption></figure>'
         + "</div></div>",
+        render_plot_help("Sweep Plot Descriptions", PLOT_EXPLANATIONS_SWEEP),
         '<div class="card"><h2>Per-W Detail Reports</h2><ul>'
         + "".join(
             f'<li><a href="{html.escape(link)}">{html.escape(name)}</a></li>'

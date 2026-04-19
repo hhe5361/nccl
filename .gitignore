@@ -5,3 +5,6 @@
 research/code/phase1/output/
 research/code/phase0/output/
 *.html
+*.txt
+*.log
+*/.phase1_report_venv

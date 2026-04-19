@@ -1380,6 +1380,7 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
     int wBase = phase1WindowBaseDepth(args);
     int wCfg = phase1WindowCfg();
     int wEff = phase1WindowEff(args);
+    int sendDepth = wBase;
     for (int s=0; s<args->nsubs; s++) {
       struct ncclProxySubArgs* sub = args->subs+s;
       int postedStepId = sub->posted;
@@ -1390,15 +1391,14 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
       volatile struct ncclConnFifo* connFifo = (volatile struct ncclConnFifo*)resources->recvMem->connFifo;
       int stepSize = resources->buffSizes[p] / NCCL_STEPS;
       char* localBuff = NCCL_NET_MAP_GET_POINTER(&resources->map, cpu, buffs[p]);
-      phase1ProxyWindowCfgLog(proxyState, args, sub, resources->shared, wBase, wCfg, wEff);
       // Post buffers to the GPU
-      if (sub->posted < sub->nsteps && sub->posted < sub->done + wEff) {
+      if (sub->posted < sub->nsteps && sub->posted < sub->done + sendDepth) {
         sub->phase1SendWstall = 0;
         ncclProfilerStartSendProxyStepEvent(s, args, postedStepId);
         int buffSlot = (sub->base+sub->posted)%NCCL_STEPS;
         if (resources->shared) {
           if (!sub->reg) {
-            int sharedBuffSlot = sub->posted%wEff;
+            int sharedBuffSlot = sub->posted%sendDepth;
             int offset;
             NCCLCHECK(sharedBuffersGet(proxyState, sub->channelId, sharedBuffSlot*args->nsubs+s, &offset, NULL));
             resources->recvMem->connFifo[buffSlot].offset = offset;
@@ -1414,8 +1414,6 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
         ncclProfilerRecordProxyStepEventState(s, args, postedStepId, ncclProfilerProxyStepSendGPUWait);
         args->idle = 0;
         continue;
-      } else if (sub->posted < sub->nsteps) {
-        phase1ProxyWstallLog(proxyState, args, sub, "PROXY_SEND_WSTALL", (sub->base+sub->posted)%NCCL_STEPS, wBase, wCfg, wEff, &sub->phase1SendWstall);
       }
       // Check whether we received data from the GPU and send it to the network
       if (sub->transmitted < sub->posted && sub->transmitted < sub->done + NCCL_STEPS) {
