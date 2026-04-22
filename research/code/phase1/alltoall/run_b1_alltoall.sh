@@ -17,6 +17,26 @@ infer_node_rank() {
   return 1
 }
 
+validate_w_list() {
+  local raw_list=$1
+  local value
+  IFS=',' read -r -a parsed <<< "${raw_list}"
+  if (( ${#parsed[@]} == 0 )); then
+    echo "[phase1-alltoall] W_LIST is empty." >&2
+    return 1
+  fi
+  for value in "${parsed[@]}"; do
+    if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+      echo "[phase1-alltoall] W_LIST contains non-integer entry '${value}'." >&2
+      return 1
+    fi
+    if (( 10#${value} <= 0 )); then
+      echo "[phase1-alltoall] W_LIST entry '${value}' must be > 0." >&2
+      return 1
+    fi
+  done
+}
+
 RUN_ID=${RUN_ID:-phase1_b1_alltoall_manual}
 MASTER_ADDR=${MASTER_ADDR:-172.16.0.101}
 MASTER_PORT_BASE=${MASTER_PORT_BASE:-30500}
@@ -27,7 +47,7 @@ NODE_RANK=${NODE_RANK:-$(infer_node_rank "${WORKER_NAME}")}
 TORCH_ENV=${TORCH_ENV:-/workspace/venvs/torch-cu121-custom/bin/activate}
 TARGET_SCRIPT=${TARGET_SCRIPT:-research/code/phase1/alltoall/alltoall_b1.py}
 LOG_ROOT=${LOG_ROOT:-/mnt/nfs_share/cts_experiments/${RUN_ID}}
-W_LIST=${W_LIST:-1,2,4,8}
+W_LIST=${W_LIST:-1,2,4,5,6,7,8}
 STEPS=${STEPS:-40}
 WARMUP_STEPS=${WARMUP_STEPS:-5}
 PAYLOAD_MB=${PAYLOAD_MB:-64}
@@ -63,6 +83,7 @@ else
 fi
 
 IFS=',' read -r -a W_VALUES <<< "${W_LIST}"
+validate_w_list "${W_LIST}"
 
 echo "[phase1-alltoall] RUN_ID=${RUN_ID}"
 echo "[phase1-alltoall] WORKER_NAME=${WORKER_NAME} NODE_RANK=${NODE_RANK}/${NNODES}"
