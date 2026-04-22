@@ -33,6 +33,8 @@
 #include "os.h"
 #include "env.h"
 #include "rma/rma.h"
+#include <stdio.h>
+#include <string.h>
 
 #define STR2(v) #v
 #define STR(v) STR2(v)
@@ -659,12 +661,62 @@ static void showVersion() {
 
 NCCL_PARAM(MNNVLUUID, "MNNVL_UUID", -1);
 NCCL_PARAM(MNNVLCliqueId, "MNNVL_CLIQUE_ID", -1);
+NCCL_PARAM(RackId, "RACK_ID", -2);
+
+static int resolveRackIdFromMap(const char* hostname, const char* mapFile) {
+  FILE* file = fopen(mapFile, "r");
+  if (file == NULL) {
+    WARN("B2 rack map: could not open NCCL_RACK_MAP_FILE=%s", mapFile);
+    return -1;
+  }
+
+  int rackId = -1;
+  char* line = NULL;
+  size_t n = 0;
+  while (getline(&line, &n, file) != -1) {
+    char* cursor = line;
+    while (*cursor == ' ' || *cursor == '\t') cursor++;
+    if (*cursor == '#' || *cursor == '\n' || *cursor == '\0') continue;
+
+    char host[1024];
+    int parsedRackId;
+    if (sscanf(cursor, "%1023s %d", host, &parsedRackId) == 2 && strcmp(host, hostname) == 0) {
+      rackId = parsedRackId;
+      break;
+    }
+  }
+
+  free(line);
+  fclose(file);
+  return rackId;
+}
+
+static int resolveRackIdForLocalHost(const char** sourceOut) {
+  if (sourceOut) *sourceOut = "unset";
+
+  int envRackId = ncclParamRackId();
+  if (envRackId >= 0) {
+    if (sourceOut) *sourceOut = "NCCL_RACK_ID";
+    return envRackId;
+  }
+
+  const char* mapFile = ncclGetEnv("NCCL_RACK_MAP_FILE");
+  if (mapFile == NULL || mapFile[0] == '\0') return -1;
+
+  char hostname[1024];
+  (void)getHostName(hostname, sizeof(hostname), '.');
+  int rackId = resolveRackIdFromMap(hostname, mapFile);
+  if (rackId >= 0 && sourceOut) *sourceOut = "NCCL_RACK_MAP_FILE";
+  return rackId;
+}
 
 static ncclResult_t fillInfo(struct ncclComm* comm, struct ncclPeerInfo* info, uint64_t commHash) {
   cudaDeviceProp prop;
+  const char* rackSource = NULL;
   info->rank = comm->rank;
   info->cudaDev = comm->cudaDev;
   info->nvmlDev = comm->nvmlDev;
+  info->rackId = resolveRackIdForLocalHost(&rackSource);
   NCCLCHECK(ncclGetVersion(&info->version));
   info->hostHash=getHostHash()+commHash;
   info->pidHash=getPidHash()+commHash;
@@ -727,6 +779,10 @@ static ncclResult_t fillInfo(struct ncclComm* comm, struct ncclPeerInfo* info, u
   info->cuMemGdrSupport = (cuMemGdrSupport == 1);
   info->supportedGinType = comm->sharedRes->ginState.ginType;
   info->rmaPluginAvailable = (comm->rmaState.rmaProxyState.ncclGin != nullptr);
+
+  if (info->rackId >= 0) {
+    INFO(NCCL_INIT, "B2 rack metadata rank %d rackId %d source %s", info->rank, info->rackId, rackSource ? rackSource : "unknown");
+  }
 
   return ncclSuccess;
 }
@@ -3150,4 +3206,3 @@ ncclResult_t ncclCommUserRank(const ncclComm_t comm, int* rank) {
   *rank = comm->rank;
   return ncclSuccess;
 }
-

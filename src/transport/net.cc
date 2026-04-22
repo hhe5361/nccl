@@ -18,6 +18,7 @@
 #include "shm.h"
 #include "compiler.h"
 #include <assert.h>
+#include <string.h>
 #include "register_inline.h"
 
 static_assert(sizeof(ncclNetHandle_t) <= CONNECT_SIZE, "NET Connect info is too large");
@@ -168,6 +169,8 @@ NCCL_PARAM(NetSharedBuffers, "NET_SHARED_BUFFERS", -2);
 NCCL_PARAM(NetSharedComms, "NET_SHARED_COMMS", 1);
 NCCL_PARAM(Phase0Log, "PHASE0_LOG", 0);
 NCCL_PARAM(Phase1StaticW, "PHASE1_STATIC_W", 0);
+NCCL_PARAM(Phase2B2Enable, "PHASE2_B2_ENABLE", 0);
+NCCL_PARAM(Phase2Log, "PHASE2_LOG", 0);
 
 struct setupReq {
   int tpRank;
@@ -688,6 +691,59 @@ static inline int phase1WindowEff(struct ncclProxyArgs* args) {
   return (wCfg > 0) ? std::min(wBase, std::max(1, wCfg)) : wBase;
 }
 
+struct phase2WindowDecision {
+  int enabled;
+  int rackSelf;
+  int rackPeer;
+  int rackKnown;
+  int interRack;
+  int penaltyTopo;
+  int penaltyColl;
+  int penaltyAlgo;
+  int penaltyTotal;
+  int wBase;
+  int wMin;
+  int wMax;
+  int wRaw;
+  int wEff;
+};
+
+static inline struct phase2WindowDecision phase2SelectWindow(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub) {
+  struct phase2WindowDecision decision;
+  memset(&decision, 0, sizeof(decision));
+  decision.enabled = ncclParamPhase2B2Enable() != 0;
+  decision.rackSelf = -1;
+  decision.rackPeer = -1;
+  decision.wBase = phase1WindowBaseDepth(args);
+  decision.wMin = (args->collAPI == ncclFuncAlltoAll) ? 2 : 4;
+  decision.wMax = decision.wBase;
+  decision.wRaw = decision.wBase;
+  decision.wEff = decision.wBase;
+
+  if (!decision.enabled || phase1WindowCfg() > 0 || proxyState == NULL || sub == NULL) return decision;
+
+  struct ncclComm* comm = proxyState->comm;
+  if (comm == NULL || comm->peerInfo == NULL) return decision;
+  if (sub->peer < 0 || sub->peer >= comm->nRanks) return decision;
+
+  decision.rackSelf = comm->peerInfo[comm->rank].rackId;
+  decision.rackPeer = comm->peerInfo[sub->peer].rackId;
+  decision.rackKnown = (decision.rackSelf >= 0 && decision.rackPeer >= 0);
+  decision.interRack = decision.rackKnown && (decision.rackSelf != decision.rackPeer);
+
+  if (decision.interRack) decision.penaltyTopo = 1;
+  if (args->collAPI == ncclFuncAlltoAll) decision.penaltyColl = 1;
+  if (args->algorithm == NCCL_ALGO_TREE) decision.penaltyAlgo = 1;
+
+  decision.penaltyTotal = decision.penaltyTopo + decision.penaltyColl + decision.penaltyAlgo;
+  decision.wRaw = decision.wBase - decision.penaltyTotal;
+  decision.wEff = std::min(decision.wMax, std::max(decision.wMin, decision.wRaw));
+  return decision;
+}
+
 static inline void phase1ProxyWindowCfgLog(
     struct ncclProxyState* proxyState,
     struct ncclProxyArgs* args,
@@ -752,6 +808,82 @@ static inline void phase1ProxyWstallLog(
       (unsigned long long)(sub->posted - sub->done),
       (unsigned long long)(sub->transmitted - sub->done));
   *stallFlag = 1;
+}
+
+static inline void phase2ProxyWindowCfgLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    const struct phase2WindowDecision* decision) {
+  if (ncclParamPhase2Log() == 0 || sub->phase2WindowCfgLogged) return;
+  INFO(NCCL_NET,
+      "PHASE2 event=PROXY_B2_WINDOW_CFG tNs=%llu rank=%d peer=%d channel=%d coll=%s collApi=%s algo=%s proto=%s base=%llu nsteps=%d rackSelf=%d rackPeer=%d rackKnown=%d interRack=%d penTopo=%d penColl=%d penAlgo=%d penTotal=%d wBase=%d wMin=%d wMax=%d wRaw=%d wEff=%d",
+      (unsigned long long)clockNano(),
+      proxyState->tpRank,
+      sub->peer,
+      sub->channelId,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol),
+      (unsigned long long)sub->base,
+      sub->nsteps,
+      decision->rackSelf,
+      decision->rackPeer,
+      decision->rackKnown,
+      decision->interRack,
+      decision->penaltyTopo,
+      decision->penaltyColl,
+      decision->penaltyAlgo,
+      decision->penaltyTotal,
+      decision->wBase,
+      decision->wMin,
+      decision->wMax,
+      decision->wRaw,
+      decision->wEff);
+  sub->phase2WindowCfgLogged = 1;
+}
+
+static inline void phase2ProxyRecvWstallLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    int slot,
+    const struct phase2WindowDecision* decision) {
+  if (ncclParamPhase2Log() == 0 || sub->phase2RecvWstall) return;
+  INFO(NCCL_NET,
+      "PHASE2 event=PROXY_B2_RECV_WSTALL tNs=%llu rank=%d peer=%d channel=%d slot=%d coll=%s collApi=%s algo=%s proto=%s base=%llu posted=%llu received=%llu transmitted=%llu done=%llu nsteps=%d rackSelf=%d rackPeer=%d rackKnown=%d interRack=%d penTopo=%d penColl=%d penAlgo=%d penTotal=%d wBase=%d wMin=%d wMax=%d wRaw=%d wEff=%d occPd=%llu occTr=%llu",
+      (unsigned long long)clockNano(),
+      proxyState->tpRank,
+      sub->peer,
+      sub->channelId,
+      slot,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol),
+      (unsigned long long)sub->base,
+      (unsigned long long)sub->posted,
+      (unsigned long long)sub->received,
+      (unsigned long long)sub->transmitted,
+      (unsigned long long)sub->done,
+      sub->nsteps,
+      decision->rackSelf,
+      decision->rackPeer,
+      decision->rackKnown,
+      decision->interRack,
+      decision->penaltyTopo,
+      decision->penaltyColl,
+      decision->penaltyAlgo,
+      decision->penaltyTotal,
+      decision->wBase,
+      decision->wMin,
+      decision->wMax,
+      decision->wRaw,
+      decision->wEff,
+      (unsigned long long)(sub->posted - sub->done),
+      (unsigned long long)(sub->transmitted - sub->done));
+  sub->phase2RecvWstall = 1;
 }
 
 static ncclResult_t sharedNetBuffersInit(struct ncclProxyState* proxyState, int cuda, int tpLocalRank, int type, int sameProcess,
@@ -1368,6 +1500,8 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
       sub->phase1WindowCfgLogged = 0;
       sub->phase1SendWstall = 0;
       sub->phase1RecvWstall = 0;
+      sub->phase2WindowCfgLogged = 0;
+      sub->phase2RecvWstall = 0;
       ncclProfilerRecordProxyOpEventState(s, args, ncclProfilerProxyOpInProgress_v4);
       if (!sub->reg)
         sub->sendMhandle = resources->mhandles[args->protocol];
@@ -1557,6 +1691,8 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
       sub->phase1WindowCfgLogged = 0;
       sub->phase1SendWstall = 0;
       sub->phase1RecvWstall = 0;
+      sub->phase2WindowCfgLogged = 0;
+      sub->phase2RecvWstall = 0;
       for (int i=0; i<groupSize; i++) sub[-i].groupSize = groupSize;
       ncclProfilerRecordProxyOpEventState(s, args, ncclProfilerProxyOpInProgress_v4);
       if (!sub->reg)
@@ -1569,7 +1705,6 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
     int p = args->protocol;
     int wBase = phase1WindowBaseDepth(args);
     int wCfg = phase1WindowCfg();
-    int wEff = phase1WindowEff(args);
     for (int s=0; s<args->nsubs; s+=args->subs[s].groupSize) {
       struct ncclProxySubArgs* subGroup = args->subs+s;
       int subCount = 0;
@@ -1583,13 +1718,24 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
         int postedStepId = sub->posted;
         if (sub->posted < sub->nsteps) {
           struct recvNetResources* resources = (struct recvNetResources*) (sub->connection->transportResources);
-          phase1ProxyWindowCfgLog(proxyState, args, sub, resources->shared, wBase, wCfg, wEff);
+          struct phase2WindowDecision phase2Decision = phase2SelectWindow(proxyState, args, sub);
+          int wEff = (wCfg > 0) ? phase1WindowEff(args) : (phase2Decision.enabled ? phase2Decision.wEff : wBase);
+          if (phase2Decision.enabled && wCfg == 0) {
+            phase2ProxyWindowCfgLog(proxyState, args, sub, &phase2Decision);
+          } else {
+            phase1ProxyWindowCfgLog(proxyState, args, sub, resources->shared, wBase, wCfg, wEff);
+          }
           if (sub->posted >= sub->done + wEff) {
-            phase1ProxyWstallLog(proxyState, args, sub, "PROXY_RECV_WSTALL", (sub->base+sub->posted)%NCCL_STEPS, wBase, wCfg, wEff, &sub->phase1RecvWstall);
+            if (phase2Decision.enabled && wCfg == 0) {
+              phase2ProxyRecvWstallLog(proxyState, args, sub, (sub->base+sub->posted)%NCCL_STEPS, &phase2Decision);
+            } else {
+              phase1ProxyWstallLog(proxyState, args, sub, "PROXY_RECV_WSTALL", (sub->base+sub->posted)%NCCL_STEPS, wBase, wCfg, wEff, &sub->phase1RecvWstall);
+            }
             subCount = 0;
             break;
           }
           sub->phase1RecvWstall = 0;
+          sub->phase2RecvWstall = 0;
           ncclProfilerStartRecvProxyStepEvent(s+i, args, postedStepId);
           int stepSize = resources->buffSizes[p] / NCCL_STEPS;
           char* localBuff = NCCL_NET_MAP_GET_POINTER(&resources->map, cpu, buffs[p]);
@@ -1646,6 +1792,8 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
           for (int i=0; i<subGroup->groupSize; i++) {
             struct ncclProxySubArgs* sub = subGroup+i;
             int postedStepId = sub->posted;
+            struct phase2WindowDecision phase2Decision = phase2SelectWindow(proxyState, args, sub);
+            int wEff = (wCfg > 0) ? phase1WindowEff(args) : (phase2Decision.enabled ? phase2Decision.wEff : wBase);
             TRACE(NCCL_NET, "recvProxy [%ld/%ld/%d] Irecv posted, buff %p, size %ld, myRank %d, channelId %d, mhandle %p", sub->posted, (sub->base + sub->posted) % NCCL_STEPS, sub->nsteps, ptrs[i], sizes[i], proxyState->tpRank, sub->channelId, mhandles[i]);
             phase0ProxyLog(proxyState, args, sub, "PROXY_RECV_POST", (sub->base + sub->posted) % NCCL_STEPS, sizes[i], wBase, wCfg, wEff);
             sub->posted += args->sliceSteps;
@@ -1675,6 +1823,8 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             struct ncclProxySubArgs* sub = subGroup + i;
             int receivedStepId = sub->received;
             int buffSlot = (sub->base + sub->received) % NCCL_STEPS;
+            struct phase2WindowDecision phase2Decision = phase2SelectWindow(proxyState, args, sub);
+            int wEff = (wCfg > 0) ? phase1WindowEff(args) : (phase2Decision.enabled ? phase2Decision.wEff : wBase);
             struct recvNetResources* resources = (struct recvNetResources*)(sub->connection->transportResources);
             volatile struct ncclConnFifo* connFifo = (volatile struct ncclConnFifo*)resources->recvMem->connFifo;
             connFifo[buffSlot].size = -1;
@@ -1742,6 +1892,8 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
           for (int i=0; i<subGroup->groupSize; i++) {
             struct ncclProxySubArgs* sub = subGroup + i;
             int transmittedStepId = sub->transmitted;
+            struct phase2WindowDecision phase2Decision = phase2SelectWindow(proxyState, args, sub);
+            int wEff = (wCfg > 0) ? phase1WindowEff(args) : (phase2Decision.enabled ? phase2Decision.wEff : wBase);
 
             sub->transmitted += args->sliceSteps;
             ncclProfilerRecordProxyStepEventState(s+i, args, transmittedStepId, ncclProfilerProxyStepRecvGPUWait);
@@ -1779,6 +1931,8 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
               subGroup->recvRequestsCache[sub->done%NCCL_STEPS] = NULL;
             }
             int doneStepId = sub->done;
+            struct phase2WindowDecision phase2Decision = phase2SelectWindow(proxyState, args, sub);
+            int wEff = (wCfg > 0) ? phase1WindowEff(args) : (phase2Decision.enabled ? phase2Decision.wEff : wBase);
             phase0ProxyLog(proxyState, args, sub, "PROXY_RECV_CONSUMED", (sub->base + sub->done) % NCCL_STEPS, sub->transSize, wBase, wCfg, wEff);
             sub->done += args->sliceSteps;
             ncclProfilerStopProxyStepEvent(s+i, args, doneStepId);

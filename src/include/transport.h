@@ -44,6 +44,7 @@ struct ncclPeerInfo {
   int cudaDev;
   int nvmlDev;
   int gdrSupport;
+  int rackId;
   uint64_t hostHash;
   uint64_t pidHash;
   dev_t shmDev;
