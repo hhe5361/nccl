@@ -8,7 +8,7 @@ infer_node_rank() {
   local worker_name=$1
   if [[ "${worker_name}" =~ ^worker([0-9]+)$ ]]; then
     local idx=${BASH_REMATCH[1]}
-    if (( 1 <= 10#${idx} && 10#${idx} <= 7 )); then
+    if (( 1 <= 10#${idx} && 10#${idx} <= 8 )); then
       echo $((10#${idx} - 1))
       return 0
     fi
@@ -20,7 +20,7 @@ infer_node_rank() {
 RUN_ID=${RUN_ID:-phase1_b1_ring_manual}
 MASTER_ADDR=${MASTER_ADDR:-172.16.0.101}
 MASTER_PORT_BASE=${MASTER_PORT_BASE:-29500}
-NNODES=${NNODES:-7}
+NNODES=${NNODES:-8}
 NPROC_PER_NODE=${NPROC_PER_NODE:-1}
 WORKER_NAME=${WORKER_NAME:-$(hostname -s)}
 NODE_RANK=${NODE_RANK:-$(infer_node_rank "${WORKER_NAME}")}
