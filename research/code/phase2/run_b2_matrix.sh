@@ -9,10 +9,10 @@ MASTER_ADDR=${MASTER_ADDR:-172.16.0.101}
 MASTER_PORT_BASE=${MASTER_PORT_BASE:-31500}
 LOG_ROOT_BASE=${LOG_ROOT_BASE:-/mnt/nfs_share/cts_experiments}
 MATRIX_ROOT=${MATRIX_ROOT:-${LOG_ROOT_BASE}/${RUN_ID}}
-ALL_WORKERS=${ALL_WORKERS:-worker01,worker02,worker03,worker04,worker05,worker06,worker07}
+ALL_WORKERS=${ALL_WORKERS:-worker01,worker02,worker03,worker04,worker05,worker06,worker07,worker08}
 INTRA_RACK_HOSTS=${INTRA_RACK_HOSTS:-worker01,worker02,worker03,worker04}
 INTER_RACK_HOSTS=${INTER_RACK_HOSTS:-worker01,worker02,worker05,worker06}
-PAYLOAD_LIST=${PAYLOAD_LIST:-4,32,256}
+PAYLOAD_MB=${PAYLOAD_MB:-32}
 RUN_MODES=${RUN_MODES:-stock,b2}
 DTYPE=${DTYPE:-float32}
 STEPS=${STEPS:-40}
@@ -26,7 +26,6 @@ WORKER_NAME=${WORKER_NAME:-$(hostname -s)}
 mkdir -p "${MATRIX_ROOT}"
 
 IFS=',' read -r -a ALL_WORKER_ARRAY <<< "${ALL_WORKERS}"
-IFS=',' read -r -a PAYLOADS <<< "${PAYLOAD_LIST}"
 
 contains_worker() {
   local worker=$1
@@ -71,29 +70,23 @@ count_in_list() {
 EXPERIMENT_IDS=()
 EXPERIMENT_HOSTS=()
 EXPERIMENT_COLLS=()
-EXPERIMENT_ALGOS=()
-EXPERIMENT_PROTOS=()
 EXPERIMENT_PAYLOADS=()
 
 add_experiment() {
   EXPERIMENT_IDS+=("$1")
   EXPERIMENT_HOSTS+=("$2")
   EXPERIMENT_COLLS+=("$3")
-  EXPERIMENT_ALGOS+=("$4")
-  EXPERIMENT_PROTOS+=("$5")
-  EXPERIMENT_PAYLOADS+=("$6")
+  EXPERIMENT_PAYLOADS+=("$4")
 }
 
-for payload in "${PAYLOADS[@]}"; do
-  add_experiment "intra_a_allreduce_ring_simple_${payload}mb" "${INTRA_RACK_HOSTS}" "allreduce" "Ring" "Simple" "${payload}"
-  add_experiment "inter_allreduce_ring_simple_${payload}mb" "${INTER_RACK_HOSTS}" "allreduce" "Ring" "Simple" "${payload}"
-  add_experiment "inter_allreduce_tree_simple_${payload}mb" "${INTER_RACK_HOSTS}" "allreduce" "Tree" "Simple" "${payload}"
-  add_experiment "inter_allgather_ring_simple_${payload}mb" "${INTER_RACK_HOSTS}" "allgather" "Ring" "Simple" "${payload}"
-  add_experiment "inter_allgather_tree_simple_${payload}mb" "${INTER_RACK_HOSTS}" "allgather" "Tree" "Simple" "${payload}"
-  add_experiment "inter_reducescatter_ring_simple_${payload}mb" "${INTER_RACK_HOSTS}" "reducescatter" "Ring" "Simple" "${payload}"
-  add_experiment "inter_reducescatter_tree_simple_${payload}mb" "${INTER_RACK_HOSTS}" "reducescatter" "Tree" "Simple" "${payload}"
-  add_experiment "inter_alltoall_auto_simple_${payload}mb" "${INTER_RACK_HOSTS}" "alltoall" "auto" "Simple" "${payload}"
-done
+add_experiment "intra_allreduce_${PAYLOAD_MB}mb" "${INTRA_RACK_HOSTS}" "allreduce" "${PAYLOAD_MB}"
+add_experiment "inter_allreduce_${PAYLOAD_MB}mb" "${INTER_RACK_HOSTS}" "allreduce" "${PAYLOAD_MB}"
+add_experiment "intra_allgather_${PAYLOAD_MB}mb" "${INTRA_RACK_HOSTS}" "allgather" "${PAYLOAD_MB}"
+add_experiment "inter_allgather_${PAYLOAD_MB}mb" "${INTER_RACK_HOSTS}" "allgather" "${PAYLOAD_MB}"
+add_experiment "intra_reducescatter_${PAYLOAD_MB}mb" "${INTRA_RACK_HOSTS}" "reducescatter" "${PAYLOAD_MB}"
+add_experiment "inter_reducescatter_${PAYLOAD_MB}mb" "${INTER_RACK_HOSTS}" "reducescatter" "${PAYLOAD_MB}"
+add_experiment "intra_alltoall_${PAYLOAD_MB}mb" "${INTRA_RACK_HOSTS}" "alltoall" "${PAYLOAD_MB}"
+add_experiment "inter_alltoall_${PAYLOAD_MB}mb" "${INTER_RACK_HOSTS}" "alltoall" "${PAYLOAD_MB}"
 
 MANIFEST_JSON="${MATRIX_ROOT}/matrix_manifest.json"
 if [[ "${WORKER_NAME}" == "${ALL_WORKER_ARRAY[0]}" ]]; then
@@ -104,6 +97,7 @@ if [[ "${WORKER_NAME}" == "${ALL_WORKER_ARRAY[0]}" ]]; then
     echo "  \"master_port_base\": ${MASTER_PORT_BASE},"
     echo "  \"run_modes\": \"${RUN_MODES}\","
     echo "  \"dtype\": \"${DTYPE}\","
+    echo "  \"payload_mb\": ${PAYLOAD_MB},"
     echo "  \"steps\": ${STEPS},"
     echo "  \"warmup_steps\": ${WARMUP_STEPS},"
     echo "  \"rack_map_file\": \"${RACK_MAP_FILE}\","
@@ -120,8 +114,6 @@ if [[ "${WORKER_NAME}" == "${ALL_WORKER_ARRAY[0]}" ]]; then
       "id": "${EXPERIMENT_IDS[$idx]}",
       "hosts": "${EXPERIMENT_HOSTS[$idx]}",
       "collective": "${EXPERIMENT_COLLS[$idx]}",
-      "algo": "${EXPERIMENT_ALGOS[$idx]}",
-      "proto": "${EXPERIMENT_PROTOS[$idx]}",
       "payload_mb": ${EXPERIMENT_PAYLOADS[$idx]}
     }${comma}
 EOF
@@ -140,8 +132,6 @@ for idx in "${!EXPERIMENT_IDS[@]}"; do
   exp_id=${EXPERIMENT_IDS[$idx]}
   exp_hosts=${EXPERIMENT_HOSTS[$idx]}
   exp_coll=${EXPERIMENT_COLLS[$idx]}
-  exp_algo=${EXPERIMENT_ALGOS[$idx]}
-  exp_proto=${EXPERIMENT_PROTOS[$idx]}
   exp_payload=${EXPERIMENT_PAYLOADS[$idx]}
   exp_nodes=$(count_in_list "${exp_hosts}")
   exp_root="${MATRIX_ROOT}/$(printf "%02d_%s" "$((idx+1))" "${exp_id}")"
@@ -157,7 +147,7 @@ for idx in "${!EXPERIMENT_IDS[@]}"; do
   if contains_worker "${WORKER_NAME}" "${exp_hosts}"; then
     participated=1
     exp_rank=$(index_in_list "${WORKER_NAME}" "${exp_hosts}")
-    echo "[phase2-matrix] start idx=${idx} id=${exp_id} rank=${exp_rank}/${exp_nodes} coll=${exp_coll} algo=${exp_algo} proto=${exp_proto} payload=${exp_payload}MB"
+    echo "[phase2-matrix] start idx=${idx} id=${exp_id} rank=${exp_rank}/${exp_nodes} coll=${exp_coll} payload=${exp_payload}MB"
     set +e
     RUN_ID="${exp_id}" \
     LOG_ROOT="${exp_root}" \
@@ -174,8 +164,8 @@ for idx in "${!EXPERIMENT_IDS[@]}"; do
     STEPS="${STEPS}" \
     WARMUP_STEPS="${WARMUP_STEPS}" \
     SLEEP_MS="${SLEEP_MS}" \
-    NCCL_ALGO="${exp_algo}" \
-    NCCL_PROTO="${exp_proto}" \
+    NCCL_ALGO="auto" \
+    NCCL_PROTO="auto" \
     NCCL_RACK_MAP_FILE="${RACK_MAP_FILE}" \
     TORCH_ENV="${TORCH_ENV}" \
     bash "${REPO_ROOT}/${INNER_SCRIPT}"

@@ -35,6 +35,8 @@ PAYLOAD_MB=${PAYLOAD_MB:-64}
 DTYPE=${DTYPE:-float32}
 SLEEP_MS=${SLEEP_MS:-0}
 RACK_MAP_FILE=${NCCL_RACK_MAP_FILE:-${REPO_ROOT}/research/code/phase2/rack_map.txt}
+ALGO_SETTING=${NCCL_ALGO:-auto}
+PROTO_SETTING=${NCCL_PROTO:-auto}
 
 mkdir -p "${LOG_ROOT}"
 
@@ -47,19 +49,21 @@ export NCCL_PHASE1_STATIC_W=0
 export NCCL_PHASE2_LOG=${NCCL_PHASE2_LOG:-1}
 export NCCL_DEBUG=${NCCL_DEBUG:-INFO}
 export NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-NET}
-export NCCL_ALGO=${NCCL_ALGO:-Ring}
-export NCCL_PROTO=${NCCL_PROTO:-Simple}
 export NCCL_RACK_MAP_FILE="${RACK_MAP_FILE}"
 export NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL:-0}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
 
-if [[ "${NCCL_ALGO}" == "auto" ]]; then
+if [[ "${ALGO_SETTING}" == "auto" ]]; then
   unset NCCL_ALGO
+else
+  export NCCL_ALGO="${ALGO_SETTING}"
 fi
 
-if [[ "${NCCL_PROTO}" == "auto" ]]; then
+if [[ "${PROTO_SETTING}" == "auto" ]]; then
   unset NCCL_PROTO
+else
+  export NCCL_PROTO="${PROTO_SETTING}"
 fi
 
 if command -v torchrun >/dev/null 2>&1; then
@@ -101,8 +105,8 @@ if [[ "${NODE_RANK}" == "0" ]]; then
   "warmup_steps": ${WARMUP_STEPS},
   "payload_mb": ${PAYLOAD_MB},
   "dtype": "${DTYPE}",
-  "nccl_algo": "${NCCL_ALGO}",
-  "nccl_proto": "${NCCL_PROTO}",
+  "nccl_algo": "${ALGO_SETTING}",
+  "nccl_proto": "${PROTO_SETTING}",
   "rack_map_file": "${RACK_MAP_FILE}",
   "policy_name": "rack_aware_semantic_static_b2",
   "policy_formula": "W_eff = clamp(W_min, W_base, W_base - (interRack + alltoall + tree))",
@@ -119,7 +123,7 @@ echo "[phase2] MASTER_ADDR=${MASTER_ADDR} MASTER_PORT_BASE=${MASTER_PORT_BASE}"
 echo "[phase2] LOG_ROOT=${LOG_ROOT}"
 echo "[phase2] TARGET_SCRIPT=${TARGET_SCRIPT}"
 echo "[phase2] COLLECTIVE=${COLLECTIVE} RUN_MODES=${RUN_MODES}"
-echo "[phase2] PAYLOAD_MB=${PAYLOAD_MB} DTYPE=${DTYPE} NCCL_ALGO=${NCCL_ALGO} NCCL_PROTO=${NCCL_PROTO}"
+echo "[phase2] PAYLOAD_MB=${PAYLOAD_MB} DTYPE=${DTYPE} NCCL_ALGO=${ALGO_SETTING} NCCL_PROTO=${PROTO_SETTING}"
 echo "[phase2] RACK_MAP_FILE=${RACK_MAP_FILE}"
 
 for idx in "${!MODE_VALUES[@]}"; do
