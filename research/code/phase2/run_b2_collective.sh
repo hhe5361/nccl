@@ -17,7 +17,7 @@ infer_node_rank() {
   return 1
 }
 
-RUN_ID=${RUN_ID:-phase2_b2_manual}
+RUN_ID=${RUN_ID:-phase2_b2_collective_$(date +%y%m%d_%H%M%S)}
 MASTER_ADDR=${MASTER_ADDR:-172.16.0.101}
 MASTER_PORT_BASE=${MASTER_PORT_BASE:-31500}
 NNODES=${NNODES:-8}
