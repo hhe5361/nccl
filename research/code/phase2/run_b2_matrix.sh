@@ -11,8 +11,10 @@ LOG_ROOT_BASE=${LOG_ROOT_BASE:-/mnt/nfs_share/cts_experiments}
 MATRIX_ROOT=${MATRIX_ROOT:-${LOG_ROOT_BASE}/${RUN_ID}}
 ALL_WORKERS=${ALL_WORKERS:-worker01,worker02,worker03,worker04,worker05,worker06,worker07,worker08}
 INTRA_RACK_HOSTS=${INTRA_RACK_HOSTS:-worker01,worker02,worker03,worker04}
-INTER_RACK_HOSTS=${INTER_RACK_HOSTS:-worker01,worker02,worker05,worker06}
-PAYLOAD_MB=${PAYLOAD_MB:-32}
+FULL_INTER_RACK_HOSTS=${FULL_INTER_RACK_HOSTS:-worker01,worker02,worker03,worker04,worker05,worker06,worker07,worker08}
+INTRA_PAYLOAD_MB=${INTRA_PAYLOAD_MB:-128}
+INTER_PAYLOAD_MB=${INTER_PAYLOAD_MB:-128}
+INTER_LARGE_PAYLOAD_MB=${INTER_LARGE_PAYLOAD_MB:-256}
 RUN_MODES=${RUN_MODES:-stock,b2}
 DTYPE=${DTYPE:-float32}
 STEPS=${STEPS:-40}
@@ -79,14 +81,9 @@ add_experiment() {
   EXPERIMENT_PAYLOADS+=("$4")
 }
 
-add_experiment "intra_allreduce_${PAYLOAD_MB}mb" "${INTRA_RACK_HOSTS}" "allreduce" "${PAYLOAD_MB}"
-add_experiment "inter_allreduce_${PAYLOAD_MB}mb" "${INTER_RACK_HOSTS}" "allreduce" "${PAYLOAD_MB}"
-add_experiment "intra_allgather_${PAYLOAD_MB}mb" "${INTRA_RACK_HOSTS}" "allgather" "${PAYLOAD_MB}"
-add_experiment "inter_allgather_${PAYLOAD_MB}mb" "${INTER_RACK_HOSTS}" "allgather" "${PAYLOAD_MB}"
-add_experiment "intra_reducescatter_${PAYLOAD_MB}mb" "${INTRA_RACK_HOSTS}" "reducescatter" "${PAYLOAD_MB}"
-add_experiment "inter_reducescatter_${PAYLOAD_MB}mb" "${INTER_RACK_HOSTS}" "reducescatter" "${PAYLOAD_MB}"
-add_experiment "intra_alltoall_${PAYLOAD_MB}mb" "${INTRA_RACK_HOSTS}" "alltoall" "${PAYLOAD_MB}"
-add_experiment "inter_alltoall_${PAYLOAD_MB}mb" "${INTER_RACK_HOSTS}" "alltoall" "${PAYLOAD_MB}"
+add_experiment "intra_alltoall_${INTRA_PAYLOAD_MB}mb" "${INTRA_RACK_HOSTS}" "alltoall" "${INTRA_PAYLOAD_MB}"
+add_experiment "inter_alltoall_${INTER_PAYLOAD_MB}mb" "${FULL_INTER_RACK_HOSTS}" "alltoall" "${INTER_PAYLOAD_MB}"
+add_experiment "inter_alltoall_${INTER_LARGE_PAYLOAD_MB}mb" "${FULL_INTER_RACK_HOSTS}" "alltoall" "${INTER_LARGE_PAYLOAD_MB}"
 
 MANIFEST_JSON="${MATRIX_ROOT}/matrix_manifest.json"
 if [[ "${WORKER_NAME}" == "${ALL_WORKER_ARRAY[0]}" ]]; then
@@ -97,11 +94,15 @@ if [[ "${WORKER_NAME}" == "${ALL_WORKER_ARRAY[0]}" ]]; then
     echo "  \"master_port_base\": ${MASTER_PORT_BASE},"
     echo "  \"run_modes\": \"${RUN_MODES}\","
     echo "  \"dtype\": \"${DTYPE}\","
-    echo "  \"payload_mb\": ${PAYLOAD_MB},"
+    echo "  \"intra_payload_mb\": ${INTRA_PAYLOAD_MB},"
+    echo "  \"inter_payload_mb\": ${INTER_PAYLOAD_MB},"
+    echo "  \"inter_large_payload_mb\": ${INTER_LARGE_PAYLOAD_MB},"
     echo "  \"steps\": ${STEPS},"
     echo "  \"warmup_steps\": ${WARMUP_STEPS},"
     echo "  \"rack_map_file\": \"${RACK_MAP_FILE}\","
     echo "  \"worker_pool\": \"${ALL_WORKERS}\","
+    echo "  \"intra_rack_hosts\": \"${INTRA_RACK_HOSTS}\","
+    echo "  \"full_inter_rack_hosts\": \"${FULL_INTER_RACK_HOSTS}\","
     echo "  \"experiments\": ["
     for idx in "${!EXPERIMENT_IDS[@]}"; do
       comma=","
