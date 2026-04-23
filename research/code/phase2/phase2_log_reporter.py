@@ -254,6 +254,8 @@ def summarize_nccl_logs(mode_dir: Path) -> dict:
     event_counts: Counter = Counter()
     worker_event_counts: Dict[str, Counter] = defaultdict(Counter)
     worker_wstall_counts: Counter = Counter()
+    worker_recv_wstall_counts: Counter = Counter()
+    worker_send_wstall_counts: Counter = Counter()
     decision_counts: Counter = Counter()
     w_eff_values: List[float] = []
     pressure_scores: List[float] = []
@@ -303,8 +305,10 @@ def summarize_nccl_logs(mode_dir: Path) -> dict:
                 if "WSTALL" in event_name:
                     worker_wstall_counts[worker] += 1
                     if "RECV" in event_name:
+                        worker_recv_wstall_counts[worker] += 1
                         recv_wstall_count += 1
                     if "SEND" in event_name:
+                        worker_send_wstall_counts[worker] += 1
                         send_wstall_count += 1
 
                 if event_name.endswith("DECISION") and "reason" in entry:
@@ -342,6 +346,8 @@ def summarize_nccl_logs(mode_dir: Path) -> dict:
         "event_counts": event_counts,
         "worker_event_counts": worker_event_counts,
         "worker_wstall_counts": worker_wstall_counts,
+        "worker_recv_wstall_counts": worker_recv_wstall_counts,
+        "worker_send_wstall_counts": worker_send_wstall_counts,
         "decision_counts": decision_counts,
         "w_eff_values": sorted({int(v) if float(v).is_integer() else v for v in w_eff_values}, key=float),
         "w_eff_counter": Counter(int(v) if float(v).is_integer() else v for v in w_eff_values),
@@ -408,6 +414,15 @@ def load_mode_data(mode_dir: Path) -> dict:
     }
 
 
+def load_experiment_mode_data(experiment_root: Path) -> List[dict]:
+    mode_dirs = find_mode_dirs(experiment_root)
+    if not mode_dirs:
+        raise FileNotFoundError(f"no mode directories found in {experiment_root}")
+    mode_data = [load_mode_data(mode_dir) for mode_dir in mode_dirs]
+    mode_data.sort(key=lambda item: mode_sort_key(item["mode"]))
+    return mode_data
+
+
 def render_table(headers: List[str], rows: List[List[object]]) -> str:
     head = "".join(f"<th>{html.escape(str(h))}</th>" for h in headers)
     body = []
@@ -432,6 +447,62 @@ def render_field_help_card(title: str, field_help: Dict[str, str], wanted_fields
 def render_plot_help_card(title: str, rows: List[Tuple[str, str, str]]) -> str:
     formatted = [[name, source, meaning] for name, source, meaning in rows]
     return '<div class="card"><h2>' + html.escape(title) + '</h2>' + render_table(["plot", "source", "meaning"], formatted) + '</div>'
+
+
+def collect_worker_stats(nccl: dict) -> List[dict]:
+    workers = sorted(
+        set(nccl["worker_event_counts"].keys())
+        | set(nccl["worker_wstall_counts"].keys())
+        | set(nccl.get("worker_recv_wstall_counts", {}).keys())
+        | set(nccl.get("worker_send_wstall_counts", {}).keys()),
+        key=worker_sort_key,
+    )
+    rows: List[dict] = []
+    for worker in workers:
+        event_counter = nccl["worker_event_counts"].get(worker, Counter())
+        total_events = int(sum(event_counter.values()))
+        recv_wstall = int(nccl.get("worker_recv_wstall_counts", {}).get(worker, 0))
+        send_wstall = int(nccl.get("worker_send_wstall_counts", {}).get(worker, 0))
+        total_wstall = int(nccl["worker_wstall_counts"].get(worker, recv_wstall + send_wstall))
+        top_events = ", ".join(f"{name}:{count}" for name, count in event_counter.most_common(5)) or "-"
+        rows.append({
+            "worker": worker,
+            "total_events": total_events,
+            "recv_wstall": recv_wstall,
+            "send_wstall": send_wstall,
+            "total_wstall": total_wstall,
+            "top_events": top_events,
+        })
+    return rows
+
+
+def build_worker_stats_section(mode_data: List[dict]) -> str:
+    cards: List[str] = []
+    for item in mode_data:
+        rows = collect_worker_stats(item["nccl"])
+        if not rows:
+            continue
+        table_rows = [
+            [
+                row["worker"],
+                row["total_events"],
+                row["recv_wstall"],
+                row["send_wstall"],
+                row["total_wstall"],
+                row["top_events"],
+            ]
+            for row in rows
+        ]
+        cards.append(
+            '<div class="card"><h2>'
+            + html.escape(f'{item["mode"]} Worker Summary')
+            + '</h2>'
+            + render_table(["worker", "total_events", "recv_wstall", "send_wstall", "total_wstall", "top_events"], table_rows)
+            + '</div>'
+        )
+    if not cards:
+        return ""
+    return '<section class="section"><h2>Worker Statistics</h2><div class="grid-2">' + "".join(cards) + '</div></section>'
 
 
 def render_html(title: str, sections: List[str]) -> str:
@@ -747,7 +818,11 @@ def save_pressure_summary_plot(path: Path, mode_data: List[dict]) -> Optional[Pa
 
 def save_occupancy_summary_plot(path: Path, mode_data: List[dict]) -> Optional[Path]:
     modes = [item["mode"] for item in mode_data]
-    if not any(item["nccl"]["occ_pd_values"] or item["nccl"]["occ_tr_values"] for item in mode_data):
+    if not any(
+        float(item["nccl"].get("max_occ_pd", 0.0)) > 0.0
+        or float(item["nccl"].get("max_occ_tr", 0.0)) > 0.0
+        for item in mode_data
+    ):
         return None
     save_grouped_bar(
         path,
@@ -850,15 +925,15 @@ def build_visualization_plan_card_single(mode_data: List[dict]) -> str:
     return render_plot_help_card("Visualization Plan", rows)
 
 
-def build_single_experiment_report(experiment_root: Path, output_dir: Path, top_events: int) -> Path:
+def build_single_experiment_report(
+    experiment_root: Path,
+    output_dir: Path,
+    top_events: int,
+    mode_data: Optional[List[dict]] = None,
+) -> Path:
     log_progress(f"build single report start experiment={experiment_root.name}")
     env_setup = load_json(experiment_root / "env_setup.json") if (experiment_root / "env_setup.json").exists() else None
-    mode_dirs = find_mode_dirs(experiment_root)
-    if not mode_dirs:
-        raise FileNotFoundError(f"no mode directories found in {experiment_root}")
-
-    mode_data = [load_mode_data(mode_dir) for mode_dir in mode_dirs]
-    mode_data.sort(key=lambda item: mode_sort_key(item["mode"]))
+    mode_data = mode_data if mode_data is not None else load_experiment_mode_data(experiment_root)
     summary_rows = summarize_modes(mode_data)
 
     plots_dir = output_dir / "plots"
@@ -978,6 +1053,9 @@ def build_single_experiment_report(experiment_root: Path, output_dir: Path, top_
         + "</div></section>",
         '<section class="section"><h2>Mode Summary</h2>' + render_table(summary_headers, summary_table) + "</section>",
     ]
+    worker_stats_section = build_worker_stats_section(mode_data)
+    if worker_stats_section:
+        sections.append(worker_stats_section)
 
     figure_fragments = []
     for path, caption in [
@@ -1009,6 +1087,7 @@ def build_single_experiment_report(experiment_root: Path, output_dir: Path, top_
                 "experiment": experiment_root.name,
                 "env_setup": env_setup,
                 "modes": summary_rows,
+                "worker_stats_by_mode": {item["mode"]: collect_worker_stats(item["nccl"]) for item in mode_data},
             },
             indent=2,
             ensure_ascii=False,
@@ -1079,14 +1158,11 @@ def build_matrix_report(matrix_root: Path, output_dir: Path, top_events: int) ->
 
     for experiment_dir in experiment_dirs:
         log_progress(f"matrix experiment start name={experiment_dir.name}")
+        mode_data = load_experiment_mode_data(experiment_dir)
         per_output = output_dir / experiment_dir.name
         per_output.mkdir(parents=True, exist_ok=True)
-        per_html = build_single_experiment_report(experiment_dir, per_output, top_events)
+        per_html = build_single_experiment_report(experiment_dir, per_output, top_events, mode_data=mode_data)
         per_experiment_links[experiment_dir.name] = relpath(per_html, output_dir)
-
-        mode_dirs = find_mode_dirs(experiment_dir)
-        mode_data = [load_mode_data(mode_dir) for mode_dir in mode_dirs]
-        mode_data.sort(key=lambda item: mode_sort_key(item["mode"]))
         matrix_rows.extend(collect_matrix_rows(experiment_dir.name, summarize_modes(mode_data)))
         log_progress(f"matrix experiment complete name={experiment_dir.name}")
 
