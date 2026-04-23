@@ -24,6 +24,7 @@ NNODES=${NNODES:-8}
 NPROC_PER_NODE=${NPROC_PER_NODE:-1}
 WORKER_NAME=${WORKER_NAME:-$(hostname -s)}
 NODE_RANK=${NODE_RANK:-$(infer_node_rank "${WORKER_NAME}")}
+MASTER_SERVER=${MASTER_SERVER:-${WORKER_NAME}}
 TORCH_ENV=${TORCH_ENV:-/workspace/venvs/torch-cu121-custom/bin/activate}
 TARGET_SCRIPT=${TARGET_SCRIPT:-research/code/phase2/collective_b2.py}
 LOG_ROOT=${LOG_ROOT:-/mnt/nfs_share/cts_experiments/${RUN_ID}}
@@ -37,6 +38,13 @@ SLEEP_MS=${SLEEP_MS:-0}
 RACK_MAP_FILE=${NCCL_RACK_MAP_FILE:-${REPO_ROOT}/research/code/phase2/rack_map.txt}
 ALGO_SETTING=${NCCL_ALGO:-auto}
 PROTO_SETTING=${NCCL_PROTO:-auto}
+
+SWITCH_LOG_ENABLE=${SWITCH_LOG_ENABLE:-0}
+SWITCH_METADATA_FILE=${SWITCH_METADATA_FILE:-}
+DPU_NODE_HOST=${DPU_NODE_HOST:-172.16.0.100}
+DPU_NODE_USER=${DPU_NODE_USER:-ubuntu}
+SWITCH_LOGGER_ROOT=${SWITCH_LOGGER_ROOT:-/home/ubuntu/hyoeun/switch_setup_task/switch_congestion_logger}
+SWITCH_LOG_SHARED_ROOT=${SWITCH_LOG_SHARED_ROOT:-/mnt/nfs/cts_experiments/switch_log}
 
 mkdir -p "${LOG_ROOT}"
 
@@ -80,6 +88,57 @@ else
   exit 1
 fi
 
+is_master_server() {
+  [[ "${WORKER_NAME}" == "${MASTER_SERVER}" || "$(hostname -f 2>/dev/null || true)" == "${MASTER_SERVER}" || "$(hostname -s 2>/dev/null || true)" == "${MASTER_SERVER}" ]]
+}
+
+require_sshpass() {
+  if ! command -v sshpass >/dev/null 2>&1; then
+    echo "[phase2] sshpass is required for switch marker integration." >&2
+    exit 1
+  fi
+}
+
+remote_dpu_bash() {
+  local cmd=$1
+  require_sshpass
+  if [[ -z "${DPU_NODE_PWD:-}" ]]; then
+    echo "[phase2] DPU_NODE_PWD must be set when SWITCH_LOG_ENABLE=1 on MASTER_SERVER." >&2
+    exit 1
+  fi
+  sshpass -p "${DPU_NODE_PWD}" \
+    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    "${DPU_NODE_USER}@${DPU_NODE_HOST}" \
+    "bash -lc $(printf '%q' "${cmd}")"
+}
+
+SWITCH_LOG_RUN_ID=
+SWITCH_LOG_DIR=
+SWITCH_LOG_LOCAL_DIR=
+SWITCH_LOG_MARKERS_JSONL=
+if [[ -n "${SWITCH_METADATA_FILE}" && -f "${SWITCH_METADATA_FILE}" ]]; then
+  # shellcheck disable=SC1090
+  source "${SWITCH_METADATA_FILE}"
+fi
+if [[ -z "${SWITCH_LOG_LOCAL_DIR:-}" && -n "${SWITCH_LOG_RUN_ID:-}" ]]; then
+  SWITCH_LOG_LOCAL_DIR="${SWITCH_LOG_SHARED_ROOT}/${SWITCH_LOG_RUN_ID}"
+fi
+
+emit_switch_marker() {
+  local marker=$1
+  local message=${2:-}
+  local source_tag=${3:-phase2_collective}
+  [[ "${SWITCH_LOG_ENABLE}" == "1" ]] || return 0
+  is_master_server || return 0
+  [[ -n "${SWITCH_LOG_RUN_ID:-}" ]] || return 0
+  local cmd
+  cmd="cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && ./log_run_marker.sh --run-id $(printf '%q' "${SWITCH_LOG_RUN_ID}") --marker $(printf '%q' "${marker}") --source $(printf '%q' "${source_tag}")"
+  if [[ -n "${message}" ]]; then
+    cmd+=" --message $(printf '%q' "${message}")"
+  fi
+  remote_dpu_bash "${cmd}" >/dev/null
+}
+
 case "${COLLECTIVE}" in
   allreduce|allgather|reducescatter|alltoall) ;;
   *)
@@ -90,8 +149,22 @@ esac
 
 IFS=',' read -r -a MODE_VALUES <<< "${RUN_MODES}"
 
+SWITCH_ENV_JSON=""
+if [[ "${SWITCH_LOG_ENABLE}" == "1" && -n "${SWITCH_LOG_RUN_ID:-}" ]]; then
+  SWITCH_ENV_JSON=$(cat <<EOF2
+,
+  "switch_log_enable": 1,
+  "switch_log_run_id": "${SWITCH_LOG_RUN_ID}",
+  "switch_log_dir": "${SWITCH_LOG_DIR:-}",
+  "switch_log_local_dir": "${SWITCH_LOG_LOCAL_DIR:-}",
+  "switch_log_markers_jsonl": "${SWITCH_LOG_MARKERS_JSONL:-}",
+  "dpu_node_host": "${DPU_NODE_HOST}"
+EOF2
+)
+fi
+
 if [[ "${NODE_RANK}" == "0" ]]; then
-  cat > "${LOG_ROOT}/env_setup.json" <<EOF
+  cat > "${LOG_ROOT}/env_setup.json" <<EOF2
 {
   "phase": "B2",
   "run_id": "${RUN_ID}",
@@ -108,23 +181,28 @@ if [[ "${NODE_RANK}" == "0" ]]; then
   "nccl_algo": "${ALGO_SETTING}",
   "nccl_proto": "${PROTO_SETTING}",
   "rack_map_file": "${RACK_MAP_FILE}",
+  "master_server": "${MASTER_SERVER}",
   "policy_name": "rack_aware_semantic_static_b2",
   "policy_formula": "W_eff = clamp(W_min, W_base, W_base - (interRack + alltoall + tree))",
   "w_min_rule": "2 if collAPI == AllToAll else 4",
   "w_max_rule": "stock baseline",
-  "b2_penalty_rule": "topology +1, collAPI +1, tree +1"
+  "b2_penalty_rule": "topology +1, collAPI +1, tree +1"${SWITCH_ENV_JSON}
 }
-EOF
+EOF2
 fi
 
 echo "[phase2] RUN_ID=${RUN_ID}"
 echo "[phase2] WORKER_NAME=${WORKER_NAME} NODE_RANK=${NODE_RANK}/${NNODES}"
 echo "[phase2] MASTER_ADDR=${MASTER_ADDR} MASTER_PORT_BASE=${MASTER_PORT_BASE}"
+echo "[phase2] MASTER_SERVER=${MASTER_SERVER}"
 echo "[phase2] LOG_ROOT=${LOG_ROOT}"
 echo "[phase2] TARGET_SCRIPT=${TARGET_SCRIPT}"
 echo "[phase2] COLLECTIVE=${COLLECTIVE} RUN_MODES=${RUN_MODES}"
 echo "[phase2] PAYLOAD_MB=${PAYLOAD_MB} DTYPE=${DTYPE} NCCL_ALGO=${ALGO_SETTING} NCCL_PROTO=${PROTO_SETTING}"
 echo "[phase2] RACK_MAP_FILE=${RACK_MAP_FILE}"
+if [[ "${SWITCH_LOG_ENABLE}" == "1" && -n "${SWITCH_LOG_RUN_ID:-}" ]]; then
+  echo "[phase2] SWITCH_LOG_RUN_ID=${SWITCH_LOG_RUN_ID} SWITCH_LOG_DIR=${SWITCH_LOG_DIR:-} SWITCH_LOG_LOCAL_DIR=${SWITCH_LOG_LOCAL_DIR:-}"
+fi
 
 for idx in "${!MODE_VALUES[@]}"; do
   MODE="${MODE_VALUES[$idx]}"
@@ -154,6 +232,7 @@ for idx in "${!MODE_VALUES[@]}"; do
 
   echo "[phase2] starting MODE=${MODE} MASTER_PORT=${MASTER_PORT}"
   echo "[phase2] NCCL_DEBUG_FILE=${NCCL_DEBUG_FILE}"
+  emit_switch_marker "mode_start" "run_id=${RUN_ID} mode=${MODE_UPPER} collective=${COLLECTIVE} payload_mb=${PAYLOAD_MB}" "phase2_collective"
 
   "${LAUNCHER[@]}" \
     --nnodes="${NNODES}" \
@@ -172,5 +251,6 @@ for idx in "${!MODE_VALUES[@]}"; do
     --tag "${MODE_UPPER}" \
     "$@"
 
+  emit_switch_marker "mode_end" "run_id=${RUN_ID} mode=${MODE_UPPER} collective=${COLLECTIVE} payload_mb=${PAYLOAD_MB}" "phase2_collective"
   sleep 2
 done

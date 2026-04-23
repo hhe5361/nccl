@@ -10,7 +10,7 @@ import tempfile
 import zipfile
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
     import matplotlib
@@ -29,6 +29,7 @@ EXPERIMENT_RE = re.compile(r"^\d+_.+")
 
 MODE_ORDER = {"STOCK": 0, "B2": 1, "B3": 2}
 REPORT_LOG_PATH: Optional[Path] = None
+SWITCH_SHARED_ROOT_DEFAULT = Path("/mnt/nfs/cts_experiments/switch_log")
 
 RUN_SUMMARY_FIELD_HELP = {
     "mode": "실험 모드. STOCK, B2, B3 등.",
@@ -379,6 +380,316 @@ def compute_summary_from_steps(step_rows: List[dict]) -> dict:
         "collective_gbps_avg": mean(float(row["collective_gbps_est"]) for row in rows),
         "collective_gbps_p95": percentile([float(row["collective_gbps_est"]) for row in rows], 0.95),
     }
+
+
+def extract_ts_ns(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        abs_value = abs(value)
+        if abs_value >= 10**17:
+            return value
+        if abs_value >= 10**14:
+            return value * 1000
+        if abs_value >= 10**11:
+            return value * 1_000_000
+        if abs_value >= 10**9:
+            return value * 1_000_000_000
+        return None
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        abs_value = abs(value)
+        if abs_value >= 10**17:
+            return int(value)
+        if abs_value >= 10**9:
+            return int(value * 1_000_000_000)
+        return None
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        if raw.isdigit():
+            return extract_ts_ns(int(raw))
+        try:
+            return extract_ts_ns(float(raw))
+        except ValueError:
+            pass
+        normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
+        try:
+            return int(dt.datetime.fromisoformat(normalized).timestamp() * 1_000_000_000)
+        except ValueError:
+            return None
+    return None
+
+
+def extract_record_ts_ns(record: dict) -> Optional[int]:
+    for key in (
+        "ts_unix_ns",
+        "timestamp_ns",
+        "unix_ns",
+        "ts_ns",
+        "time_ns",
+        "timestamp",
+        "ts",
+        "time",
+        "collected_at",
+        "sample_time",
+    ):
+        if key in record:
+            ts_ns = extract_ts_ns(record.get(key))
+            if ts_ns is not None:
+                return ts_ns
+    for value in record.values():
+        if isinstance(value, dict):
+            ts_ns = extract_record_ts_ns(value)
+            if ts_ns is not None:
+                return ts_ns
+    return None
+
+
+def flatten_numeric_named_values(node: Any, prefix: str = "") -> List[Tuple[str, float]]:
+    values: List[Tuple[str, float]] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            name = f"{prefix}/{key}" if prefix else str(key)
+            values.extend(flatten_numeric_named_values(value, name))
+    elif isinstance(node, list):
+        for idx, value in enumerate(node):
+            name = f"{prefix}/{idx}" if prefix else str(idx)
+            values.extend(flatten_numeric_named_values(value, name))
+    elif isinstance(node, (int, float)) and not isinstance(node, bool):
+        values.append((prefix, float(node)))
+    return values
+
+
+def is_counter_like_key(name: str) -> bool:
+    lower = name.lower()
+    tail = lower.split("/")[-1]
+    if any(token in lower for token in ("timestamp", "time_ns", "unix_ns", "collected_at", "sample_time", "elapsed")):
+        return False
+    if tail in {"ts", "time", "date", "priority", "port", "queue", "index", "pid", "interval", "interval_sec", "sample"}:
+        return False
+    return True
+
+
+def aggregate_switch_counter(record: dict) -> float:
+    total = 0.0
+    for name, value in flatten_numeric_named_values(record):
+        if is_counter_like_key(name):
+            total += max(0.0, float(value))
+    return total
+
+
+def load_switch_counter_samples(path: Path) -> List[Tuple[int, float]]:
+    samples: List[Tuple[int, float]] = []
+    for row in load_jsonl(path):
+        ts_ns = extract_record_ts_ns(row)
+        if ts_ns is None:
+            continue
+        samples.append((ts_ns, aggregate_switch_counter(row)))
+    samples.sort(key=lambda item: item[0])
+    return samples
+
+
+def compute_switch_delta_series(samples: List[Tuple[int, float]]) -> List[Tuple[int, float]]:
+    deltas: List[Tuple[int, float]] = []
+    for (prev_ts, prev_total), (cur_ts, cur_total) in zip(samples, samples[1:]):
+        dt_sec = (cur_ts - prev_ts) / 1_000_000_000.0
+        if dt_sec <= 0.0:
+            continue
+        delta = max(0.0, cur_total - prev_total)
+        deltas.append((cur_ts, delta / dt_sec))
+    return deltas
+
+
+def resolve_switch_log_dir(experiment_root: Path, env_setup: Optional[dict]) -> Optional[Path]:
+    if not env_setup or int(env_setup.get("switch_log_enable", 0) or 0) != 1:
+        return None
+    candidates: List[Path] = []
+    local_dir = env_setup.get("switch_log_local_dir")
+    if local_dir:
+        candidates.append(Path(str(local_dir)))
+    run_id = env_setup.get("switch_log_run_id")
+    if run_id:
+        candidates.append(SWITCH_SHARED_ROOT_DEFAULT / str(run_id))
+    remote_dir = env_setup.get("switch_log_dir")
+    if remote_dir:
+        candidates.append(Path(str(remote_dir)))
+    seen = set()
+    unique: List[Path] = []
+    for candidate in candidates:
+        key = candidate.as_posix()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    for candidate in unique:
+        if candidate.exists():
+            return candidate
+    return unique[0] if unique else None
+
+
+def step_time_bounds(step_rows: List[dict]) -> Optional[Tuple[int, int]]:
+    starts = [extract_ts_ns(row.get("ts_start_unix_ns")) for row in step_rows]
+    starts = [value for value in starts if value is not None]
+    ends = [extract_ts_ns(row.get("ts_end_unix_ns")) for row in step_rows]
+    ends = [value for value in ends if value is not None]
+    mids = [extract_ts_ns(row.get("ts_mid_unix_ns")) for row in step_rows]
+    mids = [value for value in mids if value is not None]
+    if starts and ends:
+        return min(starts), max(ends)
+    if mids:
+        return min(mids), max(mids)
+    return None
+
+
+def step_midpoint_series(step_rows: List[dict]) -> List[Tuple[int, float]]:
+    points: List[Tuple[int, float]] = []
+    for row in effective_rows(step_rows):
+        ts_ns = extract_ts_ns(row.get("ts_mid_unix_ns"))
+        if ts_ns is None:
+            ts_ns = extract_ts_ns(row.get("ts_end_unix_ns"))
+        if ts_ns is None:
+            ts_ns = extract_ts_ns(row.get("ts_start_unix_ns"))
+        if ts_ns is None:
+            continue
+        points.append((ts_ns, float(row["step_ms_max"])))
+    points.sort(key=lambda item: item[0])
+    return points
+
+
+def find_mode_marker_bounds(markers: List[dict], run_id: str, mode: str) -> Optional[Tuple[int, int]]:
+    starts: List[int] = []
+    ends: List[int] = []
+    mode_token = f"mode={mode.upper()}"
+    run_token = f"run_id={run_id}" if run_id else ""
+    for record in markers:
+        marker_name = str(record.get("marker") or record.get("event") or "")
+        message = str(record.get("message") or "")
+        if mode_token not in message:
+            continue
+        if run_token and run_token not in message:
+            continue
+        ts_ns = extract_record_ts_ns(record)
+        if ts_ns is None:
+            continue
+        if marker_name == "mode_start":
+            starts.append(ts_ns)
+        elif marker_name == "mode_end":
+            ends.append(ts_ns)
+    if starts and ends:
+        return min(starts), max(ends)
+    return None
+
+
+def build_mode_time_windows(mode_data: List[dict], env_setup: Optional[dict], markers: List[dict]) -> Dict[str, Tuple[int, int]]:
+    run_id = str(env_setup.get("run_id", "")) if env_setup else ""
+    windows: Dict[str, Tuple[int, int]] = {}
+    for item in mode_data:
+        bounds = step_time_bounds(item["step_rows"])
+        if bounds is None:
+            bounds = find_mode_marker_bounds(markers, run_id, item["mode"])
+        if bounds is not None:
+            windows[item["mode"]] = bounds
+    return windows
+
+
+def load_switch_bundle(experiment_root: Path, env_setup: Optional[dict]) -> Optional[dict]:
+    log_dir = resolve_switch_log_dir(experiment_root, env_setup)
+    if log_dir is None or not log_dir.exists():
+        return None
+    series = {}
+    file_map = {
+        "spine": log_dir / "spine_roce_counters.jsonl",
+        "rackA": log_dir / "rackA_pfc_statistics.jsonl",
+        "rackB": log_dir / "rackB_pfc_statistics.jsonl",
+    }
+    for label, path in file_map.items():
+        if not path.exists():
+            continue
+        rate_series = compute_switch_delta_series(load_switch_counter_samples(path))
+        if rate_series:
+            series[label] = rate_series
+    markers_path = log_dir / "markers.jsonl"
+    markers = load_jsonl(markers_path) if markers_path.exists() else []
+    if not series and not markers:
+        return None
+    return {
+        "log_dir": log_dir,
+        "series": series,
+        "markers": markers,
+    }
+
+
+def save_switch_overlay_plot(
+    path: Path,
+    experiment_root: Path,
+    env_setup: Optional[dict],
+    mode_data: List[dict],
+) -> Optional[Path]:
+    switch_bundle = load_switch_bundle(experiment_root, env_setup)
+    if not switch_bundle or not switch_bundle.get("series"):
+        return None
+
+    mode_windows = build_mode_time_windows(mode_data, env_setup, switch_bundle.get("markers", []))
+    if not mode_windows:
+        return None
+
+    global_start = min(start for start, _ in mode_windows.values())
+    global_end = max(end for _, end in mode_windows.values())
+    if global_end <= global_start:
+        return None
+
+    switch_series = {}
+    for label, rows in switch_bundle["series"].items():
+        filtered = [((ts_ns - global_start) / 1_000_000_000.0, rate) for ts_ns, rate in rows if global_start <= ts_ns <= global_end]
+        if filtered:
+            switch_series[label] = filtered
+    if not switch_series:
+        return None
+
+    step_series = []
+    for item in mode_data:
+        points = [((ts_ns - global_start) / 1_000_000_000.0, value) for ts_ns, value in step_midpoint_series(item["step_rows"]) if global_start <= ts_ns <= global_end]
+        if points:
+            step_series.append((item["mode"], points))
+
+    colors = {"spine": "#d04e00", "rackA": "#1f77b4", "rackB": "#2ca02c"}
+    fig, axes = plt.subplots(2, 1, figsize=(12, 7.5), sharex=True, gridspec_kw={"height_ratios": [1.0, 1.0]})
+    ax_top, ax_bottom = axes
+
+    for label, points in switch_series.items():
+        ax_top.plot([x for x, _ in points], [y for _, y in points], linewidth=1.8, label=label, color=colors.get(label))
+
+    for _, (start_ns, end_ns) in mode_windows.items():
+        rel_start = (start_ns - global_start) / 1_000_000_000.0
+        rel_end = (end_ns - global_start) / 1_000_000_000.0
+        ax_top.axvspan(rel_start, rel_end, color="#8aa1c1", alpha=0.06)
+        ax_bottom.axvspan(rel_start, rel_end, color="#8aa1c1", alpha=0.06)
+        ax_top.axvline(rel_start, color="#6c7f99", linestyle="--", alpha=0.35, linewidth=0.9)
+        ax_bottom.axvline(rel_start, color="#6c7f99", linestyle="--", alpha=0.35, linewidth=0.9)
+
+    for mode, points in step_series:
+        ax_bottom.plot([x for x, _ in points], [y for _, y in points], marker="o", linewidth=1.5, markersize=2.8, label=mode)
+
+    ax_top.set_title(f"{experiment_root.name} Switch Pressure Overlay")
+    ax_top.set_ylabel("switch delta / sec")
+    ax_top.grid(True, alpha=0.25)
+    if switch_series:
+        ax_top.legend()
+
+    ax_bottom.set_xlabel("elapsed sec")
+    ax_bottom.set_ylabel("step_ms_max")
+    ax_bottom.grid(True, alpha=0.25)
+    if step_series:
+        ax_bottom.legend()
+
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    return path
 
 
 def load_mode_data(mode_dir: Path) -> dict:
@@ -902,12 +1213,17 @@ def build_collection_plan_card_single(experiment_root: Path, env_setup: Optional
         ["MODE/*_step_metrics.jsonl", "step별 시계열. warmup 여부와 step_ms_max/mean, collective_gbps_est를 포함."],
         [f"MODE/workerXX/nccl.*.log ({total_logs} files)", "PHASE0/1/2 이벤트 로그. WSTALL, WINDOW_CFG, pressure/decision trace를 포함할 수 있음."],
     ]
+    if env_setup and int(env_setup.get("switch_log_enable", 0) or 0) == 1:
+        switch_dir = env_setup.get("switch_log_local_dir") or (str(SWITCH_SHARED_ROOT_DEFAULT / str(env_setup.get("switch_log_run_id", ""))) if env_setup.get("switch_log_run_id") else "")
+        if switch_dir:
+            rows.append(["switch_log_local_dir", switch_dir])
+        rows.append(["switch_log/*.jsonl", "switch pressure 로그. spine ROCE, rackA/rackB PFC, markers.jsonl 을 포함."])
     if env_setup and "run_modes" in env_setup:
         rows.append(["run_modes", str(env_setup["run_modes"])])
     return '<div class="card"><h2>Collected Logs</h2>' + render_table(["source", "meaning"], rows) + '</div>'
 
 
-def build_visualization_plan_card_single(mode_data: List[dict]) -> str:
+def build_visualization_plan_card_single(mode_data: List[dict], env_setup: Optional[dict] = None) -> str:
     rows = [
         ("step_timeline.png", "*_step_metrics.jsonl", "mode별 step_ms_max / step_ms_mean 시계열 비교"),
         ("throughput_timeline.png", "*_step_metrics.jsonl", "mode별 collective_gbps_est 시계열 비교"),
@@ -918,6 +1234,8 @@ def build_visualization_plan_card_single(mode_data: List[dict]) -> str:
         ("selected_window_distribution.png", "WINDOW_CFG / DECISION log", "선택된 W_eff 분포 확인"),
         ("occupancy_summary.png", "nccl.*.log", "p99_occ_pd / p99_occ_tr 비교"),
     ]
+    if env_setup and int(env_setup.get("switch_log_enable", 0) or 0) == 1:
+        rows.append(("switch_overlay.png", "switch_log/*.jsonl + *_step_metrics.jsonl", "switch PFC/ROCE delta/sec 와 step latency overlay"))
     if any(item["nccl"]["decision_counts"] for item in mode_data):
         rows.append(("decision_counts.png", "DECISION log", "shrink / hold / recover reason count"))
     if any(item["nccl"]["pressure_scores"] for item in mode_data):
@@ -952,22 +1270,10 @@ def build_single_experiment_report(
         bw_series.append((item["mode"], steps, [float(row["collective_gbps_est"]) for row in rows]))
 
     p_step = plots_dir / "step_timeline.png"
-    save_line_plot(
-        p_step,
-        f"{experiment_root.name} Step Timeline",
-        "step",
-        "latency (ms)",
-        step_series_max + step_series_mean,
-    )
+    save_line_plot(p_step, f"{experiment_root.name} Step Timeline", "step", "latency (ms)", step_series_max + step_series_mean)
 
     p_bw = plots_dir / "throughput_timeline.png"
-    save_line_plot(
-        p_bw,
-        f"{experiment_root.name} Collective Throughput Estimate",
-        "step",
-        "Gbps",
-        bw_series,
-    )
+    save_line_plot(p_bw, f"{experiment_root.name} Collective Throughput Estimate", "step", "Gbps", bw_series)
 
     categories = [row["mode"] for row in summary_rows]
     p_step_summary = plots_dir / "summary_latency.png"
@@ -975,10 +1281,7 @@ def build_single_experiment_report(
         p_step_summary,
         "Latency Summary by Mode",
         categories,
-        [
-            ("avg", [float(row["step_ms_avg"]) for row in summary_rows]),
-            ("p95", [float(row["step_ms_p95"]) for row in summary_rows]),
-        ],
+        [("avg", [float(row["step_ms_avg"]) for row in summary_rows]), ("p95", [float(row["step_ms_p95"]) for row in summary_rows])],
         "ms",
     )
 
@@ -987,10 +1290,7 @@ def build_single_experiment_report(
         p_bw_summary,
         "Throughput Summary by Mode",
         categories,
-        [
-            ("avg", [float(row["collective_gbps_avg"]) for row in summary_rows]),
-            ("p95", [float(row["collective_gbps_p95"]) for row in summary_rows]),
-        ],
+        [("avg", [float(row["collective_gbps_avg"]) for row in summary_rows]), ("p95", [float(row["collective_gbps_p95"]) for row in summary_rows])],
         "Gbps",
     )
 
@@ -1000,6 +1300,7 @@ def build_single_experiment_report(
     p_occ = save_occupancy_summary_plot(plots_dir / "occupancy_summary.png", mode_data)
     p_decision = save_decision_counts_plot(plots_dir / "decision_counts.png", mode_data)
     p_pressure = save_pressure_summary_plot(plots_dir / "pressure_summary.png", mode_data)
+    p_switch = save_switch_overlay_plot(plots_dir / "switch_overlay.png", experiment_root, env_setup, mode_data)
 
     summary_headers = [
         "mode", "collective", "payload_mb", "step_ms_avg", "step_ms_p95",
@@ -1008,48 +1309,25 @@ def build_single_experiment_report(
     ]
     summary_table = [
         [
-            row["mode"],
-            row["collective"],
-            f'{row["payload_mb"]:.3f}',
-            f'{row["step_ms_avg"]:.3f}',
-            f'{row["step_ms_p95"]:.3f}',
-            f'{row["collective_gbps_avg"]:.3f}',
-            f'{row["collective_gbps_p95"]:.3f}',
-            row["total_wstall_count"],
-            f'{row["p99_occ_tr"]:.3f}',
-            row["w_eff_values"] or "-",
-            f'{row["delta_step_vs_stock_pct"]:.2f}',
-            f'{row["delta_bw_vs_stock_pct"]:.2f}',
+            row["mode"], row["collective"], f'{row["payload_mb"]:.3f}', f'{row["step_ms_avg"]:.3f}', f'{row["step_ms_p95"]:.3f}',
+            f'{row["collective_gbps_avg"]:.3f}', f'{row["collective_gbps_p95"]:.3f}', row["total_wstall_count"], f'{row["p99_occ_tr"]:.3f}',
+            row["w_eff_values"] or "-", f'{row["delta_step_vs_stock_pct"]:.2f}', f'{row["delta_bw_vs_stock_pct"]:.2f}',
         ]
         for row in summary_rows
     ]
 
-    info_rows = [
-        ["experiment_root", experiment_root.as_posix()],
-        ["modes", ", ".join(item["mode"] for item in mode_data)],
-    ]
+    info_rows = [["experiment_root", experiment_root.as_posix()], ["modes", ", ".join(item["mode"] for item in mode_data)]]
     if env_setup:
-        for key in ["collective", "run_modes", "payload_mb", "dtype", "master_addr", "master_port_base", "policy_name"]:
+        for key in ["collective", "run_modes", "payload_mb", "dtype", "master_addr", "master_port_base", "policy_name", "master_server", "switch_log_run_id", "switch_log_local_dir"]:
             if key in env_setup:
                 info_rows.append([key, env_setup[key]])
 
     sections = [
         '<section class="section"><h2>Experiment Metadata</h2>' + render_table(["field", "value"], info_rows) + "</section>",
+        '<section class="section"><div class="grid-2">' + build_collection_plan_card_single(experiment_root, env_setup, mode_data) + build_visualization_plan_card_single(mode_data, env_setup) + "</div></section>",
         '<section class="section"><div class="grid-2">'
-        + build_collection_plan_card_single(experiment_root, env_setup, mode_data)
-        + build_visualization_plan_card_single(mode_data)
-        + "</div></section>",
-        '<section class="section"><div class="grid-2">'
-        + render_field_help_card(
-            "Run Summary Field Meanings",
-            RUN_SUMMARY_FIELD_HELP,
-            ["mode", "phase2_mode", "collective", "world_size", "payload_mb", "step_ms_avg", "step_ms_p95", "collective_gbps_avg", "collective_gbps_p95", "delta_step_vs_stock_pct", "delta_bw_vs_stock_pct"],
-        )
-        + render_field_help_card(
-            "NCCL Summary Field Meanings",
-            NCCL_SUMMARY_FIELD_HELP,
-            ["total_events", "total_wstall_count", "recv_wstall_count", "send_wstall_count", "p99_occ_pd", "p99_occ_tr", "w_eff_values", "decision_counts", "pressure_score_p95"],
-        )
+        + render_field_help_card("Run Summary Field Meanings", RUN_SUMMARY_FIELD_HELP, ["mode", "phase2_mode", "collective", "world_size", "payload_mb", "step_ms_avg", "step_ms_p95", "collective_gbps_avg", "collective_gbps_p95", "delta_step_vs_stock_pct", "delta_bw_vs_stock_pct"])
+        + render_field_help_card("NCCL Summary Field Meanings", NCCL_SUMMARY_FIELD_HELP, ["total_events", "total_wstall_count", "recv_wstall_count", "send_wstall_count", "p99_occ_pd", "p99_occ_tr", "w_eff_values", "decision_counts", "pressure_score_p95"])
         + "</div></section>",
         '<section class="section"><h2>Mode Summary</h2>' + render_table(summary_headers, summary_table) + "</section>",
     ]
@@ -1058,7 +1336,7 @@ def build_single_experiment_report(
         sections.append(worker_stats_section)
 
     figure_fragments = []
-    for path, caption in [
+    for plot_path, caption in [
         (p_step, "mode별 step latency timeline"),
         (p_bw, "mode별 collective throughput estimate"),
         (p_step_summary, "mode별 latency summary"),
@@ -1069,12 +1347,11 @@ def build_single_experiment_report(
         (p_occ, "occupancy summary"),
         (p_decision, "decision reason count"),
         (p_pressure, "pressure score summary"),
+        (p_switch, "switch PFC / ROCE pressure overlay"),
     ]:
-        if path is None or not path.exists():
+        if plot_path is None or not plot_path.exists():
             continue
-        figure_fragments.append(
-            f'<figure><img src="{html.escape(relpath(path, output_dir))}" alt="{html.escape(caption)}"><figcaption>{html.escape(caption)}</figcaption></figure>'
-        )
+        figure_fragments.append(f'<figure><img src="{html.escape(relpath(plot_path, output_dir))}" alt="{html.escape(caption)}"><figcaption>{html.escape(caption)}</figcaption></figure>')
     sections.append('<section class="section"><h2>Plots</h2>' + "".join(figure_fragments) + "</section>")
 
     html_path = output_dir / "phase2_report.html"
@@ -1088,6 +1365,7 @@ def build_single_experiment_report(
                 "env_setup": env_setup,
                 "modes": summary_rows,
                 "worker_stats_by_mode": {item["mode"]: collect_worker_stats(item["nccl"]) for item in mode_data},
+                "switch_overlay_plot": relpath(p_switch, output_dir) if p_switch is not None and p_switch.exists() else None,
             },
             indent=2,
             ensure_ascii=False,

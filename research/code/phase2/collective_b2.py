@@ -133,6 +133,7 @@ def main() -> None:
             input_tensor.fill_(base_value)
 
             torch.cuda.synchronize(device)
+            ts_start_unix_ns = time.time_ns()
             t0 = time.perf_counter()
 
             if args.collective == "allreduce":
@@ -146,6 +147,7 @@ def main() -> None:
 
             torch.cuda.synchronize(device)
             t1 = time.perf_counter()
+            ts_end_unix_ns = time.time_ns()
 
             local_ms = (t1 - t0) * 1000.0
             local_times = torch.tensor([local_ms], device=device, dtype=torch.float64)
@@ -185,6 +187,9 @@ def main() -> None:
                 "world_size": world_size,
                 "payload_mb": payload_mb,
                 "traffic_mb_est_rank": traffic_mb_est_rank,
+                "ts_start_unix_ns": int(ts_start_unix_ns),
+                "ts_end_unix_ns": int(ts_end_unix_ns),
+                "ts_mid_unix_ns": int((ts_start_unix_ns + ts_end_unix_ns) // 2),
                 "step_ms_max": float(max_times[0].item()),
                 "step_ms_mean": float(mean_times[0].item()),
                 "collective_gbps_est": collective_gbps_est,
