@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import csv
+import datetime as dt
 import html
 import json
 import math
@@ -27,6 +28,7 @@ WORKER_RE = re.compile(r"worker(\d+)$")
 EXPERIMENT_RE = re.compile(r"^\d+_.+")
 
 MODE_ORDER = {"STOCK": 0, "B2": 1, "B3": 2}
+REPORT_LOG_PATH: Optional[Path] = None
 
 RUN_SUMMARY_FIELD_HELP = {
     "mode": "실험 모드. STOCK, B2, B3 등.",
@@ -74,6 +76,24 @@ def parse_args() -> argparse.Namespace:
         help="Number of top NCCL events to visualize",
     )
     return parser.parse_args()
+
+
+def human_size(num_bytes: int) -> str:
+    value = float(num_bytes)
+    for unit in ["B", "KiB", "MiB", "GiB", "TiB"]:
+        if value < 1024.0 or unit == "TiB":
+            return f"{value:.1f}{unit}"
+        value /= 1024.0
+    return f"{num_bytes}B"
+
+
+def log_progress(message: str) -> None:
+    timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[phase2-log-reporter] {timestamp} {message}"
+    print(line, flush=True)
+    if REPORT_LOG_PATH is not None:
+        with REPORT_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
 
 
 def mean(values: Iterable[float]) -> float:
@@ -176,46 +196,60 @@ def is_matrix_root(path: Path) -> bool:
     return path.joinpath("matrix_manifest.json").exists() or bool(find_experiment_dirs(path))
 
 
-def collect_nccl_logs(mode_dir: Path) -> List[dict]:
-    events: List[dict] = []
-    for log_path in sorted(mode_dir.glob("*/nccl.*.log")):
-        worker = log_path.parent.name
-        for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
-            match = PHASE_RE.search(line)
-            if not match:
-                continue
-            phase = match.group(1)
-            payload = match.group(2)
-            fields = {key: parse_value(value) for key, value in KV_RE.findall(payload)}
-            event_name = fields.get("event")
-            if not event_name:
-                continue
-            fields["_phase"] = phase
-            fields["_worker"] = worker
-            events.append(fields)
-    return events
+def percentile_from_counter(counter: Counter, q: float) -> float:
+    if not counter:
+        return 0.0
+    total = sum(counter.values())
+    if total <= 0:
+        return 0.0
+    threshold = max(1, math.ceil(total * q))
+    seen = 0
+    for value in sorted(counter.keys(), key=float):
+        seen += counter[value]
+        if seen >= threshold:
+            return float(value)
+    return float(max(counter.keys(), key=float))
 
 
-def summarize_nccl_events(events: List[dict]) -> dict:
+def summarize_nccl_logs(mode_dir: Path) -> dict:
+    log_paths = sorted(mode_dir.glob("*/nccl.*.log"))
+    log_progress(
+        f"scan mode logs start mode_dir={mode_dir.as_posix()} files={len(log_paths)}"
+    )
     specific_alias_keys = set()
-    for entry in events:
-        event_name = str(entry.get("event", ""))
-        family = None
-        if event_name.endswith("WINDOW_CFG"):
-            family = "WINDOW_CFG"
-        elif event_name.endswith("RECV_WSTALL"):
-            family = "RECV_WSTALL"
-        if family and ("_B2_" in event_name or "_B3_" in event_name):
-            specific_alias_keys.add(
-                (
-                    entry.get("_worker"),
-                    entry.get("tNs"),
-                    entry.get("peer"),
-                    entry.get("channel"),
-                    entry.get("slot"),
-                    family,
-                )
-            )
+    for log_path in log_paths:
+        worker = log_path.parent.name
+        log_progress(
+            f"scan aliases file={log_path.name} worker={worker} size={human_size(log_path.stat().st_size)}"
+        )
+        with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for raw_line in handle:
+                line = raw_line.rstrip("\n")
+                match = PHASE_RE.search(line)
+                if not match:
+                    continue
+                phase = match.group(1)
+                payload = match.group(2)
+                fields = {key: parse_value(value) for key, value in KV_RE.findall(payload)}
+                event_name = fields.get("event")
+                if not event_name:
+                    continue
+                family = None
+                if str(event_name).endswith("WINDOW_CFG"):
+                    family = "WINDOW_CFG"
+                elif str(event_name).endswith("RECV_WSTALL"):
+                    family = "RECV_WSTALL"
+                if family and ("_B2_" in str(event_name) or "_B3_" in str(event_name)):
+                    specific_alias_keys.add(
+                        (
+                            worker,
+                            fields.get("tNs"),
+                            fields.get("peer"),
+                            fields.get("channel"),
+                            fields.get("slot"),
+                            family,
+                        )
+                    )
 
     event_counts: Counter = Counter()
     worker_event_counts: Dict[str, Counter] = defaultdict(Counter)
@@ -223,75 +257,86 @@ def summarize_nccl_events(events: List[dict]) -> dict:
     decision_counts: Counter = Counter()
     w_eff_values: List[float] = []
     pressure_scores: List[float] = []
-    occ_pd_values: List[float] = []
-    occ_tr_values: List[float] = []
+    occ_pd_counter: Counter = Counter()
+    occ_tr_counter: Counter = Counter()
 
     recv_wstall_count = 0
     send_wstall_count = 0
 
-    for entry in events:
-        event_name = str(entry.get("event", ""))
-        worker = str(entry.get("_worker", "unknown"))
-        if not event_name:
-            continue
+    for log_path in log_paths:
+        worker = log_path.parent.name
+        log_progress(
+            f"scan events file={log_path.name} worker={worker} size={human_size(log_path.stat().st_size)}"
+        )
+        with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for raw_line in handle:
+                line = raw_line.rstrip("\n")
+                match = PHASE_RE.search(line)
+                if not match:
+                    continue
+                payload = match.group(2)
+                entry = {key: parse_value(value) for key, value in KV_RE.findall(payload)}
+                event_name = str(entry.get("event", ""))
+                if not event_name:
+                    continue
 
-        family = None
-        if event_name == "PROXY_WINDOW_CFG":
-            family = "WINDOW_CFG"
-        elif event_name == "PROXY_RECV_WSTALL":
-            family = "RECV_WSTALL"
-        if family:
-            key = (
-                entry.get("_worker"),
-                entry.get("tNs"),
-                entry.get("peer"),
-                entry.get("channel"),
-                entry.get("slot"),
-                family,
-            )
-            if key in specific_alias_keys:
-                continue
+                family = None
+                if event_name == "PROXY_WINDOW_CFG":
+                    family = "WINDOW_CFG"
+                elif event_name == "PROXY_RECV_WSTALL":
+                    family = "RECV_WSTALL"
+                if family:
+                    key = (
+                        worker,
+                        entry.get("tNs"),
+                        entry.get("peer"),
+                        entry.get("channel"),
+                        entry.get("slot"),
+                        family,
+                    )
+                    if key in specific_alias_keys:
+                        continue
 
-        event_counts[event_name] += 1
-        worker_event_counts[worker][event_name] += 1
+                event_counts[event_name] += 1
+                worker_event_counts[worker][event_name] += 1
 
-        if "WSTALL" in event_name:
-            worker_wstall_counts[worker] += 1
-            if "RECV" in event_name:
-                recv_wstall_count += 1
-            if "SEND" in event_name:
-                send_wstall_count += 1
+                if "WSTALL" in event_name:
+                    worker_wstall_counts[worker] += 1
+                    if "RECV" in event_name:
+                        recv_wstall_count += 1
+                    if "SEND" in event_name:
+                        send_wstall_count += 1
 
-        if event_name.endswith("DECISION") and "reason" in entry:
-            decision_counts[str(entry["reason"])] += 1
+                if event_name.endswith("DECISION") and "reason" in entry:
+                    decision_counts[str(entry["reason"])] += 1
 
-        if "wEff" in entry:
-            try:
-                w_eff_values.append(float(entry["wEff"]))
-            except (TypeError, ValueError):
-                pass
-        elif "newW" in entry:
-            try:
-                w_eff_values.append(float(entry["newW"]))
-            except (TypeError, ValueError):
-                pass
+                if "wEff" in entry:
+                    try:
+                        w_eff_values.append(float(entry["wEff"]))
+                    except (TypeError, ValueError):
+                        pass
+                elif "newW" in entry:
+                    try:
+                        w_eff_values.append(float(entry["newW"]))
+                    except (TypeError, ValueError):
+                        pass
 
-        if "pressureScore" in entry:
-            try:
-                pressure_scores.append(float(entry["pressureScore"]))
-            except (TypeError, ValueError):
-                pass
+                if "pressureScore" in entry:
+                    try:
+                        pressure_scores.append(float(entry["pressureScore"]))
+                    except (TypeError, ValueError):
+                        pass
 
-        if "occPd" in entry:
-            try:
-                occ_pd_values.append(float(entry["occPd"]))
-            except (TypeError, ValueError):
-                pass
-        if "occTr" in entry:
-            try:
-                occ_tr_values.append(float(entry["occTr"]))
-            except (TypeError, ValueError):
-                pass
+                if "occPd" in entry:
+                    try:
+                        occ_pd_counter[float(entry["occPd"])] += 1
+                    except (TypeError, ValueError):
+                        pass
+                if "occTr" in entry:
+                    try:
+                        occ_tr_counter[float(entry["occTr"])] += 1
+                    except (TypeError, ValueError):
+                        pass
 
     return {
         "event_counts": event_counts,
@@ -301,16 +346,16 @@ def summarize_nccl_events(events: List[dict]) -> dict:
         "w_eff_values": sorted({int(v) if float(v).is_integer() else v for v in w_eff_values}, key=float),
         "w_eff_counter": Counter(int(v) if float(v).is_integer() else v for v in w_eff_values),
         "pressure_scores": pressure_scores,
-        "occ_pd_values": occ_pd_values,
-        "occ_tr_values": occ_tr_values,
+        "occ_pd_values": [],
+        "occ_tr_values": [],
         "total_events": int(sum(event_counts.values())),
         "total_wstall_count": int(recv_wstall_count + send_wstall_count),
         "recv_wstall_count": int(recv_wstall_count),
         "send_wstall_count": int(send_wstall_count),
-        "max_occ_pd": max(occ_pd_values) if occ_pd_values else 0.0,
-        "p99_occ_pd": percentile(occ_pd_values, 0.99),
-        "max_occ_tr": max(occ_tr_values) if occ_tr_values else 0.0,
-        "p99_occ_tr": percentile(occ_tr_values, 0.99),
+        "max_occ_pd": max(occ_pd_counter.keys()) if occ_pd_counter else 0.0,
+        "p99_occ_pd": percentile_from_counter(occ_pd_counter, 0.99),
+        "max_occ_tr": max(occ_tr_counter.keys()) if occ_tr_counter else 0.0,
+        "p99_occ_tr": percentile_from_counter(occ_tr_counter, 0.99),
         "pressure_score_p95": percentile(pressure_scores, 0.95),
     }
 
@@ -331,6 +376,7 @@ def compute_summary_from_steps(step_rows: List[dict]) -> dict:
 
 
 def load_mode_data(mode_dir: Path) -> dict:
+    log_progress(f"load mode start mode_dir={mode_dir.as_posix()}")
     summary_files = sorted(mode_dir.glob("*_summary.json"))
     if not summary_files:
         raise FileNotFoundError(f"no *_summary.json found in {mode_dir}")
@@ -344,9 +390,11 @@ def load_mode_data(mode_dir: Path) -> dict:
     if "step_ms_avg" not in summary and step_rows:
         summary.update(compute_summary_from_steps(step_rows))
 
-    events = collect_nccl_logs(mode_dir)
-    nccl_summary = summarize_nccl_events(events)
+    nccl_summary = summarize_nccl_logs(mode_dir)
     mode_name = str(summary.get("run_tag") or summary.get("phase2_mode") or mode_dir.name).upper()
+    log_progress(
+        f"load mode complete mode={mode_name} step_rows={len(step_rows)} total_events={nccl_summary['total_events']}"
+    )
 
     return {
         "mode": mode_name,
@@ -354,7 +402,7 @@ def load_mode_data(mode_dir: Path) -> dict:
         "step_path": step_path,
         "summary": summary,
         "step_rows": step_rows,
-        "events": events,
+        "events": [],
         "nccl": nccl_summary,
         "mode_dir": mode_dir,
     }
@@ -803,6 +851,7 @@ def build_visualization_plan_card_single(mode_data: List[dict]) -> str:
 
 
 def build_single_experiment_report(experiment_root: Path, output_dir: Path, top_events: int) -> Path:
+    log_progress(f"build single report start experiment={experiment_root.name}")
     env_setup = load_json(experiment_root / "env_setup.json") if (experiment_root / "env_setup.json").exists() else None
     mode_dirs = find_mode_dirs(experiment_root)
     if not mode_dirs:
@@ -974,6 +1023,7 @@ def build_single_experiment_report(experiment_root: Path, output_dir: Path, top_
             writer.writeheader()
             writer.writerows(summary_rows)
 
+    log_progress(f"build single report complete experiment={experiment_root.name} html={html_path.as_posix()}")
     return html_path
 
 
@@ -1020,11 +1070,15 @@ def build_matrix_report(matrix_root: Path, output_dir: Path, top_events: int) ->
     experiment_dirs = find_experiment_dirs(matrix_root)
     if not experiment_dirs:
         raise FileNotFoundError(f"no experiment directories found in {matrix_root}")
+    log_progress(
+        f"build matrix report start matrix_root={matrix_root.as_posix()} experiments={len(experiment_dirs)}"
+    )
 
     per_experiment_links: Dict[str, str] = {}
     matrix_rows: List[dict] = []
 
     for experiment_dir in experiment_dirs:
+        log_progress(f"matrix experiment start name={experiment_dir.name}")
         per_output = output_dir / experiment_dir.name
         per_output.mkdir(parents=True, exist_ok=True)
         per_html = build_single_experiment_report(experiment_dir, per_output, top_events)
@@ -1034,6 +1088,7 @@ def build_matrix_report(matrix_root: Path, output_dir: Path, top_events: int) ->
         mode_data = [load_mode_data(mode_dir) for mode_dir in mode_dirs]
         mode_data.sort(key=lambda item: mode_sort_key(item["mode"]))
         matrix_rows.extend(collect_matrix_rows(experiment_dir.name, summarize_modes(mode_data)))
+        log_progress(f"matrix experiment complete name={experiment_dir.name}")
 
     experiment_names = [exp.name for exp in experiment_dirs]
     mode_names = sorted({row["mode"] for row in matrix_rows}, key=mode_sort_key)
@@ -1193,10 +1248,12 @@ def build_matrix_report(matrix_root: Path, output_dir: Path, top_events: int) ->
             writer.writeheader()
             writer.writerows(matrix_rows)
 
+    log_progress(f"build matrix report complete html={html_path.as_posix()}")
     return html_path
 
 
 def main() -> None:
+    global REPORT_LOG_PATH
     args = parse_args()
     input_path = Path(args.input).resolve()
 
@@ -1204,14 +1261,19 @@ def main() -> None:
         default_output = input_path.with_name(f"{input_path.stem}_report")
         output_dir = Path(args.output_dir).resolve() if args.output_dir else default_output
         output_dir.mkdir(parents=True, exist_ok=True)
+        REPORT_LOG_PATH = output_dir / "phase2_reporter.log"
+        REPORT_LOG_PATH.write_text("", encoding="utf-8")
+        log_progress(f"start input={input_path.as_posix()} output={output_dir.as_posix()}")
         with tempfile.TemporaryDirectory(prefix="phase2_log_reporter_") as tempdir:
             temp_root = Path(tempdir)
+            log_progress(f"extract zip start temp_root={temp_root.as_posix()}")
             with zipfile.ZipFile(input_path) as zf:
                 zf.extractall(temp_root)
                 top_level_dirs = sorted({Path(name).parts[0] for name in zf.namelist() if name.strip("/")})
             if not top_level_dirs:
                 raise FileNotFoundError(f"zip archive is empty: {input_path}")
             extracted_root = temp_root / top_level_dirs[0]
+            log_progress(f"extract zip complete extracted_root={extracted_root.as_posix()}")
             if is_matrix_root(extracted_root):
                 html_path = build_matrix_report(extracted_root, output_dir, args.top_events)
             else:
@@ -1219,12 +1281,15 @@ def main() -> None:
     else:
         output_dir = Path(args.output_dir).resolve() if args.output_dir else input_path / "report"
         output_dir.mkdir(parents=True, exist_ok=True)
+        REPORT_LOG_PATH = output_dir / "phase2_reporter.log"
+        REPORT_LOG_PATH.write_text("", encoding="utf-8")
+        log_progress(f"start input={input_path.as_posix()} output={output_dir.as_posix()}")
         if is_matrix_root(input_path):
             html_path = build_matrix_report(input_path, output_dir, args.top_events)
         else:
             html_path = build_single_experiment_report(input_path, output_dir, args.top_events)
 
-    print(f"[phase2-log-reporter] wrote {html_path}")
+    log_progress(f"wrote html={html_path.as_posix()}")
 
 
 if __name__ == "__main__":
