@@ -171,6 +171,14 @@ NCCL_PARAM(Phase0Log, "PHASE0_LOG", 0);
 NCCL_PARAM(Phase1StaticW, "PHASE1_STATIC_W", 0);
 NCCL_PARAM(Phase2B2Enable, "PHASE2_B2_ENABLE", 0);
 NCCL_PARAM(Phase2Log, "PHASE2_LOG", 0);
+NCCL_PARAM(Phase3B3Enable, "PHASE3_B3_ENABLE", 0);
+NCCL_PARAM(Phase3Log, "PHASE3_LOG", 0);
+NCCL_PARAM(Phase3WarmupIntervals, "PHASE3_WARMUP_INTERVALS", 4);
+NCCL_PARAM(Phase3HiIntervals, "PHASE3_HI_INTERVALS", 2);
+NCCL_PARAM(Phase3LoIntervals, "PHASE3_LO_INTERVALS", 8);
+NCCL_PARAM(Phase3OccRatioHighPct, "PHASE3_OCC_RATIO_HIGH_PCT", 90);
+NCCL_PARAM(Phase3LagRatioHighPct, "PHASE3_LAG_RATIO_HIGH_PCT", 100);
+NCCL_PARAM(Phase3DelayRatioHighPct, "PHASE3_DELAY_RATIO_HIGH_PCT", 125);
 
 struct setupReq {
   int tpRank;
@@ -723,7 +731,7 @@ static inline struct phase2WindowDecision phase2SelectWindow(
   decision.wRaw = decision.wBase;
   decision.wEff = decision.wBase;
 
-  if (!decision.enabled || phase1WindowCfg() > 0 || proxyState == NULL || sub == NULL) return decision;
+  if (phase1WindowCfg() > 0 || proxyState == NULL || sub == NULL) return decision;
 
   struct ncclComm* comm = proxyState->comm;
   if (comm == NULL || comm->peerInfo == NULL) return decision;
@@ -741,6 +749,143 @@ static inline struct phase2WindowDecision phase2SelectWindow(
   decision.penaltyTotal = decision.penaltyTopo + decision.penaltyColl + decision.penaltyAlgo;
   decision.wRaw = decision.wBase - decision.penaltyTotal;
   decision.wEff = std::min(decision.wMax, std::max(decision.wMin, decision.wRaw));
+  return decision;
+}
+
+struct phase3WindowDecision {
+  int enabled;
+  struct phase2WindowDecision semantic;
+  int wSem;
+  int wCur;
+  int wFb;
+  int wEff;
+  int occPd;
+  int occTr;
+  int recvLag;
+  uint64_t completionDelayNs;
+  uint64_t delayBaseNs;
+  uint64_t delayEwmaNs;
+  int occRatioPct;
+  int lagRatioPct;
+  int delayRatioPct;
+  int pressureScore;
+  int hiCount;
+  int loCount;
+  int warmupCount;
+  uint64_t ctrlStep;
+  int oldW;
+  int newW;
+  const char* reason;
+};
+
+static inline int phase3Clamp(int lo, int hi, int value) {
+  return std::min(hi, std::max(lo, value));
+}
+
+static inline int phase3RatioPct(uint64_t numerator, uint64_t denominator) {
+  if (denominator == 0) return 0;
+  return (int)((numerator * 100 + denominator - 1) / denominator);
+}
+
+static inline uint64_t phase3UpdateDelayEwma(uint64_t prev, uint64_t sample) {
+  if (sample == 0) return prev;
+  if (prev == 0) return sample;
+  return (7 * prev + sample) / 8;
+}
+
+static inline struct phase3WindowDecision phase3SnapshotWindow(
+    struct ncclProxySubArgs* sub,
+    const struct phase2WindowDecision* semantic) {
+  struct phase3WindowDecision decision;
+  memset(&decision, 0, sizeof(decision));
+  decision.enabled = ncclParamPhase3B3Enable() != 0;
+  decision.semantic = *semantic;
+  decision.wSem = semantic->wEff;
+  if (sub->phase3CurrentW == 0) sub->phase3CurrentW = decision.wSem;
+  decision.wCur = sub->phase3CurrentW;
+  decision.wFb = decision.wCur;
+  decision.wEff = phase3Clamp(semantic->wMin, semantic->wMax, std::min(decision.wSem, decision.wFb));
+  decision.occPd = (int)(sub->posted - sub->done);
+  decision.occTr = (int)(sub->transmitted - sub->done);
+  decision.recvLag = (int)(sub->received - sub->transmitted);
+  decision.completionDelayNs = sub->phase3LastDelayNs;
+  decision.delayBaseNs = sub->phase3DelayBaseNs;
+  decision.delayEwmaNs = sub->phase3DelayEwmaNs;
+  decision.occRatioPct = phase3RatioPct((uint64_t)decision.occTr, (uint64_t)std::max(1, decision.wCur));
+  decision.lagRatioPct = phase3RatioPct((uint64_t)decision.recvLag, 1);
+  decision.delayRatioPct = phase3RatioPct(decision.delayEwmaNs, std::max<uint64_t>(1, decision.delayBaseNs));
+  decision.hiCount = sub->phase3HiCount;
+  decision.loCount = sub->phase3LoCount;
+  decision.warmupCount = sub->phase3WarmupCount;
+  decision.ctrlStep = sub->phase3CtrlStep;
+  decision.oldW = decision.wCur;
+  decision.newW = decision.wEff;
+  decision.reason = "init";
+  return decision;
+}
+
+static inline struct phase3WindowDecision phase3UpdateController(
+    struct ncclProxySubArgs* sub,
+    const struct phase2WindowDecision* semantic) {
+  struct phase3WindowDecision decision = phase3SnapshotWindow(sub, semantic);
+  if (!decision.enabled || phase1WindowCfg() > 0) return decision;
+
+  decision.ctrlStep = ++sub->phase3CtrlStep;
+  decision.occPd = (int)(sub->posted - sub->done);
+  decision.occTr = (int)(sub->transmitted - sub->done);
+  decision.recvLag = (int)(sub->received - sub->transmitted);
+  decision.completionDelayNs = sub->phase3LastDelayNs;
+  decision.delayBaseNs = sub->phase3DelayBaseNs;
+  decision.delayEwmaNs = sub->phase3DelayEwmaNs;
+  decision.occRatioPct = phase3RatioPct((uint64_t)decision.occTr, (uint64_t)std::max(1, sub->phase3CurrentW));
+  decision.lagRatioPct = phase3RatioPct((uint64_t)decision.recvLag, 1);
+  decision.delayRatioPct = phase3RatioPct(decision.delayEwmaNs, std::max<uint64_t>(1, decision.delayBaseNs));
+
+  decision.pressureScore = 0;
+  if (decision.occRatioPct >= ncclParamPhase3OccRatioHighPct()) decision.pressureScore += 1;
+  if (decision.lagRatioPct >= ncclParamPhase3LagRatioHighPct()) decision.pressureScore += 1;
+  if (decision.delayRatioPct >= ncclParamPhase3DelayRatioHighPct()) decision.pressureScore += 1;
+
+  decision.oldW = sub->phase3CurrentW;
+  decision.newW = decision.oldW;
+  decision.reason = "hold";
+
+  if (sub->phase3WarmupCount < ncclParamPhase3WarmupIntervals()) {
+    sub->phase3WarmupCount += 1;
+    sub->phase3HiCount = 0;
+    sub->phase3LoCount = 0;
+    decision.reason = "warmup";
+    decision.newW = decision.wSem;
+  } else if (decision.pressureScore >= 2) {
+    sub->phase3HiCount += 1;
+    sub->phase3LoCount = 0;
+    if (sub->phase3HiCount >= ncclParamPhase3HiIntervals()) {
+      decision.newW = decision.oldW - 1;
+      sub->phase3HiCount = 0;
+      decision.reason = "shrink";
+    }
+  } else if (decision.pressureScore == 0) {
+    sub->phase3LoCount += 1;
+    sub->phase3HiCount = 0;
+    if (sub->phase3LoCount >= ncclParamPhase3LoIntervals()) {
+      decision.newW = decision.oldW + 1;
+      sub->phase3LoCount = 0;
+      decision.reason = "recover";
+    }
+  } else {
+    sub->phase3HiCount = 0;
+    sub->phase3LoCount = 0;
+  }
+
+  decision.wFb = decision.newW;
+  decision.wEff = phase3Clamp(semantic->wMin, semantic->wMax, std::min(decision.wSem, decision.wFb));
+  decision.newW = decision.wEff;
+  sub->phase3CurrentW = decision.wEff;
+
+  decision.wCur = sub->phase3CurrentW;
+  decision.hiCount = sub->phase3HiCount;
+  decision.loCount = sub->phase3LoCount;
+  decision.warmupCount = sub->phase3WarmupCount;
   return decision;
 }
 
@@ -884,6 +1029,142 @@ static inline void phase2ProxyRecvWstallLog(
       (unsigned long long)(sub->posted - sub->done),
       (unsigned long long)(sub->transmitted - sub->done));
   sub->phase2RecvWstall = 1;
+}
+
+static inline void phase3ProxyWindowCfgLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    const struct phase3WindowDecision* decision) {
+  if (ncclParamPhase3Log() == 0) return;
+  if (sub->phase3WindowCfgLogged && sub->phase3LastLoggedW == decision->wEff) return;
+  INFO(NCCL_NET,
+      "PHASE3 event=PROXY_B3_WINDOW_CFG tNs=%llu rank=%d peer=%d channel=%d coll=%s collApi=%s algo=%s proto=%s base=%llu nsteps=%d rackSelf=%d rackPeer=%d rackKnown=%d interRack=%d penTopo=%d penColl=%d penAlgo=%d penTotal=%d wBase=%d wMin=%d wMax=%d wRaw=%d wSem=%d wCur=%d wFb=%d wEff=%d ctrlStep=%llu",
+      (unsigned long long)clockNano(),
+      proxyState->tpRank,
+      sub->peer,
+      sub->channelId,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol),
+      (unsigned long long)sub->base,
+      sub->nsteps,
+      decision->semantic.rackSelf,
+      decision->semantic.rackPeer,
+      decision->semantic.rackKnown,
+      decision->semantic.interRack,
+      decision->semantic.penaltyTopo,
+      decision->semantic.penaltyColl,
+      decision->semantic.penaltyAlgo,
+      decision->semantic.penaltyTotal,
+      decision->semantic.wBase,
+      decision->semantic.wMin,
+      decision->semantic.wMax,
+      decision->semantic.wRaw,
+      decision->wSem,
+      decision->oldW,
+      decision->wFb,
+      decision->wEff,
+      (unsigned long long)decision->ctrlStep);
+  sub->phase3WindowCfgLogged = 1;
+  sub->phase3LastLoggedW = decision->wEff;
+}
+
+static inline void phase3ProxyPressureLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    const struct phase3WindowDecision* decision) {
+  if (ncclParamPhase3Log() == 0) return;
+  INFO(NCCL_NET,
+      "PHASE3 event=PROXY_B3_PRESSURE tNs=%llu rank=%d peer=%d channel=%d coll=%s collApi=%s algo=%s proto=%s ctrlStep=%llu occPd=%d occTr=%d recvLag=%d completionDelayNs=%llu delayBaseNs=%llu delayEwmaNs=%llu occRatioPct=%d lagRatioPct=%d delayRatioPct=%d pressureScore=%d hiCount=%d loCount=%d wSem=%d wCur=%d wEff=%d",
+      (unsigned long long)clockNano(),
+      proxyState->tpRank,
+      sub->peer,
+      sub->channelId,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol),
+      (unsigned long long)decision->ctrlStep,
+      decision->occPd,
+      decision->occTr,
+      decision->recvLag,
+      (unsigned long long)decision->completionDelayNs,
+      (unsigned long long)decision->delayBaseNs,
+      (unsigned long long)decision->delayEwmaNs,
+      decision->occRatioPct,
+      decision->lagRatioPct,
+      decision->delayRatioPct,
+      decision->pressureScore,
+      decision->hiCount,
+      decision->loCount,
+      decision->wSem,
+      decision->oldW,
+      decision->wEff);
+}
+
+static inline void phase3ProxyDecisionLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    const struct phase3WindowDecision* decision) {
+  if (ncclParamPhase3Log() == 0) return;
+  INFO(NCCL_NET,
+      "PHASE3 event=PROXY_B3_DECISION tNs=%llu rank=%d peer=%d channel=%d coll=%s collApi=%s algo=%s proto=%s ctrlStep=%llu reason=%s oldW=%d newW=%d wSem=%d wFb=%d wEff=%d pressureScore=%d hiCount=%d loCount=%d",
+      (unsigned long long)clockNano(),
+      proxyState->tpRank,
+      sub->peer,
+      sub->channelId,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol),
+      (unsigned long long)decision->ctrlStep,
+      decision->reason,
+      decision->oldW,
+      decision->newW,
+      decision->wSem,
+      decision->wFb,
+      decision->wEff,
+      decision->pressureScore,
+      decision->hiCount,
+      decision->loCount);
+}
+
+static inline void phase3ProxyRecvWstallLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    int slot,
+    const struct phase3WindowDecision* decision) {
+  if (ncclParamPhase3Log() == 0 || sub->phase3RecvWstall) return;
+  INFO(NCCL_NET,
+      "PHASE3 event=PROXY_B3_RECV_WSTALL tNs=%llu rank=%d peer=%d channel=%d slot=%d coll=%s collApi=%s algo=%s proto=%s base=%llu posted=%llu received=%llu transmitted=%llu done=%llu nsteps=%d ctrlStep=%llu wSem=%d wEff=%d occPd=%d occTr=%d recvLag=%d pressureScore=%d",
+      (unsigned long long)clockNano(),
+      proxyState->tpRank,
+      sub->peer,
+      sub->channelId,
+      slot,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol),
+      (unsigned long long)sub->base,
+      (unsigned long long)sub->posted,
+      (unsigned long long)sub->received,
+      (unsigned long long)sub->transmitted,
+      (unsigned long long)sub->done,
+      sub->nsteps,
+      (unsigned long long)decision->ctrlStep,
+      decision->wSem,
+      decision->wEff,
+      decision->occPd,
+      decision->occTr,
+      decision->recvLag,
+      decision->pressureScore);
+  sub->phase3RecvWstall = 1;
 }
 
 static ncclResult_t sharedNetBuffersInit(struct ncclProxyState* proxyState, int cuda, int tpLocalRank, int type, int sameProcess,
@@ -1502,6 +1783,18 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
       sub->phase1RecvWstall = 0;
       sub->phase2WindowCfgLogged = 0;
       sub->phase2RecvWstall = 0;
+      sub->phase3WindowCfgLogged = 0;
+      sub->phase3RecvWstall = 0;
+      sub->phase3CurrentW = 0;
+      sub->phase3LastLoggedW = 0;
+      sub->phase3HiCount = 0;
+      sub->phase3LoCount = 0;
+      sub->phase3WarmupCount = 0;
+      sub->phase3CtrlStep = 0;
+      sub->phase3DelayBaseNs = 0;
+      sub->phase3DelayEwmaNs = 0;
+      sub->phase3LastDelayNs = 0;
+      memset(sub->phase3PostTs, 0, sizeof(sub->phase3PostTs));
       ncclProfilerRecordProxyOpEventState(s, args, ncclProfilerProxyOpInProgress_v4);
       if (!sub->reg)
         sub->sendMhandle = resources->mhandles[args->protocol];
@@ -1693,6 +1986,18 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
       sub->phase1RecvWstall = 0;
       sub->phase2WindowCfgLogged = 0;
       sub->phase2RecvWstall = 0;
+      sub->phase3WindowCfgLogged = 0;
+      sub->phase3RecvWstall = 0;
+      sub->phase3CurrentW = 0;
+      sub->phase3LastLoggedW = 0;
+      sub->phase3HiCount = 0;
+      sub->phase3LoCount = 0;
+      sub->phase3WarmupCount = 0;
+      sub->phase3CtrlStep = 0;
+      sub->phase3DelayBaseNs = 0;
+      sub->phase3DelayEwmaNs = 0;
+      sub->phase3LastDelayNs = 0;
+      memset(sub->phase3PostTs, 0, sizeof(sub->phase3PostTs));
       for (int i=0; i<groupSize; i++) sub[-i].groupSize = groupSize;
       ncclProfilerRecordProxyOpEventState(s, args, ncclProfilerProxyOpInProgress_v4);
       if (!sub->reg)
@@ -1718,16 +2023,25 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
         int postedStepId = sub->posted;
         if (sub->posted < sub->nsteps) {
           struct recvNetResources* resources = (struct recvNetResources*) (sub->connection->transportResources);
-          struct phase2WindowDecision phase2Decision = phase2SelectWindow(proxyState, args, sub);
-          int wEff = (wCfg > 0) ? phase1WindowEff(args) : (phase2Decision.enabled ? phase2Decision.wEff : wBase);
-          if (phase2Decision.enabled && wCfg == 0) {
-            phase2ProxyWindowCfgLog(proxyState, args, sub, &phase2Decision);
+          struct phase2WindowDecision semanticDecision = phase2SelectWindow(proxyState, args, sub);
+          struct phase3WindowDecision phase3Decision = phase3SnapshotWindow(sub, &semanticDecision);
+          int wEff = wBase;
+          if (wCfg > 0) {
+            wEff = phase1WindowEff(args);
+          } else if (phase3Decision.enabled) {
+            wEff = phase3Decision.wEff;
+            phase3ProxyWindowCfgLog(proxyState, args, sub, &phase3Decision);
+          } else if (semanticDecision.enabled) {
+            wEff = semanticDecision.wEff;
+            phase2ProxyWindowCfgLog(proxyState, args, sub, &semanticDecision);
           } else {
             phase1ProxyWindowCfgLog(proxyState, args, sub, resources->shared, wBase, wCfg, wEff);
           }
           if (sub->posted >= sub->done + wEff) {
-            if (phase2Decision.enabled && wCfg == 0) {
-              phase2ProxyRecvWstallLog(proxyState, args, sub, (sub->base+sub->posted)%NCCL_STEPS, &phase2Decision);
+            if (phase3Decision.enabled && wCfg == 0) {
+              phase3ProxyRecvWstallLog(proxyState, args, sub, (sub->base+sub->posted)%NCCL_STEPS, &phase3Decision);
+            } else if (semanticDecision.enabled && wCfg == 0) {
+              phase2ProxyRecvWstallLog(proxyState, args, sub, (sub->base+sub->posted)%NCCL_STEPS, &semanticDecision);
             } else {
               phase1ProxyWstallLog(proxyState, args, sub, "PROXY_RECV_WSTALL", (sub->base+sub->posted)%NCCL_STEPS, wBase, wCfg, wEff, &sub->phase1RecvWstall);
             }
@@ -1736,6 +2050,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
           }
           sub->phase1RecvWstall = 0;
           sub->phase2RecvWstall = 0;
+          sub->phase3RecvWstall = 0;
           ncclProfilerStartRecvProxyStepEvent(s+i, args, postedStepId);
           int stepSize = resources->buffSizes[p] / NCCL_STEPS;
           char* localBuff = NCCL_NET_MAP_GET_POINTER(&resources->map, cpu, buffs[p]);
@@ -1792,10 +2107,12 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
           for (int i=0; i<subGroup->groupSize; i++) {
             struct ncclProxySubArgs* sub = subGroup+i;
             int postedStepId = sub->posted;
-            struct phase2WindowDecision phase2Decision = phase2SelectWindow(proxyState, args, sub);
-            int wEff = (wCfg > 0) ? phase1WindowEff(args) : (phase2Decision.enabled ? phase2Decision.wEff : wBase);
+            struct phase2WindowDecision semanticDecision = phase2SelectWindow(proxyState, args, sub);
+            struct phase3WindowDecision phase3Decision = phase3SnapshotWindow(sub, &semanticDecision);
+            int wEff = (wCfg > 0) ? phase1WindowEff(args) : (phase3Decision.enabled ? phase3Decision.wEff : (semanticDecision.enabled ? semanticDecision.wEff : wBase));
             TRACE(NCCL_NET, "recvProxy [%ld/%ld/%d] Irecv posted, buff %p, size %ld, myRank %d, channelId %d, mhandle %p", sub->posted, (sub->base + sub->posted) % NCCL_STEPS, sub->nsteps, ptrs[i], sizes[i], proxyState->tpRank, sub->channelId, mhandles[i]);
             phase0ProxyLog(proxyState, args, sub, "PROXY_RECV_POST", (sub->base + sub->posted) % NCCL_STEPS, sizes[i], wBase, wCfg, wEff);
+            sub->phase3PostTs[(sub->base + sub->posted) % NCCL_STEPS] = clockNano();
             sub->posted += args->sliceSteps;
             ncclProfilerRecordProxyStepEventState(s+i, args, postedStepId, ncclProfilerProxyStepRecvWait);
           }
@@ -1823,15 +2140,30 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             struct ncclProxySubArgs* sub = subGroup + i;
             int receivedStepId = sub->received;
             int buffSlot = (sub->base + sub->received) % NCCL_STEPS;
-            struct phase2WindowDecision phase2Decision = phase2SelectWindow(proxyState, args, sub);
-            int wEff = (wCfg > 0) ? phase1WindowEff(args) : (phase2Decision.enabled ? phase2Decision.wEff : wBase);
+            struct phase2WindowDecision semanticDecision = phase2SelectWindow(proxyState, args, sub);
+            struct phase3WindowDecision phase3Decision = phase3SnapshotWindow(sub, &semanticDecision);
+            int wEff = (wCfg > 0) ? phase1WindowEff(args) : (phase3Decision.enabled ? phase3Decision.wEff : (semanticDecision.enabled ? semanticDecision.wEff : wBase));
             struct recvNetResources* resources = (struct recvNetResources*)(sub->connection->transportResources);
             volatile struct ncclConnFifo* connFifo = (volatile struct ncclConnFifo*)resources->recvMem->connFifo;
             connFifo[buffSlot].size = -1;
             sub->transSize = sizes[i];
+            uint64_t nowNs = clockNano();
+            uint64_t delayNs = 0;
+            if (sub->phase3PostTs[buffSlot] != 0 && nowNs >= sub->phase3PostTs[buffSlot]) {
+              delayNs = nowNs - sub->phase3PostTs[buffSlot];
+              sub->phase3LastDelayNs = delayNs;
+              sub->phase3DelayEwmaNs = phase3UpdateDelayEwma(sub->phase3DelayEwmaNs, delayNs);
+              if (sub->phase3DelayBaseNs == 0) sub->phase3DelayBaseNs = sub->phase3DelayEwmaNs;
+            }
             phase0ProxyLog(proxyState, args, sub, "PROXY_RECV_NET_DONE", buffSlot, sizes[i], wBase, wCfg, wEff);
             sub->received += args->sliceSteps;
             ncclProfilerRecordProxyStepEventState(s+i, args, receivedStepId, ncclProfilerProxyStepRecvFlushWait);
+            if (phase3Decision.enabled && wCfg == 0) {
+              struct phase3WindowDecision updated = phase3UpdateController(sub, &semanticDecision);
+              phase3ProxyPressureLog(proxyState, args, sub, &updated);
+              phase3ProxyDecisionLog(proxyState, args, sub, &updated);
+              phase3ProxyWindowCfgLog(proxyState, args, sub, &updated);
+            }
             if (step < sub->nsteps) {
               struct recvNetResources* resources = (struct recvNetResources*) (sub->connection->transportResources);
               if (resources->useGdr) needFlush |= resources->needFlush;
@@ -1892,8 +2224,9 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
           for (int i=0; i<subGroup->groupSize; i++) {
             struct ncclProxySubArgs* sub = subGroup + i;
             int transmittedStepId = sub->transmitted;
-            struct phase2WindowDecision phase2Decision = phase2SelectWindow(proxyState, args, sub);
-            int wEff = (wCfg > 0) ? phase1WindowEff(args) : (phase2Decision.enabled ? phase2Decision.wEff : wBase);
+            struct phase2WindowDecision semanticDecision = phase2SelectWindow(proxyState, args, sub);
+            struct phase3WindowDecision phase3Decision = phase3SnapshotWindow(sub, &semanticDecision);
+            int wEff = (wCfg > 0) ? phase1WindowEff(args) : (phase3Decision.enabled ? phase3Decision.wEff : (semanticDecision.enabled ? semanticDecision.wEff : wBase));
 
             sub->transmitted += args->sliceSteps;
             ncclProfilerRecordProxyStepEventState(s+i, args, transmittedStepId, ncclProfilerProxyStepRecvGPUWait);
@@ -1931,11 +2264,18 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
               subGroup->recvRequestsCache[sub->done%NCCL_STEPS] = NULL;
             }
             int doneStepId = sub->done;
-            struct phase2WindowDecision phase2Decision = phase2SelectWindow(proxyState, args, sub);
-            int wEff = (wCfg > 0) ? phase1WindowEff(args) : (phase2Decision.enabled ? phase2Decision.wEff : wBase);
+            struct phase2WindowDecision semanticDecision = phase2SelectWindow(proxyState, args, sub);
+            struct phase3WindowDecision phase3Decision = phase3SnapshotWindow(sub, &semanticDecision);
+            int wEff = (wCfg > 0) ? phase1WindowEff(args) : (phase3Decision.enabled ? phase3Decision.wEff : (semanticDecision.enabled ? semanticDecision.wEff : wBase));
             phase0ProxyLog(proxyState, args, sub, "PROXY_RECV_CONSUMED", (sub->base + sub->done) % NCCL_STEPS, sub->transSize, wBase, wCfg, wEff);
             sub->done += args->sliceSteps;
             ncclProfilerStopProxyStepEvent(s+i, args, doneStepId);
+            if (phase3Decision.enabled && wCfg == 0) {
+              struct phase3WindowDecision updated = phase3UpdateController(sub, &semanticDecision);
+              phase3ProxyPressureLog(proxyState, args, sub, &updated);
+              phase3ProxyDecisionLog(proxyState, args, sub, &updated);
+              phase3ProxyWindowCfgLog(proxyState, args, sub, &updated);
+            }
             args->idle = 0;
             if (sub->done == sub->nsteps) {
               args->done++;

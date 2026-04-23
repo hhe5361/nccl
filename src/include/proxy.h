@@ -156,6 +156,18 @@ struct ncclProxySubArgs {
   uint8_t phase1RecvWstall;
   uint8_t phase2WindowCfgLogged;
   uint8_t phase2RecvWstall;
+  uint8_t phase3WindowCfgLogged;
+  uint8_t phase3RecvWstall;
+  int phase3CurrentW;
+  int phase3LastLoggedW;
+  int phase3HiCount;
+  int phase3LoCount;
+  int phase3WarmupCount;
+  uint64_t phase3CtrlStep;
+  uint64_t phase3DelayBaseNs;
+  uint64_t phase3DelayEwmaNs;
+  uint64_t phase3LastDelayNs;
+  uint64_t phase3PostTs[NCCL_STEPS];
   void* requests[NCCL_STEPS];
 
   // Profiler plugin
