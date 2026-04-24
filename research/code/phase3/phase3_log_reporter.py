@@ -67,6 +67,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", required=True, help="Single experiment root, matrix root, or zip")
     parser.add_argument("--output-dir", default=None, help="Output directory. Defaults to <input>_report or <input>/report")
     parser.add_argument("--top-events", type=int, default=12, help="Number of top NCCL events to visualize")
+    parser.add_argument("--switch-log-dir", default=None, help="Override switch log directory for all experiments in this report")
     return parser.parse_args()
 
 
@@ -153,11 +154,22 @@ def load_json(path: Path) -> dict:
 
 
 def load_jsonl(path: Path) -> List[dict]:
+    text = path.read_text(encoding="utf-8", errors="replace").strip()
+    if not text:
+        return []
+
     rows: List[dict] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line:
-            rows.append(json.loads(line))
+    decoder = json.JSONDecoder()
+    index = 0
+    length = len(text)
+    while index < length:
+        while index < length and text[index].isspace():
+            index += 1
+        if index >= length:
+            break
+        row, next_index = decoder.raw_decode(text, index)
+        rows.append(row)
+        index = next_index
     return rows
 
 
@@ -197,6 +209,24 @@ def positive_ylim(max_value: float) -> Optional[Tuple[float, float]]:
     return 0.0, max_value * 1.05
 
 
+def value_ylim(values: List[float]) -> Optional[Tuple[float, float]]:
+    if not values:
+        return None
+    min_value = min(values)
+    max_value = max(values)
+    if min_value >= 0:
+        return positive_ylim(max_value)
+    span = max_value - min_value
+    margin = max(span * 0.05, 0.1)
+    lower = min_value - margin
+    upper = max_value + margin
+    if lower > 0:
+        lower = 0.0
+    if upper < 0:
+        upper = 0.0
+    return lower, upper
+
+
 def save_line_plot(path: Path, title: str, xlabel: str, ylabel: str, series: List[Tuple[str, List[float], List[float]]]) -> Optional[Path]:
     if not series:
         return None
@@ -228,16 +258,15 @@ def save_grouped_bar(path: Path, title: str, categories: List[str], series: List
     plt.figure(figsize=(max(10, len(categories) * 0.9), 5.8))
     x = list(range(len(categories)))
     width = 0.8 / max(len(series), 1)
-    max_value = 0.0
+    all_values: List[float] = []
     for idx, (label, values) in enumerate(series):
         offset = (idx - (len(series) - 1) / 2.0) * width
         plt.bar([pos + offset for pos in x], values, width=width, label=label)
-        if values:
-            max_value = max(max_value, max(values))
+        all_values.extend(float(v) for v in values)
     plt.title(title)
     plt.ylabel(ylabel)
     plt.xticks(x, categories, rotation=35 if rotate_labels else 0, ha="right" if rotate_labels else "center")
-    ylim = positive_ylim(max_value)
+    ylim = value_ylim(all_values)
     if ylim:
         plt.ylim(*ylim)
     plt.grid(True, axis="y", alpha=0.25)
@@ -709,6 +738,9 @@ def extract_ts_ns(value: Any) -> Optional[int]:
 
 def extract_record_ts_ns(record: dict) -> Optional[int]:
     for key in (
+        "ts_mid_unix_ns",
+        "ts_start_unix_ns",
+        "ts_end_unix_ns",
         "ts_unix_ns",
         "timestamp_ns",
         "unix_ns",
@@ -787,7 +819,9 @@ def compute_switch_delta_series(samples: List[Tuple[int, float]]) -> List[Tuple[
     return deltas
 
 
-def resolve_switch_log_dir(experiment_root: Path, env_setup: Optional[dict]) -> Optional[Path]:
+def resolve_switch_log_dir(experiment_root: Path, env_setup: Optional[dict], switch_log_dir_override: Optional[str] = None) -> Optional[Path]:
+    if switch_log_dir_override:
+        return Path(switch_log_dir_override)
     if not env_setup or int(env_setup.get("switch_log_enable", 0) or 0) != 1:
         return None
     candidates: List[Path] = []
@@ -879,8 +913,8 @@ def build_mode_time_windows(mode_data: List[dict], env_setup: Optional[dict], ma
     return windows
 
 
-def load_switch_bundle(experiment_root: Path, env_setup: Optional[dict]) -> Optional[dict]:
-    log_dir = resolve_switch_log_dir(experiment_root, env_setup)
+def load_switch_bundle(experiment_root: Path, env_setup: Optional[dict], switch_log_dir_override: Optional[str] = None) -> Optional[dict]:
+    log_dir = resolve_switch_log_dir(experiment_root, env_setup, switch_log_dir_override)
     if log_dir is None or not log_dir.exists():
         return None
     series = {}
@@ -906,8 +940,14 @@ def load_switch_bundle(experiment_root: Path, env_setup: Optional[dict]) -> Opti
     }
 
 
-def save_switch_overlay_plot(path: Path, experiment_root: Path, env_setup: Optional[dict], mode_data: List[dict]) -> Optional[Path]:
-    switch_bundle = load_switch_bundle(experiment_root, env_setup)
+def save_switch_overlay_plot(
+    path: Path,
+    experiment_root: Path,
+    env_setup: Optional[dict],
+    mode_data: List[dict],
+    switch_log_dir_override: Optional[str] = None,
+) -> Optional[Path]:
+    switch_bundle = load_switch_bundle(experiment_root, env_setup, switch_log_dir_override)
     if not switch_bundle or not switch_bundle.get("series"):
         return None
 
@@ -1039,14 +1079,19 @@ def summarize_modes(mode_data: List[dict]) -> List[dict]:
             row["delta_bw_vs_stock_pct"] = rel_change(float(stock["summary"].get("collective_gbps_avg", 0.0)), row["collective_gbps_avg"])
             row["delta_occ_tr_vs_stock_pct"] = rel_change(float(stock["nccl"]["p99_occ_tr"]), row["p99_occ_tr"])
             row["delta_wstall_vs_stock_pct"] = rel_change(float(stock["nccl"]["total_wstall_count"]), row["total_wstall_count"])
-        if b2 is not None and item["mode"] != "B2":
+        if b2 is not None and item["mode"] not in {"STOCK", "B2"}:
             row["delta_step_vs_b2_pct"] = rel_change(float(b2["summary"].get("step_ms_avg", 0.0)), row["step_ms_avg"])
             row["delta_bw_vs_b2_pct"] = rel_change(float(b2["summary"].get("collective_gbps_avg", 0.0)), row["collective_gbps_avg"])
         rows.append(row)
     return rows
 
 
-def build_collection_plan_card_single(experiment_root: Path, mode_data: List[dict], env_setup: Optional[dict] = None) -> str:
+def build_collection_plan_card_single(
+    experiment_root: Path,
+    mode_data: List[dict],
+    env_setup: Optional[dict] = None,
+    switch_log_dir_override: Optional[str] = None,
+) -> str:
     total_logs = sum(len(list(item["mode_dir"].glob("*/nccl.*.log"))) for item in mode_data)
     total_step_timing = sum(len(list(item["mode_dir"].glob("*/**/*_worker_step_timing.jsonl"))) for item in mode_data)
     rows = [
@@ -1056,7 +1101,10 @@ def build_collection_plan_card_single(experiment_root: Path, mode_data: List[dic
         [f"MODE/workerXX/*_worker_step_timing.jsonl ({total_step_timing} files)", "worker-local monotonic step timing. receiver W trace를 collective step 축에 정렬할 때 사용."],
         [f"MODE/workerXX/nccl.*.log ({total_logs} files)", "PHASE0/2/3 이벤트 로그. WINDOW_CFG, PRESSURE, DECISION, WSTALL을 포함."],
     ]
-    if env_setup and int(env_setup.get("switch_log_enable", 0) or 0) == 1:
+    if switch_log_dir_override:
+        rows.append(["switch_log_override", switch_log_dir_override])
+        rows.append(["switch_log/*.jsonl", "override 경로에서 읽는 switch pressure 로그. spine ROCE, rackA/rackB PFC, markers.jsonl 을 포함."])
+    elif env_setup and int(env_setup.get("switch_log_enable", 0) or 0) == 1:
         switch_dir = env_setup.get("switch_log_local_dir") or (str(SWITCH_SHARED_ROOT_DEFAULT / str(env_setup.get("switch_log_run_id", ""))) if env_setup.get("switch_log_run_id") else "")
         if switch_dir:
             rows.append(["switch_log_local_dir", switch_dir])
@@ -1064,7 +1112,7 @@ def build_collection_plan_card_single(experiment_root: Path, mode_data: List[dic
     return '<div class="card"><h2>Collected Logs</h2>' + render_table(["source", "meaning"], rows) + '</div>'
 
 
-def build_visualization_plan_card_single(env_setup: Optional[dict] = None) -> str:
+def build_visualization_plan_card_single(env_setup: Optional[dict] = None, switch_log_dir_override: Optional[str] = None) -> str:
     rows = [
         ("step_timeline.png", "*_step_metrics.jsonl", "mode별 collective step latency 시계열"),
         ("throughput_timeline.png", "*_step_metrics.jsonl", "mode별 collective throughput estimate 시계열"),
@@ -1076,7 +1124,7 @@ def build_visualization_plan_card_single(env_setup: Optional[dict] = None) -> st
         ("pressure_summary.png", "PROXY_B3_PRESSURE", "pressure score p50 / p95"),
         ("worker_window_trace_<MODE>.png", "WINDOW_CFG / DECISION / RECV events + worker step timing", "worker별 receiver W 변화를 collective step 축에 정렬"),
     ]
-    if env_setup and int(env_setup.get("switch_log_enable", 0) or 0) == 1:
+    if switch_log_dir_override or (env_setup and int(env_setup.get("switch_log_enable", 0) or 0) == 1):
         rows.append(("switch_overlay.png", "switch_log/*.jsonl + *_step_metrics.jsonl", "switch PFC/ROCE delta/sec 와 step latency overlay"))
     return render_plot_help_card("Visualization Plan", rows)
 
@@ -1224,7 +1272,12 @@ def build_worker_window_table(mode_item: dict) -> str:
     )
 
 
-def build_single_experiment_report(experiment_root: Path, output_dir: Path, top_events: int) -> Path:
+def build_single_experiment_report(
+    experiment_root: Path,
+    output_dir: Path,
+    top_events: int,
+    switch_log_dir_override: Optional[str] = None,
+) -> Path:
     log_progress(f"build single report start experiment={experiment_root.name}")
     env_setup = load_json(experiment_root / "env_setup.json") if (experiment_root / "env_setup.json").exists() else None
     mode_dirs = find_mode_dirs(experiment_root)
@@ -1276,7 +1329,7 @@ def build_single_experiment_report(experiment_root: Path, output_dir: Path, top_
     p_occ = save_occupancy_summary_plot(plots_dir / "occupancy_summary.png", mode_data)
     p_decision = save_decision_counts_plot(plots_dir / "decision_counts.png", mode_data)
     p_pressure = save_pressure_summary_plot(plots_dir / "pressure_summary.png", mode_data)
-    p_switch = save_switch_overlay_plot(plots_dir / "switch_overlay.png", experiment_root, env_setup, mode_data)
+    p_switch = save_switch_overlay_plot(plots_dir / "switch_overlay.png", experiment_root, env_setup, mode_data, switch_log_dir_override)
 
     worker_trace_paths = []
     for item in mode_data:
@@ -1317,10 +1370,12 @@ def build_single_experiment_report(experiment_root: Path, output_dir: Path, top_
         for key in ["placement", "collective", "nccl_algo", "nccl_proto", "run_modes", "payload_mb", "dtype", "policy_name", "policy_formula", "master_server", "switch_log_run_id", "switch_log_local_dir"]:
             if key in env_setup:
                 info_rows.append([key, env_setup[key]])
+    if switch_log_dir_override:
+        info_rows.append(["switch_log_override", switch_log_dir_override])
 
     sections = [
         '<section class="section"><h2>Experiment Metadata</h2>' + render_table(["field", "value"], info_rows) + "</section>",
-        '<section class="section"><div class="grid-2">' + build_collection_plan_card_single(experiment_root, mode_data, env_setup) + build_visualization_plan_card_single(env_setup) + "</div></section>",
+        '<section class="section"><div class="grid-2">' + build_collection_plan_card_single(experiment_root, mode_data, env_setup, switch_log_dir_override) + build_visualization_plan_card_single(env_setup, switch_log_dir_override) + "</div></section>",
         '<section class="section"><div class="grid-2">'
         + render_field_help_card("Run Summary Field Meanings", RUN_SUMMARY_FIELD_HELP, ["mode", "placement", "workload", "collective", "algo", "payload_mb", "step_ms_avg", "step_ms_p95", "collective_gbps_avg", "collective_gbps_p95", "delta_step_vs_stock_pct", "delta_bw_vs_stock_pct", "delta_occ_tr_vs_stock_pct", "delta_wstall_vs_stock_pct", "delta_step_vs_b2_pct", "delta_bw_vs_b2_pct"])
         + render_field_help_card("NCCL Summary Field Meanings", NCCL_SUMMARY_FIELD_HELP, ["total_events", "recv_wstall_count", "send_wstall_count", "p99_occ_pd", "p99_occ_tr", "w_eff_values", "decision_counts", "pressure_score_p95"])
@@ -1407,7 +1462,7 @@ def collect_matrix_rows(experiment_name: str, mode_rows: List[dict]) -> List[dic
     return rows
 
 
-def build_matrix_report(matrix_root: Path, output_dir: Path, top_events: int) -> Path:
+def build_matrix_report(matrix_root: Path, output_dir: Path, top_events: int, switch_log_dir_override: Optional[str] = None) -> Path:
     experiment_dirs = find_experiment_dirs(matrix_root)
     if not experiment_dirs:
         raise FileNotFoundError(f"no experiment directories found in {matrix_root}")
@@ -1419,7 +1474,7 @@ def build_matrix_report(matrix_root: Path, output_dir: Path, top_events: int) ->
     for experiment_dir in experiment_dirs:
         per_output = output_dir / experiment_dir.name
         per_output.mkdir(parents=True, exist_ok=True)
-        per_html = build_single_experiment_report(experiment_dir, per_output, top_events)
+        per_html = build_single_experiment_report(experiment_dir, per_output, top_events, switch_log_dir_override)
         per_experiment_links[experiment_dir.name] = relpath(per_html, output_dir)
         env_setup = load_json(experiment_dir / "env_setup.json") if (experiment_dir / "env_setup.json").exists() else None
         mode_data = [load_mode_data(mode_dir) for mode_dir in find_mode_dirs(experiment_dir)]
@@ -1540,9 +1595,9 @@ def main() -> None:
                 raise FileNotFoundError(f"zip archive is empty: {input_path}")
             extracted_root = temp_root / top_level_dirs[0]
             if is_matrix_root(extracted_root):
-                html_path = build_matrix_report(extracted_root, output_dir, args.top_events)
+                html_path = build_matrix_report(extracted_root, output_dir, args.top_events, args.switch_log_dir)
             else:
-                html_path = build_single_experiment_report(extracted_root, output_dir, args.top_events)
+                html_path = build_single_experiment_report(extracted_root, output_dir, args.top_events, args.switch_log_dir)
     else:
         output_dir = Path(args.output_dir).resolve() if args.output_dir else input_path / "report"
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1550,9 +1605,9 @@ def main() -> None:
         REPORT_LOG_PATH.write_text("", encoding="utf-8")
         log_progress(f"start input={input_path.as_posix()} output={output_dir.as_posix()}")
         if is_matrix_root(input_path):
-            html_path = build_matrix_report(input_path, output_dir, args.top_events)
+            html_path = build_matrix_report(input_path, output_dir, args.top_events, args.switch_log_dir)
         else:
-            html_path = build_single_experiment_report(input_path, output_dir, args.top_events)
+            html_path = build_single_experiment_report(input_path, output_dir, args.top_events, args.switch_log_dir)
 
     log_progress(f"wrote html={html_path.as_posix()}")
 

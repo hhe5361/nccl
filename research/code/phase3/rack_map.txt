@@ -1,0 +1,9 @@
+# hostname rack_id
+worker01 0
+worker02 0
+worker03 0
+worker04 0
+worker05 1
+worker06 1
+worker07 1
+worker08 1
