@@ -18,9 +18,19 @@
     "nproc_per_node": 1,
     "master_addr": "172.16.0.101",
     "master_port": 40000,
+    "network_topology_file": "research/env/network_topology_internal_ips.txt",
     "torch_env": "/workspace/venvs/torch-cu121-custom/bin/activate",
     "target_script": "research/code/phase2/collective_b2.py",
     "execution_model": "master_orchestrated_single_port",
+    "ssh_user_resolution": {
+      "default": "worker hostname itself",
+      "global_override_env": "WORKER_SSH_USER",
+      "per_worker_override_env": "WORKER_SSH_USER_MAP"
+    },
+    "ssh_host_resolution": {
+      "default": "resolve worker internal IP from [Workers] section in research/env/network_topology_internal_ips.txt",
+      "override_env": "NETWORK_TOPOLOGY_FILE"
+    },
     "container_model": {
       "helper_script": "research/code/deploy/run_dev_container.sh",
       "container_name": "nccl-cu121-dev",

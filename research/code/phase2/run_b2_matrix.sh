@@ -24,9 +24,11 @@ HOST_REPO_ROOT=${HOST_REPO_ROOT:-${REPO_ROOT}}
 REMOTE_REPO_ROOT=${REMOTE_REPO_ROOT:-${HOST_REPO_ROOT}}
 CONTAINER_REPO_ROOT=${CONTAINER_REPO_ROOT:-/workspace/$(basename "${REPO_ROOT}")}
 CONTAINER_NAME=${CONTAINER_NAME:-nccl-cu121-dev}
-WORKER_SSH_USER=${WORKER_SSH_USER:-$(id -un)}
+WORKER_SSH_USER=${WORKER_SSH_USER:-}
+WORKER_SSH_USER_MAP=${WORKER_SSH_USER_MAP:-}
 WORKER_SSH_PASSWORD=${WORKER_SSH_PASSWORD:-}
 SSH_CONNECT_TIMEOUT_SEC=${SSH_CONNECT_TIMEOUT_SEC:-10}
+NETWORK_TOPOLOGY_FILE=${NETWORK_TOPOLOGY_FILE:-${REPO_ROOT}/research/env/network_topology_internal_ips.txt}
 CONTAINER_RESET_AT_START=${CONTAINER_RESET_AT_START:-1}
 RESTART_CONTAINERS_ON_FAILURE=${RESTART_CONTAINERS_ON_FAILURE:-1}
 STOP_ON_FAILURE=${STOP_ON_FAILURE:-0}
@@ -74,23 +76,73 @@ require_sshpass() {
   fi
 }
 
+resolve_worker_ssh_user() {
+  local worker=$1
+  local mapping entry map_worker map_user
+  if [[ -n "${WORKER_SSH_USER_MAP}" ]]; then
+    IFS=',' read -r -a mapping <<< "${WORKER_SSH_USER_MAP}"
+    for entry in "${mapping[@]}"; do
+      map_worker=${entry%%=*}
+      map_user=${entry#*=}
+      if [[ "${map_worker}" == "${worker}" && -n "${map_user}" ]]; then
+        echo "${map_user}"
+        return 0
+      fi
+    done
+  fi
+  if [[ -n "${WORKER_SSH_USER}" ]]; then
+    echo "${WORKER_SSH_USER}"
+    return 0
+  fi
+  echo "${worker}"
+}
+
+resolve_worker_ssh_host() {
+  local worker=$1
+  local ssh_host
+  if [[ ! -f "${NETWORK_TOPOLOGY_FILE}" ]]; then
+    echo "[phase2-matrix] NETWORK_TOPOLOGY_FILE not found: ${NETWORK_TOPOLOGY_FILE}" >&2
+    return 1
+  fi
+  ssh_host=$(awk -v target="${worker}" '
+    /^\[Workers\]/ { in_workers=1; next }
+    /^\[/ && $0 !~ /^\[Workers\]/ { in_workers=0 }
+    in_workers && $1 == "-" {
+      gsub(":", "", $2)
+      if ($2 == target) {
+        print $3
+        exit
+      }
+    }
+  ' "${NETWORK_TOPOLOGY_FILE}")
+  if [[ -z "${ssh_host}" ]]; then
+    echo "[phase2-matrix] failed to resolve SSH host for worker=${worker} from ${NETWORK_TOPOLOGY_FILE}" >&2
+    return 1
+  fi
+  echo "${ssh_host}"
+}
+
 remote_worker_bash() {
   local worker=$1
   local cmd=$2
+  local ssh_user
+  local ssh_host
   if [[ "${worker}" == "${MASTER_SERVER}" ]]; then
     bash -lc "${cmd}"
     return
   fi
 
   require_sshpass
+  ssh_user=$(resolve_worker_ssh_user "${worker}")
+  ssh_host=$(resolve_worker_ssh_host "${worker}")
   if [[ -n "${WORKER_SSH_PASSWORD}" ]]; then
     sshpass -p "${WORKER_SSH_PASSWORD}" \
       ssh -o ConnectTimeout="${SSH_CONNECT_TIMEOUT_SEC}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-      "${WORKER_SSH_USER}@${worker}" \
+      "${ssh_user}@${ssh_host}" \
       "bash -lc $(printf '%q' "${cmd}")"
   else
     ssh -o ConnectTimeout="${SSH_CONNECT_TIMEOUT_SEC}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-      "${WORKER_SSH_USER}@${worker}" \
+      "${ssh_user}@${ssh_host}" \
       "bash -lc $(printf '%q' "${cmd}")"
   fi
 }
@@ -249,6 +301,8 @@ done
   echo "  \"mode_timeout_sec\": ${MODE_TIMEOUT_SEC},"
   echo "  \"worker_pool\": \"${ALL_WORKERS}\","
   echo "  \"execution_model\": \"master_orchestrated_single_port\","
+  echo "  \"network_topology_file\": \"${NETWORK_TOPOLOGY_FILE}\","
+  echo "  \"ssh_host_resolution\": \"resolve worker internal IP from [Workers] section in network topology file\","
   echo "  \"container_name\": \"${CONTAINER_NAME}\","
   echo "  \"container_reset_at_start\": ${CONTAINER_RESET_AT_START},"
   echo "  \"switch_log_enable\": ${SWITCH_LOG_ENABLE},"
@@ -316,6 +370,7 @@ for idx in "${!EXPERIMENT_IDS[@]}"; do
   CONTAINER_RESET_AT_START=0 \
   RESTART_CONTAINERS_ON_FAILURE="${RESTART_CONTAINERS_ON_FAILURE}" \
   WORKER_SSH_USER="${WORKER_SSH_USER}" \
+  WORKER_SSH_USER_MAP="${WORKER_SSH_USER_MAP}" \
   WORKER_SSH_PASSWORD="${WORKER_SSH_PASSWORD}" \
   SSH_CONNECT_TIMEOUT_SEC="${SSH_CONNECT_TIMEOUT_SEC}" \
   SWITCH_LOG_ENABLE="${SWITCH_LOG_ENABLE}" \
