@@ -312,7 +312,7 @@ for idx in "${!EXPERIMENT_IDS[@]}"; do
   exp_root="${MATRIX_ROOT}/$(printf "%02d_%s" "$((idx+1))" "${exp_id}")"
   status_dir="${MATRIX_ROOT}/.matrix_status/$(printf "%02d_%s" "$((idx+1))" "${exp_id}")"
   status_file="${status_dir}/${WORKER_NAME}.status"
-  port_base=$((MASTER_PORT_BASE + idx * 10))
+  port_base=$((MASTER_PORT_BASE + idx))
 
   mkdir -p "${status_dir}"
   rm -f "${status_file}"
