@@ -7,6 +7,7 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/../../.." && pwd)
 RUN_ID=${RUN_ID:-phase3_b3_matrix_$(date +%y%m%d_%H%M%S)}
 MASTER_ADDR=${MASTER_ADDR:-172.16.0.101}
 MASTER_PORT_BASE=${MASTER_PORT_BASE:-32500}
+PORT_STRIDE=${PORT_STRIDE:-10}
 LOG_ROOT_BASE=${LOG_ROOT_BASE:-/mnt/nfs_share/cts_experiments}
 MATRIX_ROOT=${MATRIX_ROOT:-${LOG_ROOT_BASE}/${RUN_ID}}
 ALL_WORKERS=${ALL_WORKERS:-worker01,worker02,worker03,worker04,worker05,worker06,worker07,worker08}
@@ -313,6 +314,7 @@ echo "[phase3-matrix-new] WORKER_NAME=${WORKER_NAME}"
 echo "[phase3-matrix-new] MASTER_SERVER=${MASTER_SERVER}"
 echo "[phase3-matrix-new] MATRIX_ROOT=${MATRIX_ROOT}"
 echo "[phase3-matrix-new] TOTAL_EXPERIMENTS=${#EXPERIMENT_IDS[@]}"
+echo "[phase3-matrix-new] PORT_STRIDE=${PORT_STRIDE}"
 if [[ "${SWITCH_LOG_ENABLE}" == "1" ]]; then
   echo "[phase3-matrix-new] SWITCH_METADATA_FILE=${SWITCH_METADATA_FILE}"
 fi
@@ -327,7 +329,7 @@ for idx in "${!EXPERIMENT_IDS[@]}"; do
   exp_root="${MATRIX_ROOT}/$(printf "%02d_%s" "$((idx+1))" "${exp_id}")"
   status_dir="${MATRIX_ROOT}/.matrix_status/$(printf "%02d_%s" "$((idx+1))" "${exp_id}")"
   status_file="${status_dir}/${WORKER_NAME}.status"
-  port_base=$((MASTER_PORT_BASE + idx))
+  port_base=$((MASTER_PORT_BASE + idx * PORT_STRIDE))
 
   mkdir -p "${status_dir}"
   rm -f "${status_file}"
