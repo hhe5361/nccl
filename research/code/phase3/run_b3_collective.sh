@@ -185,7 +185,7 @@ if [[ "${NODE_RANK}" == "0" ]]; then
   "master_server": "${MASTER_SERVER}",
   "policy_name": "runtime_receiver_b3",
   "policy_formula": "W_eff = clamp(W_min, W_base, min(W_sem, W_fb))",
-  "w_sem_rule": "B2 semantic prior: inter-rack +1, alltoall +1, tree +1",
+  "w_sem_rule": "B2 semantic prior: alltoall +1, tree +1",
   "w_fb_rule": "fast decrease / slow increase with pressure score over occTr, recvLag, completionDelay",
   "w_min_rule": "2 if collAPI == AllToAll else 4",
   "w_max_rule": "stock baseline",

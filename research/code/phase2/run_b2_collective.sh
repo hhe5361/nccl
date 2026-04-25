@@ -182,11 +182,11 @@ if [[ "${NODE_RANK}" == "0" ]]; then
   "nccl_proto": "${PROTO_SETTING}",
   "rack_map_file": "${RACK_MAP_FILE}",
   "master_server": "${MASTER_SERVER}",
-  "policy_name": "rack_aware_semantic_static_b2",
-  "policy_formula": "W_eff = clamp(W_min, W_base, W_base - (interRack + alltoall + tree))",
+  "policy_name": "semantic_static_b2",
+  "policy_formula": "W_eff = clamp(W_min, W_base, W_base - (alltoall + tree))",
   "w_min_rule": "2 if collAPI == AllToAll else 4",
   "w_max_rule": "stock baseline",
-  "b2_penalty_rule": "topology +1, collAPI +1, tree +1"${SWITCH_ENV_JSON}
+  "b2_penalty_rule": "collAPI +1, tree +1"${SWITCH_ENV_JSON}
 }
 EOF2
 fi

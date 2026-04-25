@@ -720,6 +720,8 @@ static inline struct phase2WindowDecision phase2SelectWindow(
     struct ncclProxyState* proxyState,
     struct ncclProxyArgs* args,
     struct ncclProxySubArgs* sub) {
+  (void)proxyState;
+  (void)sub;
   struct phase2WindowDecision decision;
   memset(&decision, 0, sizeof(decision));
   decision.enabled = ncclParamPhase2B2Enable() != 0;
@@ -731,22 +733,12 @@ static inline struct phase2WindowDecision phase2SelectWindow(
   decision.wRaw = decision.wBase;
   decision.wEff = decision.wBase;
 
-  if (phase1WindowCfg() > 0 || proxyState == NULL || sub == NULL) return decision;
+  if (phase1WindowCfg() > 0) return decision;
 
-  struct ncclComm* comm = proxyState->comm;
-  if (comm == NULL || comm->peerInfo == NULL) return decision;
-  if (sub->peer < 0 || sub->peer >= comm->nRanks) return decision;
-
-  decision.rackSelf = comm->peerInfo[comm->rank].rackId;
-  decision.rackPeer = comm->peerInfo[sub->peer].rackId;
-  decision.rackKnown = (decision.rackSelf >= 0 && decision.rackPeer >= 0);
-  decision.interRack = decision.rackKnown && (decision.rackSelf != decision.rackPeer);
-
-  if (decision.interRack) decision.penaltyTopo = 1;
   if (args->collAPI == ncclFuncAlltoAll) decision.penaltyColl = 1;
   if (args->algorithm == NCCL_ALGO_TREE) decision.penaltyAlgo = 1;
 
-  decision.penaltyTotal = decision.penaltyTopo + decision.penaltyColl + decision.penaltyAlgo;
+  decision.penaltyTotal = decision.penaltyColl + decision.penaltyAlgo;
   decision.wRaw = decision.wBase - decision.penaltyTotal;
   decision.wEff = std::min(decision.wMax, std::max(decision.wMin, decision.wRaw));
   return decision;
