@@ -141,6 +141,74 @@ emit_switch_marker() {
   remote_dpu_bash "${cmd}" >/dev/null
 }
 
+report_port_owners() {
+  local port=$1
+  echo "[phase2] rendezvous port inspection port=${port}"
+
+  if command -v ss >/dev/null 2>&1; then
+    echo "[phase2] ss -ltnp for port ${port}:"
+    ss -ltnp 2>/dev/null | awk -v port=":${port}" '
+      NR == 1 || index($4, port) {
+        print
+      }
+    ' || true
+  else
+    echo "[phase2] ss not found; skipping ss inspection"
+  fi
+
+  if command -v lsof >/dev/null 2>&1; then
+    echo "[phase2] lsof listener details for port ${port}:"
+    lsof -nP -iTCP:"${port}" -sTCP:LISTEN || true
+  else
+    echo "[phase2] lsof not found; skipping lsof inspection"
+  fi
+
+  if command -v fuser >/dev/null 2>&1; then
+    local pids
+    pids=$(fuser -n tcp "${port}" 2>/dev/null || true)
+    if [[ -n "${pids}" ]]; then
+      echo "[phase2] fuser pids for port ${port}: ${pids}"
+      for pid in ${pids}; do
+        if [[ "${pid}" =~ ^[0-9]+$ ]]; then
+          echo "[phase2] ps details for pid=${pid}:"
+          ps -fp "${pid}" || true
+        fi
+      done
+    else
+      echo "[phase2] fuser found no pids for port ${port}"
+    fi
+  else
+    echo "[phase2] fuser not found; skipping pid lookup"
+  fi
+}
+
+ensure_master_port_available() {
+  local port=$1
+  if [[ "${NODE_RANK}" != "0" ]]; then
+    return 0
+  fi
+
+  local in_use=0
+  if command -v ss >/dev/null 2>&1; then
+    if ss -ltn 2>/dev/null | awk -v port=":${port}" 'index($4, port) { found=1 } END { exit(found ? 0 : 1) }'; then
+      in_use=1
+    fi
+  elif command -v lsof >/dev/null 2>&1; then
+    if lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1; then
+      in_use=1
+    fi
+  fi
+
+  if (( in_use == 1 )); then
+    echo "[phase2] ERROR: rendezvous port already in use before launch port=${port}"
+    report_port_owners "${port}"
+    return 1
+  fi
+
+  echo "[phase2] rendezvous port available port=${port}"
+  return 0
+}
+
 case "${COLLECTIVE}" in
   allreduce|allgather|reducescatter|alltoall) ;;
   *)
@@ -234,8 +302,10 @@ for idx in "${!MODE_VALUES[@]}"; do
 
   echo "[phase2] starting MODE=${MODE} MASTER_PORT=${MASTER_PORT} STATIC_W=${NCCL_PHASE1_STATIC_W}"
   echo "[phase2] NCCL_DEBUG_FILE=${NCCL_DEBUG_FILE}"
+  ensure_master_port_available "${MASTER_PORT}"
   emit_switch_marker "mode_start" "run_id=${RUN_ID} mode=${MODE_UPPER} collective=${COLLECTIVE} algo=${ALGO_SETTING} payload_mb=${PAYLOAD_MB} static_w=${NCCL_PHASE1_STATIC_W}" "phase2_collective"
 
+  set +e
   "${LAUNCHER[@]}" \
     --nnodes="${NNODES}" \
     --nproc_per_node="${NPROC_PER_NODE}" \
@@ -252,6 +322,16 @@ for idx in "${!MODE_VALUES[@]}"; do
     --output-dir "${RUN_ROOT}" \
     --tag "${MODE_UPPER}" \
     "$@"
+  run_rc=$?
+  set -e
+
+  if (( run_rc != 0 )); then
+    echo "[phase2] ERROR: launcher failed mode=${MODE} master_port=${MASTER_PORT} rc=${run_rc}"
+    if [[ "${NODE_RANK}" == "0" ]]; then
+      report_port_owners "${MASTER_PORT}"
+    fi
+    exit "${run_rc}"
+  fi
 
   emit_switch_marker "mode_end" "run_id=${RUN_ID} mode=${MODE_UPPER} collective=${COLLECTIVE} algo=${ALGO_SETTING} payload_mb=${PAYLOAD_MB} static_w=${NCCL_PHASE1_STATIC_W}" "phase2_collective"
   sleep 2
