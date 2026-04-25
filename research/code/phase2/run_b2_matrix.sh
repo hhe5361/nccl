@@ -5,22 +5,31 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/../../.." && pwd)
 
 RUN_ID=${RUN_ID:-phase2_b2_matrix_$(date +%y%m%d_%H%M%S)}
+MASTER_SERVER=${MASTER_SERVER:-worker01}
 MASTER_ADDR=${MASTER_ADDR:-172.16.0.101}
-MASTER_PORT_BASE=${MASTER_PORT_BASE:-31500}
-PORT_STRIDE=${PORT_STRIDE:-20}
+MASTER_PORT=${MASTER_PORT:-${MASTER_PORT_BASE:-40000}}
 LOG_ROOT_BASE=${LOG_ROOT_BASE:-/mnt/nfs_share/cts_experiments}
 MATRIX_ROOT=${MATRIX_ROOT:-${LOG_ROOT_BASE}/${RUN_ID}}
-ALL_WORKERS=${ALL_WORKERS:-worker01,worker03,worker05,worker07}
+ALL_WORKERS=${ALL_WORKERS:-worker01,worker02,worker03,worker04,worker05,worker06,worker07,worker08}
 PAYLOAD_MB=${PAYLOAD_MB:-128}
 RUN_MODES=${RUN_MODES:-stock,b2_w2,b2_w4,b2_w5,b2_w6,b2_w7,b2_w8}
 DTYPE=${DTYPE:-float32}
 STEPS=${STEPS:-40}
 WARMUP_STEPS=${WARMUP_STEPS:-5}
 SLEEP_MS=${SLEEP_MS:-0}
+MODE_TIMEOUT_SEC=${MODE_TIMEOUT_SEC:-600}
 TORCH_ENV=${TORCH_ENV:-/workspace/venvs/torch-cu121-custom/bin/activate}
 INNER_SCRIPT=${INNER_SCRIPT:-research/code/phase2/run_b2_collective.sh}
-WORKER_NAME=${WORKER_NAME:-$(hostname -s)}
-MASTER_SERVER=${MASTER_SERVER:-worker01}
+HOST_REPO_ROOT=${HOST_REPO_ROOT:-${REPO_ROOT}}
+REMOTE_REPO_ROOT=${REMOTE_REPO_ROOT:-${HOST_REPO_ROOT}}
+CONTAINER_REPO_ROOT=${CONTAINER_REPO_ROOT:-/workspace/$(basename "${REPO_ROOT}")}
+CONTAINER_NAME=${CONTAINER_NAME:-nccl-cu121-dev}
+WORKER_SSH_USER=${WORKER_SSH_USER:-$(id -un)}
+WORKER_SSH_PASSWORD=${WORKER_SSH_PASSWORD:-}
+SSH_CONNECT_TIMEOUT_SEC=${SSH_CONNECT_TIMEOUT_SEC:-10}
+CONTAINER_RESET_AT_START=${CONTAINER_RESET_AT_START:-1}
+RESTART_CONTAINERS_ON_FAILURE=${RESTART_CONTAINERS_ON_FAILURE:-1}
+STOP_ON_FAILURE=${STOP_ON_FAILURE:-0}
 
 SWITCH_LOG_ENABLE=${SWITCH_LOG_ENABLE:-1}
 DPU_NODE_HOST=${DPU_NODE_HOST:-172.16.0.100}
@@ -32,66 +41,63 @@ SWITCH_METADATA_FILE=${SWITCH_METADATA_FILE:-${MATRIX_ROOT}/switch_logger.env}
 
 mkdir -p "${MATRIX_ROOT}"
 
+if ! command -v docker >/dev/null 2>&1; then
+  echo "[phase2-matrix] docker is required on the master host." >&2
+  exit 1
+fi
+
+if [[ "$(hostname -s)" != "${MASTER_SERVER}" ]]; then
+  echo "[phase2-matrix] run this script on ${MASTER_SERVER}. current host=$(hostname -s)" >&2
+  exit 1
+fi
+
 IFS=',' read -r -a ALL_WORKER_ARRAY <<< "${ALL_WORKERS}"
 
-contains_worker() {
-  local worker=$1
-  local list=$2
-  local item
-  IFS=',' read -r -a _items <<< "${list}"
-  for item in "${_items[@]}"; do
-    if [[ "${item}" == "${worker}" ]]; then
-      return 0
-    fi
-  done
-  return 1
-}
+if (( ${#ALL_WORKER_ARRAY[@]} == 0 )); then
+  echo "[phase2-matrix] ALL_WORKERS is empty." >&2
+  exit 1
+fi
 
-index_in_list() {
-  local worker=$1
-  local list=$2
-  local idx=0
-  local item
-  IFS=',' read -r -a _items <<< "${list}"
-  for item in "${_items[@]}"; do
-    if [[ "${item}" == "${worker}" ]]; then
-      echo "${idx}"
-      return 0
-    fi
-    idx=$((idx + 1))
-  done
-  return 1
-}
-
-count_in_list() {
-  local list=$1
-  local count=0
-  local item
-  IFS=',' read -r -a _items <<< "${list}"
-  for item in "${_items[@]}"; do
-    [[ -n "${item}" ]] && count=$((count + 1))
-  done
-  echo "${count}"
-}
-
-is_master_server() {
-  [[ "${WORKER_NAME}" == "${MASTER_SERVER}" || "$(hostname -f 2>/dev/null || true)" == "${MASTER_SERVER}" || "$(hostname -s 2>/dev/null || true)" == "${MASTER_SERVER}" ]]
-}
+if [[ "${ALL_WORKER_ARRAY[0]}" != "${MASTER_SERVER}" ]]; then
+  echo "[phase2-matrix] ALL_WORKERS must start with MASTER_SERVER=${MASTER_SERVER}." >&2
+  exit 1
+fi
 
 require_sshpass() {
-  if ! command -v sshpass >/dev/null 2>&1; then
-    echo "[phase2-matrix] sshpass is required for switch logger integration." >&2
+  if [[ -n "${WORKER_SSH_PASSWORD}" || "${SWITCH_LOG_ENABLE}" == "1" ]] && ! command -v sshpass >/dev/null 2>&1; then
+    echo "[phase2-matrix] sshpass is required when WORKER_SSH_PASSWORD is set or switch logging is enabled." >&2
     exit 1
+  fi
+  if [[ "${SWITCH_LOG_ENABLE}" == "1" && ! -n "${DPU_NODE_PWD:-}" ]]; then
+    echo "[phase2-matrix] DPU_NODE_PWD must be set when SWITCH_LOG_ENABLE=1." >&2
+    exit 1
+  fi
+}
+
+remote_worker_bash() {
+  local worker=$1
+  local cmd=$2
+  if [[ "${worker}" == "${MASTER_SERVER}" ]]; then
+    bash -lc "${cmd}"
+    return
+  fi
+
+  require_sshpass
+  if [[ -n "${WORKER_SSH_PASSWORD}" ]]; then
+    sshpass -p "${WORKER_SSH_PASSWORD}" \
+      ssh -o ConnectTimeout="${SSH_CONNECT_TIMEOUT_SEC}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      "${WORKER_SSH_USER}@${worker}" \
+      "bash -lc $(printf '%q' "${cmd}")"
+  else
+    ssh -o ConnectTimeout="${SSH_CONNECT_TIMEOUT_SEC}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      "${WORKER_SSH_USER}@${worker}" \
+      "bash -lc $(printf '%q' "${cmd}")"
   fi
 }
 
 remote_dpu_bash() {
   local cmd=$1
   require_sshpass
-  if [[ -z "${DPU_NODE_PWD:-}" ]]; then
-    echo "[phase2-matrix] DPU_NODE_PWD must be set when SWITCH_LOG_ENABLE=1 on MASTER_SERVER." >&2
-    exit 1
-  fi
   sshpass -p "${DPU_NODE_PWD}" \
     ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "${DPU_NODE_USER}@${DPU_NODE_HOST}" \
@@ -107,34 +113,14 @@ SWITCH_LOG_MARKERS_JSONL=
 CLEANUP_DONE=0
 
 write_switch_metadata() {
-  cat > "${SWITCH_METADATA_FILE}" <<EOF2
+  cat > "${SWITCH_METADATA_FILE}" <<EOF
 SWITCH_LOG_ENABLE=${SWITCH_LOG_ENABLE}
-SWITCH_LOG_RUN_ID=$(printf '%q' "${SWITCH_LOG_RUN_ID}")
-SWITCH_LOG_DIR=$(printf '%q' "${SWITCH_LOG_DIR}")
-SWITCH_LOG_LOCAL_DIR=$(printf '%q' "${SWITCH_LOG_LOCAL_DIR}")
-SWITCH_LOG_PID_FILE=$(printf '%q' "${SWITCH_LOG_PID_FILE}")
-SWITCH_LOG_MARKERS_JSONL=$(printf '%q' "${SWITCH_LOG_MARKERS_JSONL}")
-DPU_NODE_HOST=$(printf '%q' "${DPU_NODE_HOST}")
-DPU_NODE_USER=$(printf '%q' "${DPU_NODE_USER}")
-SWITCH_LOGGER_ROOT=$(printf '%q' "${SWITCH_LOGGER_ROOT}")
-SWITCH_LOG_SHARED_ROOT=$(printf '%q' "${SWITCH_LOG_SHARED_ROOT}")
-MASTER_SERVER=$(printf '%q' "${MASTER_SERVER}")
-EOF2
-}
-
-wait_for_switch_metadata() {
-  local timeout_sec=${1:-120}
-  local waited=0
-  while [[ ! -f "${SWITCH_METADATA_FILE}" ]]; do
-    if (( waited >= timeout_sec )); then
-      echo "[phase2-matrix] timed out waiting for switch metadata file ${SWITCH_METADATA_FILE}" >&2
-      exit 1
-    fi
-    sleep 2
-    waited=$((waited + 2))
-  done
-  # shellcheck disable=SC1090
-  source "${SWITCH_METADATA_FILE}"
+SWITCH_LOG_RUN_ID=${SWITCH_LOG_RUN_ID}
+SWITCH_LOG_DIR=${SWITCH_LOG_DIR}
+SWITCH_LOG_LOCAL_DIR=${SWITCH_LOG_LOCAL_DIR}
+SWITCH_LOG_PID_FILE=${SWITCH_LOG_PID_FILE}
+SWITCH_LOG_MARKERS_JSONL=${SWITCH_LOG_MARKERS_JSONL}
+EOF
 }
 
 start_switch_logger() {
@@ -162,7 +148,7 @@ start_switch_logger() {
   SWITCH_LOG_LOCAL_DIR="${SWITCH_LOG_SHARED_ROOT}/${SWITCH_LOG_RUN_ID}"
   write_switch_metadata
   SWITCH_LOG_STARTED=1
-  echo "[phase2-matrix] switch logger started run_id=${SWITCH_LOG_RUN_ID} log_dir=${SWITCH_LOG_DIR} local_dir=${SWITCH_LOG_LOCAL_DIR}"
+  echo "[phase2-matrix] switch logger started run_id=${SWITCH_LOG_RUN_ID} local_dir=${SWITCH_LOG_LOCAL_DIR}"
 }
 
 emit_switch_marker() {
@@ -192,26 +178,29 @@ stop_switch_logger() {
   echo "[phase2-matrix] switch logger stopped run_id=${SWITCH_LOG_RUN_ID}"
 }
 
+prepare_worker_container() {
+  local worker=$1
+  local cmd
+  if [[ "${CONTAINER_RESET_AT_START}" == "1" ]]; then
+    cmd="docker rm -f $(printf '%q' "${CONTAINER_NAME}") >/dev/null 2>&1 || true; cd $(printf '%q' "${REMOTE_REPO_ROOT}") && ./research/code/deploy/run_dev_container.sh true >/dev/null"
+  else
+    cmd="cd $(printf '%q' "${REMOTE_REPO_ROOT}") && ./research/code/deploy/run_dev_container.sh true >/dev/null"
+  fi
+  echo "[phase2-matrix] prepare container worker=${worker} reset=${CONTAINER_RESET_AT_START}"
+  remote_worker_bash "${worker}" "${cmd}"
+}
+
 cleanup() {
   if (( CLEANUP_DONE == 1 )); then
     return 0
   fi
   CLEANUP_DONE=1
-  if (( SWITCH_LOG_STARTED == 1 )) && is_master_server; then
+  if (( SWITCH_LOG_STARTED == 1 )); then
     emit_switch_marker_best_effort "matrix_end" "run_id=${RUN_ID}" "phase2_matrix"
     stop_switch_logger
   fi
 }
 trap cleanup EXIT INT TERM
-
-if [[ "${SWITCH_LOG_ENABLE}" == "1" ]]; then
-  if is_master_server; then
-    start_switch_logger
-    emit_switch_marker "matrix_start" "run_id=${RUN_ID}" "phase2_matrix"
-  else
-    wait_for_switch_metadata
-  fi
-fi
 
 EXPERIMENT_IDS=()
 EXPERIMENT_COLLS=()
@@ -230,34 +219,51 @@ add_experiment "reducescatter_auto_${PAYLOAD_MB}mb" "reducescatter" "auto"
 add_experiment "alltoall_auto_${PAYLOAD_MB}mb" "alltoall" "auto"
 
 MANIFEST_JSON="${MATRIX_ROOT}/matrix_manifest.json"
-if is_master_server; then
-  {
-    echo "{"
-    echo "  \"run_id\": \"${RUN_ID}\","
-    echo "  \"master_addr\": \"${MASTER_ADDR}\","
-    echo "  \"master_port_base\": ${MASTER_PORT_BASE},"
-    echo "  \"port_stride\": ${PORT_STRIDE},"
-    echo "  \"run_modes\": \"${RUN_MODES}\","
-    echo "  \"dtype\": \"${DTYPE}\","
-    echo "  \"payload_mb\": ${PAYLOAD_MB},"
-    echo "  \"steps\": ${STEPS},"
-    echo "  \"warmup_steps\": ${WARMUP_STEPS},"
-    echo "  \"worker_pool\": \"${ALL_WORKERS}\","
-    echo "  \"switch_log_enable\": ${SWITCH_LOG_ENABLE},"
-    if [[ "${SWITCH_LOG_ENABLE}" == "1" && -f "${SWITCH_METADATA_FILE}" ]]; then
-      # shellcheck disable=SC1090
-      source "${SWITCH_METADATA_FILE}"
-      echo "  \"switch_log_run_id\": \"${SWITCH_LOG_RUN_ID}\","
-      echo "  \"switch_log_dir\": \"${SWITCH_LOG_DIR}\","
-      echo "  \"switch_log_local_dir\": \"${SWITCH_LOG_LOCAL_DIR}\","
+
+echo "[phase2-matrix] RUN_ID=${RUN_ID}"
+echo "[phase2-matrix] MASTER_SERVER=${MASTER_SERVER} MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT}"
+echo "[phase2-matrix] WORKERS=${ALL_WORKERS}"
+echo "[phase2-matrix] TOTAL_EXPERIMENTS=${#EXPERIMENT_IDS[@]}"
+echo "[phase2-matrix] MATRIX_ROOT=${MATRIX_ROOT}"
+
+if [[ "${SWITCH_LOG_ENABLE}" == "1" ]]; then
+  start_switch_logger
+  emit_switch_marker "matrix_start" "run_id=${RUN_ID}" "phase2_matrix"
+fi
+
+for worker in "${ALL_WORKER_ARRAY[@]}"; do
+  prepare_worker_container "${worker}"
+done
+
+{
+  echo "{"
+  echo "  \"run_id\": \"${RUN_ID}\","
+  echo "  \"master_server\": \"${MASTER_SERVER}\","
+  echo "  \"master_addr\": \"${MASTER_ADDR}\","
+  echo "  \"master_port\": ${MASTER_PORT},"
+  echo "  \"run_modes\": \"${RUN_MODES}\","
+  echo "  \"dtype\": \"${DTYPE}\","
+  echo "  \"payload_mb\": ${PAYLOAD_MB},"
+  echo "  \"steps\": ${STEPS},"
+  echo "  \"warmup_steps\": ${WARMUP_STEPS},"
+  echo "  \"mode_timeout_sec\": ${MODE_TIMEOUT_SEC},"
+  echo "  \"worker_pool\": \"${ALL_WORKERS}\","
+  echo "  \"execution_model\": \"master_orchestrated_single_port\","
+  echo "  \"container_name\": \"${CONTAINER_NAME}\","
+  echo "  \"container_reset_at_start\": ${CONTAINER_RESET_AT_START},"
+  echo "  \"switch_log_enable\": ${SWITCH_LOG_ENABLE},"
+  if [[ "${SWITCH_LOG_ENABLE}" == "1" ]]; then
+    echo "  \"switch_log_run_id\": \"${SWITCH_LOG_RUN_ID}\","
+    echo "  \"switch_log_dir\": \"${SWITCH_LOG_DIR}\","
+    echo "  \"switch_log_local_dir\": \"${SWITCH_LOG_LOCAL_DIR}\","
+  fi
+  echo "  \"experiments\": ["
+  for idx in "${!EXPERIMENT_IDS[@]}"; do
+    comma=","
+    if (( idx == ${#EXPERIMENT_IDS[@]} - 1 )); then
+      comma=""
     fi
-    echo "  \"experiments\": ["
-    for idx in "${!EXPERIMENT_IDS[@]}"; do
-      comma=","
-      if (( idx == ${#EXPERIMENT_IDS[@]} - 1 )); then
-        comma=""
-      fi
-      cat <<EOF
+    cat <<EOF
     {
       "index": ${idx},
       "id": "${EXPERIMENT_IDS[$idx]}",
@@ -266,110 +272,81 @@ if is_master_server; then
       "payload_mb": ${PAYLOAD_MB}
     }${comma}
 EOF
-    done
-    echo "  ]"
-    echo "}"
-  } > "${MANIFEST_JSON}"
-fi
+  done
+  echo "  ]"
+  echo "}"
+} > "${MANIFEST_JSON}"
 
-echo "[phase2-matrix] RUN_ID=${RUN_ID}"
-echo "[phase2-matrix] WORKER_NAME=${WORKER_NAME}"
-echo "[phase2-matrix] MASTER_SERVER=${MASTER_SERVER}"
-echo "[phase2-matrix] MATRIX_ROOT=${MATRIX_ROOT}"
-echo "[phase2-matrix] TOTAL_EXPERIMENTS=${#EXPERIMENT_IDS[@]}"
-echo "[phase2-matrix] PORT_STRIDE=${PORT_STRIDE}"
-
+overall_rc=0
 for idx in "${!EXPERIMENT_IDS[@]}"; do
   exp_id=${EXPERIMENT_IDS[$idx]}
   exp_coll=${EXPERIMENT_COLLS[$idx]}
   exp_algo=${EXPERIMENT_ALGOS[$idx]}
-  exp_nodes=$(count_in_list "${ALL_WORKERS}")
   exp_root="${MATRIX_ROOT}/$(printf "%02d_%s" "$((idx+1))" "${exp_id}")"
   status_dir="${MATRIX_ROOT}/.matrix_status/$(printf "%02d_%s" "$((idx+1))" "${exp_id}")"
-  status_file="${status_dir}/${WORKER_NAME}.status"
-  port_base=$((MASTER_PORT_BASE + idx * PORT_STRIDE))
-
   mkdir -p "${status_dir}"
-  rm -f "${status_file}"
 
-  if is_master_server && [[ "${SWITCH_LOG_ENABLE}" == "1" ]]; then
-    emit_switch_marker_best_effort "exp_start" "experiment=${exp_id} collective=${exp_coll} algo=${exp_algo} payload_mb=${PAYLOAD_MB}" "phase2_matrix"
-  fi
+  echo "[phase2-matrix] ============================================================"
+  echo "[phase2-matrix] start idx=${idx} id=${exp_id} coll=${exp_coll} algo=${exp_algo} payload=${PAYLOAD_MB}MB"
+  emit_switch_marker_best_effort "exp_start" "experiment=${exp_id} collective=${exp_coll} algo=${exp_algo} payload_mb=${PAYLOAD_MB}" "phase2_matrix"
 
-  run_rc=0
-  if contains_worker "${WORKER_NAME}" "${ALL_WORKERS}"; then
-    exp_rank=$(index_in_list "${WORKER_NAME}" "${ALL_WORKERS}")
-    echo "[phase2-matrix] start idx=${idx} id=${exp_id} rank=${exp_rank}/${exp_nodes} coll=${exp_coll} algo=${exp_algo} payload=${PAYLOAD_MB}MB"
-    set +e
-    RUN_ID="${exp_id}" \
-    LOG_ROOT="${exp_root}" \
-    MASTER_ADDR="${MASTER_ADDR}" \
-    MASTER_PORT_BASE="${port_base}" \
-    NNODES="${exp_nodes}" \
-    NPROC_PER_NODE=1 \
-    NODE_RANK="${exp_rank}" \
-    WORKER_NAME="${WORKER_NAME}" \
-    MASTER_SERVER="${MASTER_SERVER}" \
-    SWITCH_LOG_ENABLE="${SWITCH_LOG_ENABLE}" \
-    SWITCH_METADATA_FILE="${SWITCH_METADATA_FILE}" \
-    DPU_NODE_HOST="${DPU_NODE_HOST}" \
-    DPU_NODE_USER="${DPU_NODE_USER}" \
-    SWITCH_LOGGER_ROOT="${SWITCH_LOGGER_ROOT}" \
-    SWITCH_LOG_SHARED_ROOT="${SWITCH_LOG_SHARED_ROOT}" \
-    SWITCH_LOG_LOCAL_DIR="${SWITCH_LOG_LOCAL_DIR}" \
-    COLLECTIVE="${exp_coll}" \
-    EXPERIMENT_LABEL="${exp_id}" \
-    RUN_MODES="${RUN_MODES}" \
-    PAYLOAD_MB="${PAYLOAD_MB}" \
-    DTYPE="${DTYPE}" \
-    STEPS="${STEPS}" \
-    WARMUP_STEPS="${WARMUP_STEPS}" \
-    SLEEP_MS="${SLEEP_MS}" \
-    NCCL_ALGO="${exp_algo}" \
-    NCCL_PROTO="auto" \
-    TORCH_ENV="${TORCH_ENV}" \
-    bash "${REPO_ROOT}/${INNER_SCRIPT}"
-    run_rc=$?
-    set -e
-  fi
+  set +e
+  RUN_ID="${exp_id}" \
+  EXPERIMENT_LABEL="${exp_id}" \
+  LOG_ROOT="${exp_root}" \
+  MASTER_SERVER="${MASTER_SERVER}" \
+  MASTER_ADDR="${MASTER_ADDR}" \
+  MASTER_PORT="${MASTER_PORT}" \
+  ALL_WORKERS="${ALL_WORKERS}" \
+  RUN_MODES="${RUN_MODES}" \
+  COLLECTIVE="${exp_coll}" \
+  PAYLOAD_MB="${PAYLOAD_MB}" \
+  DTYPE="${DTYPE}" \
+  STEPS="${STEPS}" \
+  WARMUP_STEPS="${WARMUP_STEPS}" \
+  SLEEP_MS="${SLEEP_MS}" \
+  MODE_TIMEOUT_SEC="${MODE_TIMEOUT_SEC}" \
+  NCCL_ALGO="${exp_algo}" \
+  NCCL_PROTO="auto" \
+  TORCH_ENV="${TORCH_ENV}" \
+  HOST_REPO_ROOT="${HOST_REPO_ROOT}" \
+  REMOTE_REPO_ROOT="${REMOTE_REPO_ROOT}" \
+  CONTAINER_REPO_ROOT="${CONTAINER_REPO_ROOT}" \
+  CONTAINER_NAME="${CONTAINER_NAME}" \
+  CONTAINER_RESET_AT_START=0 \
+  RESTART_CONTAINERS_ON_FAILURE="${RESTART_CONTAINERS_ON_FAILURE}" \
+  WORKER_SSH_USER="${WORKER_SSH_USER}" \
+  WORKER_SSH_PASSWORD="${WORKER_SSH_PASSWORD}" \
+  SSH_CONNECT_TIMEOUT_SEC="${SSH_CONNECT_TIMEOUT_SEC}" \
+  SWITCH_LOG_ENABLE="${SWITCH_LOG_ENABLE}" \
+  SWITCH_METADATA_FILE="${SWITCH_METADATA_FILE}" \
+  DPU_NODE_HOST="${DPU_NODE_HOST}" \
+  DPU_NODE_USER="${DPU_NODE_USER}" \
+  DPU_NODE_PWD="${DPU_NODE_PWD:-}" \
+  SWITCH_LOGGER_ROOT="${SWITCH_LOGGER_ROOT}" \
+  SWITCH_LOG_SHARED_ROOT="${SWITCH_LOG_SHARED_ROOT}" \
+  bash "${REPO_ROOT}/${INNER_SCRIPT}"
+  run_rc=$?
+  set -e
 
   {
     echo "rc=${run_rc}"
-  } > "${status_file}"
+    echo "experiment=${exp_id}"
+    echo "updated_at=$(date +%s)"
+  } > "${status_dir}/summary.status"
 
-  while true; do
-    ready=1
-    for worker in "${ALL_WORKER_ARRAY[@]}"; do
-      if [[ ! -f "${status_dir}/${worker}.status" ]]; then
-        ready=0
-        break
-      fi
-    done
-    if (( ready == 1 )); then
-      break
-    fi
-    sleep 2
-  done
-
-  failed=0
-  for worker in "${ALL_WORKER_ARRAY[@]}"; do
-    rc=$(awk -F= '/^rc=/{print $2}' "${status_dir}/${worker}.status")
-    if [[ "${rc}" != "0" ]]; then
-      failed=1
-      break
-    fi
-  done
-
-  if is_master_server && [[ "${SWITCH_LOG_ENABLE}" == "1" ]]; then
-    emit_switch_marker_best_effort "exp_end" "experiment=${exp_id} collective=${exp_coll} algo=${exp_algo} payload_mb=${PAYLOAD_MB} rc=${failed}" "phase2_matrix"
+  if (( run_rc != 0 )); then
+    overall_rc=1
+    echo "[phase2-matrix] experiment failed idx=${idx} id=${exp_id}"
+  else
+    echo "[phase2-matrix] experiment complete idx=${idx} id=${exp_id}"
   fi
 
-  if (( failed == 1 )); then
-    echo "[phase2-matrix] experiment failed idx=${idx} id=${exp_id}" >&2
-    exit 1
-  fi
+  emit_switch_marker_best_effort "exp_end" "experiment=${exp_id} rc=${run_rc}" "phase2_matrix"
 
-  echo "[phase2-matrix] complete idx=${idx} id=${exp_id}"
+  if (( run_rc != 0 )) && [[ "${STOP_ON_FAILURE}" == "1" ]]; then
+    break
+  fi
 done
 
-echo "[phase2-matrix] all experiments completed"
+exit "${overall_rc}"

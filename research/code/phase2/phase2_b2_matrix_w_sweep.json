@@ -1,26 +1,49 @@
 {
   "phase": "phase2",
-  "name": "b2_w_sweep_4node_switch",
-  "description": "4-node fixed-host B2 static-W sweep with switch PFC logging. No intra/inter placement label is used in the experiment ids.",
+  "name": "b2_w_sweep_8node_master_orchestrated",
+  "description": "8-node static receiver-window sweep with a master-orchestrated single-port launch model, persistent dev containers, STATUS_DDP worker status markers, and switch PFC logging.",
   "runner_contract": {
+    "master_server": "worker01",
     "worker_pool": [
       "worker01",
+      "worker02",
       "worker03",
+      "worker04",
       "worker05",
-      "worker07"
+      "worker06",
+      "worker07",
+      "worker08"
     ],
-    "nnodes": 4,
+    "nnodes": 8,
     "nproc_per_node": 1,
     "master_addr": "172.16.0.101",
-    "master_port_base": 31500,
+    "master_port": 40000,
     "torch_env": "/workspace/venvs/torch-cu121-custom/bin/activate",
-    "target_script": "research/code/phase2/collective_b2.py"
+    "target_script": "research/code/phase2/collective_b2.py",
+    "execution_model": "master_orchestrated_single_port",
+    "container_model": {
+      "helper_script": "research/code/deploy/run_dev_container.sh",
+      "container_name": "nccl-cu121-dev",
+      "reset_at_matrix_start": true,
+      "reset_per_experiment": false,
+      "restart_on_failure": true
+    },
+    "status_contract": {
+      "env_var": "STATUS_DDP",
+      "meaning": {
+        "1": "worker is in-flight",
+        "0": "worker finished successfully and is about to exit",
+        "-1": "worker failed"
+      },
+      "sync_file_pattern": ".ddp_status/<MODE>/<worker>.status"
+    }
   },
   "payload": {
     "payload_mb": 128,
     "dtype": "float32",
     "steps": 40,
-    "warmup_steps": 5
+    "warmup_steps": 5,
+    "mode_timeout_sec": 600
   },
   "switch_logging": {
     "enabled": true,
@@ -38,48 +61,55 @@
       "label": "STOCK",
       "policy": "baseline_nccl",
       "phase2_b2_enable": 0,
+      "phase3_b3_enable": 0,
       "static_w": null
     },
     {
       "mode_id": "b2_w2",
       "label": "B2_W2",
       "policy": "static_receiver_window",
-      "phase2_b2_enable": 1,
+      "phase2_b2_enable": 0,
+      "phase3_b3_enable": 0,
       "static_w": 2
     },
     {
       "mode_id": "b2_w4",
       "label": "B2_W4",
       "policy": "static_receiver_window",
-      "phase2_b2_enable": 1,
+      "phase2_b2_enable": 0,
+      "phase3_b3_enable": 0,
       "static_w": 4
     },
     {
       "mode_id": "b2_w5",
       "label": "B2_W5",
       "policy": "static_receiver_window",
-      "phase2_b2_enable": 1,
+      "phase2_b2_enable": 0,
+      "phase3_b3_enable": 0,
       "static_w": 5
     },
     {
       "mode_id": "b2_w6",
       "label": "B2_W6",
       "policy": "static_receiver_window",
-      "phase2_b2_enable": 1,
+      "phase2_b2_enable": 0,
+      "phase3_b3_enable": 0,
       "static_w": 6
     },
     {
       "mode_id": "b2_w7",
       "label": "B2_W7",
       "policy": "static_receiver_window",
-      "phase2_b2_enable": 1,
+      "phase2_b2_enable": 0,
+      "phase3_b3_enable": 0,
       "static_w": 7
     },
     {
       "mode_id": "b2_w8",
       "label": "B2_W8",
       "policy": "static_receiver_window",
-      "phase2_b2_enable": 1,
+      "phase2_b2_enable": 0,
+      "phase3_b3_enable": 0,
       "static_w": 8
     }
   ],
@@ -137,11 +167,16 @@
     "required_tables": [
       "stock_vs_b2_summary",
       "b2_workload_by_w_summary"
+    ],
+    "validation_fields": [
+      "final_output_match_vs_stock",
+      "final_output_match_workers"
     ]
   },
   "analysis_goals": [
     "Check whether static window reduction reduces in-flight traffic indicators.",
     "Check which workload and algorithm combinations show meaningful latency or throughput changes.",
-    "Check whether switch PFC count and severity track with the window sweep."
+    "Check whether switch PFC count and severity track with the window sweep.",
+    "Confirm that each B2 mode preserves final output equivalence against STOCK."
   ]
 }
