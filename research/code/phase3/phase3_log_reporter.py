@@ -387,6 +387,27 @@ def compute_summary_from_steps(step_rows: List[dict]) -> dict:
     }
 
 
+def compute_step_tail_metrics(step_rows: List[dict]) -> dict:
+    rows = effective_rows(step_rows)
+    values = [float(row.get("step_ms_max", 0.0)) for row in rows]
+    if not values:
+        return {
+            "step_ms_p99": 0.0,
+            "step_ms_max": 0.0,
+            "top_outlier_step": -1,
+            "top_outlier_step_ms": 0.0,
+            "top_outlier_warmup": False,
+        }
+    top_row = max(rows, key=lambda row: float(row.get("step_ms_max", 0.0)))
+    return {
+        "step_ms_p99": percentile(values, 0.99),
+        "step_ms_max": max(values),
+        "top_outlier_step": int(top_row.get("step", -1)),
+        "top_outlier_step_ms": float(top_row.get("step_ms_max", 0.0)),
+        "top_outlier_warmup": bool(top_row.get("warmup", False)),
+    }
+
+
 def load_worker_step_timings(mode_dir: Path) -> Dict[str, List[dict]]:
     timing_map: Dict[str, List[dict]] = {}
     for timing_path in sorted(mode_dir.glob("*/**/*_worker_step_timing.jsonl")):
@@ -431,6 +452,10 @@ def worker_window_defaults() -> dict:
         "trace_delay_ratio": [],
         "decision_steps": [],
         "decision_reasons": [],
+        "effective_decision_steps": [],
+        "effective_decision_reasons": [],
+        "effective_decision_old_w": [],
+        "effective_decision_new_w": [],
         "sample_index": 0,
         "w_values": [],
         "w_sem_values": [],
@@ -494,6 +519,8 @@ def summarize_nccl_logs(mode_dir: Path, worker_step_timings: Optional[Dict[str, 
     worker_wstall_counts: Counter = Counter()
     decision_counts: Counter = Counter()
     worker_decision_counts: Dict[str, Counter] = defaultdict(Counter)
+    effective_decision_counts: Counter = Counter()
+    worker_effective_decision_counts: Dict[str, Counter] = defaultdict(Counter)
     w_eff_counter: Counter = Counter()
     occ_pd_counter: Counter = Counter()
     occ_tr_counter: Counter = Counter()
@@ -565,6 +592,24 @@ def summarize_nccl_logs(mode_dir: Path, worker_step_timings: Optional[Dict[str, 
                     step = lookup_worker_step(worker_steps, int(entry.get("tNs", 0) or 0))
                     worker_windows[worker]["decision_steps"].append(step if step is not None else -1)
                     worker_windows[worker]["decision_reasons"].append(reason)
+                    try:
+                        old_w = float(entry.get("oldW", 0.0))
+                        new_w = float(entry.get("newW", 0.0))
+                    except (TypeError, ValueError):
+                        old_w = new_w = 0.0
+                    if old_w != new_w:
+                        if new_w < old_w:
+                            effective_reason = "effective_shrink"
+                        elif new_w > old_w:
+                            effective_reason = "effective_recover"
+                        else:
+                            effective_reason = f"effective_{reason}"
+                        effective_decision_counts[effective_reason] += 1
+                        worker_effective_decision_counts[worker][effective_reason] += 1
+                        worker_windows[worker]["effective_decision_steps"].append(step if step is not None else -1)
+                        worker_windows[worker]["effective_decision_reasons"].append(effective_reason)
+                        worker_windows[worker]["effective_decision_old_w"].append(old_w)
+                        worker_windows[worker]["effective_decision_new_w"].append(new_w)
 
                 if should_record_window_sample(entry):
                     add_window_sample(worker_windows[worker], worker_steps, entry)
@@ -582,6 +627,7 @@ def summarize_nccl_logs(mode_dir: Path, worker_step_timings: Optional[Dict[str, 
             "p10_w": percentile(values, 0.10),
             "p90_w": percentile(values, 0.90),
             "decision_counts": dict(worker_decision_counts.get(worker, Counter())),
+            "effective_decision_counts": dict(worker_effective_decision_counts.get(worker, Counter())),
             "wstall_count": int(worker_wstall_counts.get(worker, 0)),
         }
 
@@ -595,6 +641,10 @@ def summarize_nccl_logs(mode_dir: Path, worker_step_timings: Optional[Dict[str, 
         "worker_wstall_counts": worker_wstall_counts,
         "decision_counts": decision_counts,
         "worker_decision_counts": worker_decision_counts,
+        "effective_decision_counts": effective_decision_counts,
+        "worker_effective_decision_counts": worker_effective_decision_counts,
+        "effective_shrink_count": int(effective_decision_counts.get("effective_shrink", 0)),
+        "effective_recover_count": int(effective_decision_counts.get("effective_recover", 0)),
         "w_eff_counter": w_eff_counter,
         "w_eff_values": sorted(w_eff_counter.keys(), key=float),
         "p99_occ_pd": percentile_from_counter(occ_pd_counter, 0.99),
@@ -623,6 +673,8 @@ def load_mode_data(mode_dir: Path) -> dict:
     step_rows = load_jsonl(step_path) if step_path else []
     if "step_ms_avg" not in summary and step_rows:
         summary.update(compute_summary_from_steps(step_rows))
+    if step_rows:
+        summary.update(compute_step_tail_metrics(step_rows))
 
     worker_step_timings = load_worker_step_timings(mode_dir)
     nccl = summarize_nccl_logs(mode_dir, worker_step_timings)
@@ -653,6 +705,14 @@ def workload_label(collective: str, algo: str) -> str:
 def annotate_summary_rows(summary_rows: List[dict], env_setup: Optional[dict]) -> List[dict]:
     env_algo = canonical_algo((env_setup or {}).get("nccl_algo", ""))
     placement = str((env_setup or {}).get("placement", ""))
+    threshold_keys = {
+        "threshold_warmup": "phase3_warmup_intervals",
+        "threshold_hi": "phase3_hi_intervals",
+        "threshold_lo": "phase3_lo_intervals",
+        "threshold_occ": "phase3_occ_ratio_high_pct",
+        "threshold_lag": "phase3_lag_ratio_high_pct",
+        "threshold_delay": "phase3_delay_ratio_high_pct",
+    }
     for row in summary_rows:
         algo = canonical_algo(row.get("algo", ""))
         if algo == "auto" and env_algo != "auto":
@@ -660,6 +720,12 @@ def annotate_summary_rows(summary_rows: List[dict], env_setup: Optional[dict]) -
         row["algo"] = algo
         row["placement"] = placement
         row["workload"] = workload_label(str(row.get("collective", "")), algo)
+        for out_key, env_key in threshold_keys.items():
+            row[out_key] = (env_setup or {}).get(env_key, "")
+        row["threshold_label"] = (
+            f"warmup={row['threshold_warmup']},hi={row['threshold_hi']},lo={row['threshold_lo']},"
+            f"occ={row['threshold_occ']},lag={row['threshold_lag']},delay={row['threshold_delay']}"
+        )
     return summary_rows
 
 
@@ -678,6 +744,11 @@ def summarize_modes(mode_data: List[dict]) -> List[dict]:
             "step_ms_avg": float(summary.get("step_ms_avg", 0.0)),
             "step_ms_p50": float(summary.get("step_ms_p50", 0.0)),
             "step_ms_p95": float(summary.get("step_ms_p95", 0.0)),
+            "step_ms_p99": float(summary.get("step_ms_p99", 0.0)),
+            "step_ms_max": float(summary.get("step_ms_max", 0.0)),
+            "top_outlier_step": int(summary.get("top_outlier_step", -1)),
+            "top_outlier_step_ms": float(summary.get("top_outlier_step_ms", 0.0)),
+            "top_outlier_warmup": bool(summary.get("top_outlier_warmup", False)),
             "collective_gbps_avg": float(summary.get("collective_gbps_avg", 0.0)),
             "collective_gbps_p50": float(summary.get("collective_gbps_p50", 0.0)),
             "collective_gbps_p95": float(summary.get("collective_gbps_p95", 0.0)),
@@ -692,6 +763,9 @@ def summarize_modes(mode_data: List[dict]) -> List[dict]:
             "w_mean": mean(w_values),
             "w_p90": percentile(w_values, 0.90),
             "decision_counts": ", ".join(f"{k}:{v}" for k, v in sorted(nccl["decision_counts"].items())) or "-",
+            "effective_decision_counts": ", ".join(f"{k}:{v}" for k, v in sorted(nccl["effective_decision_counts"].items())) or "-",
+            "effective_shrink_count": int(nccl["effective_shrink_count"]),
+            "effective_recover_count": int(nccl["effective_recover_count"]),
             "pressure_score_p95": float(nccl["pressure_score_p95"]),
             "occ_ratio_p95": float(nccl["occ_ratio_p95"]),
             "lag_ratio_p95": float(nccl["lag_ratio_p95"]),
@@ -1221,6 +1295,31 @@ def save_decision_counts_plot(path: Path, mode_data: List[dict]) -> Optional[Pat
     return path
 
 
+def save_effective_decision_counts_plot(path: Path, mode_data: List[dict]) -> Optional[Path]:
+    b3_item = next((item for item in mode_data if item["mode"] == "B3"), None)
+    if b3_item is None:
+        return None
+    workers = sorted(b3_item["nccl"]["worker_windows"].keys(), key=worker_sort_key)
+    reasons = sorted(b3_item["nccl"]["effective_decision_counts"].keys())
+    if not workers or not reasons:
+        return None
+    fig, ax = plt.subplots(figsize=(max(10, len(workers) * 0.8), 5.8))
+    bottom = [0.0] * len(workers)
+    for reason in reasons:
+        values = [float(b3_item["nccl"]["worker_effective_decision_counts"].get(worker, Counter()).get(reason, 0)) for worker in workers]
+        ax.bar(workers, values, bottom=bottom, label=reason)
+        bottom = [left + right for left, right in zip(bottom, values)]
+    ax.set_title("B3 Effective W Change Counts by Worker")
+    ax.set_ylabel("oldW != newW count")
+    ax.grid(True, axis="y", alpha=0.25)
+    ax.legend()
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    return path
+
+
 def save_pressure_summary_plot(path: Path, mode_data: List[dict]) -> Optional[Path]:
     b3_items = [item for item in mode_data if item["mode"] == "B3" and item["nccl"]["pressure_scores"]]
     if not b3_items:
@@ -1291,6 +1390,10 @@ def trace_by_step(worker_info: dict, value_key: str = "trace_w") -> Tuple[List[i
     return clean_x, clean_values
 
 
+def trace_by_step_pairs(worker_info: dict, value_key: str = "trace_w") -> Tuple[List[int], List[float]]:
+    return trace_by_step(worker_info, value_key)
+
+
 def save_worker_window_trace_plot(path: Path, mode_data_or_item, title: Optional[str] = None) -> Optional[Path]:
     if isinstance(mode_data_or_item, dict):
         mode_data = [mode_data_or_item]
@@ -1336,23 +1439,26 @@ def save_pressure_vs_w_plot(path: Path, mode_data: List[dict], experiment_name: 
     if not workers:
         return None
 
-    fig, axes = plt.subplots(4, 1, figsize=(12, 11), sharex=True)
+    fig, axes = plt.subplots(5, 1, figsize=(12, 13), sharex=True)
     plotted = False
     for worker in workers:
         info = worker_windows[worker]
-        xs, w_values = trace_by_step(info, "trace_w")
-        _, pressure = trace_by_step(info, "trace_pressure")
-        _, occ = trace_by_step(info, "trace_occ_ratio")
-        _, lag = trace_by_step(info, "trace_lag_ratio")
+        xs, w_values = trace_by_step_pairs(info, "trace_w")
+        pressure_xs, pressure = trace_by_step_pairs(info, "trace_pressure")
+        occ_xs, occ = trace_by_step_pairs(info, "trace_occ_ratio")
+        lag_xs, lag = trace_by_step_pairs(info, "trace_lag_ratio")
+        delay_xs, delay = trace_by_step_pairs(info, "trace_delay_ratio")
         if xs and w_values:
             plotted = True
-            axes[0].plot(xs[: len(w_values)], w_values, linewidth=1.2, marker="o", markersize=2.2, label=worker)
-        if xs and pressure:
-            axes[1].plot(xs[: len(pressure)], pressure, linewidth=1.0, alpha=0.75)
-        if xs and occ:
-            axes[2].plot(xs[: len(occ)], occ, linewidth=1.0, alpha=0.75)
-        if xs and lag:
-            axes[3].plot(xs[: len(lag)], lag, linewidth=1.0, alpha=0.75)
+            axes[0].plot(xs, w_values, linewidth=1.2, marker="o", markersize=2.2, label=worker)
+        if pressure_xs and pressure:
+            axes[1].plot(pressure_xs, pressure, linewidth=1.0, alpha=0.75)
+        if occ_xs and occ:
+            axes[2].plot(occ_xs, occ, linewidth=1.0, alpha=0.75)
+        if lag_xs and lag:
+            axes[3].plot(lag_xs, lag, linewidth=1.0, alpha=0.75)
+        if delay_xs and delay:
+            axes[4].plot(delay_xs, delay, linewidth=1.0, alpha=0.75)
     if not plotted:
         plt.close(fig)
         return None
@@ -1361,10 +1467,45 @@ def save_pressure_vs_w_plot(path: Path, mode_data: List[dict], experiment_name: 
     axes[1].set_ylabel("pressureScore")
     axes[2].set_ylabel("occRatioPct")
     axes[3].set_ylabel("lagRatioPct")
-    axes[3].set_xlabel("collective step if aligned, otherwise control sample")
+    axes[4].set_ylabel("delayRatioPct")
+    axes[4].set_xlabel("collective step if aligned, otherwise control sample")
     for ax in axes:
         ax.grid(True, alpha=0.25)
     axes[0].legend(ncol=4, fontsize=8)
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    return path
+
+
+def save_step_outlier_plot(path: Path, mode_data: List[dict], experiment_name: str) -> Optional[Path]:
+    series = []
+    for item in mode_data:
+        rows = item["step_rows"]
+        if not rows:
+            continue
+        xs = [int(row.get("step", idx)) for idx, row in enumerate(rows)]
+        ys = [float(row.get("step_ms_max", 0.0)) for row in rows]
+        series.append((item["mode"], xs, ys, rows))
+    if not series:
+        return None
+    fig, ax = plt.subplots(figsize=(11, 5.8))
+    for mode, xs, ys, rows in series:
+        color = MODE_COLORS.get(mode)
+        ax.plot(xs, ys, marker="o", linewidth=1.5, markersize=3, label=mode, color=color)
+        effective = [row for row in rows if not row.get("warmup", False)] or rows
+        top_rows = sorted(effective, key=lambda row: float(row.get("step_ms_max", 0.0)), reverse=True)[:3]
+        for row in top_rows:
+            step = int(row.get("step", -1))
+            value = float(row.get("step_ms_max", 0.0))
+            ax.scatter([step], [value], s=60, color=color, edgecolors="black", linewidths=0.8, zorder=3)
+            ax.annotate(f"{mode} s{step}", (step, value), fontsize=8, xytext=(5, 4), textcoords="offset points")
+    ax.set_title(f"{experiment_name} Step Latency Outliers")
+    ax.set_xlabel("collective step")
+    ax.set_ylabel("step_ms_max")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
     fig.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=180)
@@ -1386,8 +1527,26 @@ def build_worker_window_table(mode_item: dict) -> str:
             f'{summary["p90_w"]:.2f}',
             summary["wstall_count"],
             ", ".join(f"{k}:{v}" for k, v in sorted(summary["decision_counts"].items())) or "-",
+            ", ".join(f"{k}:{v}" for k, v in sorted(summary["effective_decision_counts"].items())) or "-",
         ])
-    return render_table(["worker", "samples", "initial_w", "final_w", "min_w", "max_w", "mean_w", "p90_w", "wstall", "decision_counts"], rows)
+    return render_table(["worker", "samples", "initial_w", "final_w", "min_w", "max_w", "mean_w", "p90_w", "wstall", "decision_counts", "effective_w_changes"], rows)
+
+
+def build_effective_decision_table(mode_data: List[dict]) -> str:
+    b3_item = next((item for item in mode_data if item["mode"] == "B3"), None)
+    if b3_item is None:
+        return "<p>No B3 mode found.</p>"
+    rows = []
+    for worker, counts in sorted(b3_item["nccl"]["worker_effective_decision_counts"].items(), key=lambda pair: worker_sort_key(pair[0])):
+        rows.append([
+            worker,
+            counts.get("effective_shrink", 0),
+            counts.get("effective_recover", 0),
+            sum(counts.values()),
+        ])
+    if not rows:
+        rows = [["-", 0, 0, 0]]
+    return render_table(["worker", "effective_shrink", "effective_recover", "total_effective_changes"], rows)
 
 
 def build_collection_card(experiment_root: Path, mode_data: List[dict], env_setup: Optional[dict], switch_log_dir_override: Optional[str]) -> str:
@@ -1410,7 +1569,9 @@ def build_visualization_card() -> str:
         ["pfc_overlay_<experiment>.png", "rackA/rackB/spine STOCK vs B3 cumulative PFC delta from mode_start to mode_end."],
         ["worker_w_trace_<experiment>.png", "Worker-level STOCK/B3 W_eff trace and stock W confirmation."],
         ["b3_decision_<experiment>.png", "B3 decision reason counts by worker."],
+        ["b3_effective_decision_<experiment>.png", "B3 effective W changes where oldW != newW."],
         ["pressure_vs_w_<experiment>.png", "B3 pressureScore and pressure components against W_eff."],
+        ["step_outliers_<experiment>.png", "Per-step latency timeline with top outlier steps highlighted."],
         ["summary plots", "Latency, throughput, W distribution, WSTALL, and stock-relative deltas."],
     ]
     return '<div class="card"><h2>Visualization Outputs</h2>' + render_table(["plot", "meaning"], rows) + "</div>"
@@ -1489,7 +1650,12 @@ def build_single_experiment_report(
         plots_dir / "summary_latency.png",
         "Latency Summary by Mode",
         [row["mode"] for row in summary_rows],
-        [("avg", [row["step_ms_avg"] for row in summary_rows]), ("p95", [row["step_ms_p95"] for row in summary_rows])],
+        [
+            ("avg", [row["step_ms_avg"] for row in summary_rows]),
+            ("p95", [row["step_ms_p95"] for row in summary_rows]),
+            ("p99", [row["step_ms_p99"] for row in summary_rows]),
+            ("max", [row["step_ms_max"] for row in summary_rows]),
+        ],
         "ms",
     )
     p_throughput = save_grouped_bar(
@@ -1502,7 +1668,9 @@ def build_single_experiment_report(
     p_pfc = save_pfc_overlay_plot(plots_dir / f"pfc_overlay_{experiment_root.name}.png", experiment_root, env_setup, mode_data, switch_log_dir_override)
     p_worker_w = save_worker_window_trace_plot(plots_dir / f"worker_w_trace_{experiment_root.name}.png", mode_data, f"{experiment_root.name} Worker W_eff Trace")
     p_decision = save_decision_counts_plot(plots_dir / f"b3_decision_{experiment_root.name}.png", mode_data)
+    p_effective_decision = save_effective_decision_counts_plot(plots_dir / f"b3_effective_decision_{experiment_root.name}.png", mode_data)
     p_pressure_w = save_pressure_vs_w_plot(plots_dir / f"pressure_vs_w_{experiment_root.name}.png", mode_data, experiment_root.name)
+    p_step_outlier = save_step_outlier_plot(plots_dir / f"step_outliers_{experiment_root.name}.png", mode_data, experiment_root.name)
     p_events = save_event_counts_plot(plots_dir / "event_counts.png", mode_data, top_events)
     p_wstall = save_worker_wstall_plot(plots_dir / "wstall_by_worker.png", mode_data)
     p_window_dist = save_window_distribution_plot(plots_dir / "window_distribution.png", mode_data)
@@ -1538,6 +1706,10 @@ def build_single_experiment_report(
         "workload",
         "step_ms_avg",
         "step_ms_p95",
+        "step_ms_p99",
+        "step_ms_max",
+        "top_outlier_step",
+        "top_outlier_step_ms",
         "gbps_avg",
         "pfc_total",
         "rackA_delta",
@@ -1549,9 +1721,11 @@ def build_single_experiment_report(
         "p99_occ_tr",
         "wstall",
         "decision_counts",
+        "effective_w_changes",
         "lat_vs_stock_pct",
         "bw_vs_stock_pct",
         "pfc_vs_stock_pct",
+        "threshold",
     ]
     summary_table = []
     for row in summary_rows:
@@ -1560,6 +1734,10 @@ def build_single_experiment_report(
             row.get("workload", ""),
             f'{row["step_ms_avg"]:.3f}',
             f'{row["step_ms_p95"]:.3f}',
+            f'{row["step_ms_p99"]:.3f}',
+            f'{row["step_ms_max"]:.3f}',
+            row["top_outlier_step"],
+            f'{row["top_outlier_step_ms"]:.3f}',
             f'{row["collective_gbps_avg"]:.3f}',
             f'{row["switch_pfc_total"]:.0f}',
             f'{row["rackA_pfc_delta"]:.0f}',
@@ -1571,9 +1749,11 @@ def build_single_experiment_report(
             f'{row["p99_occ_tr"]:.2f}',
             row["total_wstall_count"],
             row["decision_counts"],
+            row["effective_decision_counts"],
             f'{row["delta_step_vs_stock_pct"]:.2f}',
             f'{row["delta_bw_vs_stock_pct"]:.2f}',
             f'{row["delta_pfc_total_vs_stock_pct"]:.2f}',
+            row["threshold_label"],
         ])
 
     sections = [
@@ -1584,12 +1764,15 @@ def build_single_experiment_report(
 
     for item in mode_data:
         sections.append(f'<section class="section"><h2>{html.escape(item["mode"])} Worker W Summary</h2>{build_worker_window_table(item)}</section>')
+    sections.append('<section class="section"><h2>B3 Effective W Changes</h2>' + build_effective_decision_table(mode_data) + "</section>")
 
     figure_paths = [
         (p_pfc, "rackA/rackB/spine PFC cumulative count increase overlaid by mode"),
         (p_worker_w, "worker-level receiver W_eff trace, including STOCK W confirmation"),
         (p_decision, "B3 decision reason counts by worker"),
+        (p_effective_decision, "B3 effective W changes where oldW != newW"),
         (p_pressure_w, "B3 pressure basis vs W_eff"),
+        (p_step_outlier, "step latency outliers with top steps highlighted"),
         (p_step, "step latency timeline"),
         (p_bw, "throughput timeline"),
         (p_latency, "latency summary"),
@@ -1699,6 +1882,9 @@ def build_matrix_report(
         "mode",
         "workload",
         "step_ms_avg",
+        "step_ms_p99",
+        "step_ms_max",
+        "top_outlier_step",
         "gbps_avg",
         "pfc_total",
         "rackA",
@@ -1707,6 +1893,8 @@ def build_matrix_report(
         "lat_vs_stock_pct",
         "bw_vs_stock_pct",
         "pfc_vs_stock_pct",
+        "effective_w_changes",
+        "threshold",
         "report",
     ]
     table_rows = []
@@ -1717,6 +1905,9 @@ def build_matrix_report(
             html.escape(str(row["mode"])),
             html.escape(str(row.get("workload", ""))),
             f'{row["step_ms_avg"]:.3f}',
+            f'{row.get("step_ms_p99", 0.0):.3f}',
+            f'{row.get("step_ms_max", 0.0):.3f}',
+            str(row.get("top_outlier_step", "")),
             f'{row["collective_gbps_avg"]:.3f}',
             f'{row.get("switch_pfc_total", 0.0):.0f}',
             f'{row.get("rackA_pfc_delta", 0.0):.0f}',
@@ -1725,6 +1916,8 @@ def build_matrix_report(
             f'{row.get("delta_step_vs_stock_pct", 0.0):.2f}',
             f'{row.get("delta_bw_vs_stock_pct", 0.0):.2f}',
             f'{row.get("delta_pfc_total_vs_stock_pct", 0.0):.2f}',
+            html.escape(str(row.get("effective_decision_counts", "-"))),
+            html.escape(str(row.get("threshold_label", ""))),
             f'<a href="{html.escape(link)}">open</a>' if link else "",
         ])
 
