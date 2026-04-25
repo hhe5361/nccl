@@ -1,370 +1,66 @@
 #!/usr/bin/env python3
 import argparse
 import csv
-import datetime as dt
 import html
+import importlib.util
 import json
-import math
-import re
-import tempfile
-import zipfile
-from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-
-try:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-except ImportError as exc:
-    raise SystemExit(
-        "matplotlib is required for phase2_log_reporter.py. Install it first, for example: pip install matplotlib"
-    ) from exc
+from types import ModuleType
+from typing import Dict, List, Optional, Sequence, Tuple
 
 
-PHASE_RE = re.compile(r"(PHASE\d+)\s+(.*)")
-KV_RE = re.compile(r"(\w+)=([^\s]+)")
-WORKER_RE = re.compile(r"worker(\d+)$")
-EXPERIMENT_RE = re.compile(r"^\d+_.+")
+SCRIPT_DIR = Path(__file__).resolve().parent
+BASE_PATH = SCRIPT_DIR.parent / "phase3" / "phase3_log_reporter.py"
 
-MODE_ORDER = {"STOCK": 0, "B2": 1, "B3": 2}
-REPORT_LOG_PATH: Optional[Path] = None
-SWITCH_SHARED_ROOT_DEFAULT = Path("/mnt/nfs/cts_experiments/switch_log")
 
-RUN_SUMMARY_FIELD_HELP = {
-    "mode": "실험 모드. STOCK, B2, B3 등.",
-    "phase2_mode": "runner가 기록한 내부 phase2 mode 이름.",
-    "collective": "실험 collective 종류.",
-    "world_size": "참여 rank 수.",
-    "payload_mb": "rank당 logical payload 크기(MiB).",
-    "step_ms_avg": "step max latency 평균(ms).",
-    "step_ms_p95": "step max latency p95(ms).",
-    "collective_gbps_avg": "collective 예상 traffic volume 기반 처리량 평균(Gbps).",
-    "collective_gbps_p95": "collective 예상 처리량 p95(Gbps).",
-    "delta_step_vs_stock_pct": "같은 experiment 안에서 stock 대비 step_ms_avg 변화율(%). 음수면 latency 개선.",
-    "delta_bw_vs_stock_pct": "같은 experiment 안에서 stock 대비 collective_gbps_avg 변화율(%). 양수면 throughput 개선.",
-}
+def load_module(name: str, path: Path) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"failed to load module {name} from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
-NCCL_SUMMARY_FIELD_HELP = {
-    "total_events": "수집된 PHASE 이벤트 총 수.",
-    "total_wstall_count": "이벤트 이름에 WSTALL이 포함된 총 횟수.",
-    "recv_wstall_count": "RECV 관련 WSTALL 총 횟수.",
-    "send_wstall_count": "SEND 관련 WSTALL 총 횟수.",
-    "p99_occ_pd": "posted-done의 p99.",
-    "p99_occ_tr": "transmitted-done의 p99.",
-    "w_eff_values": "WINDOW_CFG 계열 이벤트에서 관측한 effective window 집합.",
-    "decision_counts": "B3 decision 이벤트의 reason별 빈도.",
-    "pressure_score_p95": "pressureScore 계열 로그의 p95.",
-}
+
+base = load_module("phase3_log_reporter_base_for_phase2", BASE_PATH)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render Phase 2 PNG plots and HTML report")
-    parser.add_argument(
-        "--input",
-        required=True,
-        help="Single experiment root or matrix root",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=None,
-        help="Output directory. Defaults to <input>/report",
-    )
-    parser.add_argument(
-        "--top-events",
-        type=int,
-        default=12,
-        help="Number of top NCCL events to visualize",
-    )
+    parser.add_argument("--input-dir", required=True, help="Single experiment root or matrix root")
+    parser.add_argument("--output-dir", required=True, help="Report output directory")
+    parser.add_argument("--switch-log", default=None, help="Override switch log directory")
+    parser.add_argument("--top-events", type=int, default=12, help="Number of top NCCL events to visualize")
     return parser.parse_args()
 
 
-def human_size(num_bytes: int) -> str:
-    value = float(num_bytes)
-    for unit in ["B", "KiB", "MiB", "GiB", "TiB"]:
-        if value < 1024.0 or unit == "TiB":
-            return f"{value:.1f}{unit}"
-        value /= 1024.0
-    return f"{num_bytes}B"
-
-
-def log_progress(message: str) -> None:
-    timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[phase2-log-reporter] {timestamp} {message}"
-    print(line, flush=True)
-    if REPORT_LOG_PATH is not None:
-        with REPORT_LOG_PATH.open("a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
-
-
-def mean(values: Iterable[float]) -> float:
-    vals = list(values)
-    if not vals:
-        return 0.0
-    return sum(vals) / len(vals)
-
-
-def percentile(values: Sequence[float], q: float) -> float:
-    if not values:
-        return 0.0
-    ordered = sorted(values)
-    if len(ordered) == 1:
-        return float(ordered[0])
-    pos = (len(ordered) - 1) * q
-    lo = int(pos)
-    hi = min(lo + 1, len(ordered) - 1)
-    frac = pos - lo
-    return float(ordered[lo] * (1.0 - frac) + ordered[hi] * frac)
-
-
-def rel_change(base: float, candidate: float) -> float:
-    if abs(base) < 1e-12:
-        return 0.0
-    return 100.0 * (candidate - base) / base
-
-
-def parse_value(raw: str):
-    if raw.startswith("0x"):
+def mode_sort_key(name: str) -> Tuple[int, int, str]:
+    mode = str(name or "").upper()
+    if mode == "STOCK":
+        return (0, 0, mode)
+    if mode.startswith("B2_W"):
         try:
-            return int(raw, 16)
-        except ValueError:
-            return raw
-    try:
-        return int(raw)
-    except ValueError:
+            return (1, int(mode.split("_W", 1)[1]), mode)
+        except (IndexError, ValueError):
+            return (1, 10**9, mode)
+    return (10**9, 10**9, mode)
+
+
+def static_w_from_mode(mode: str, summary: dict) -> int:
+    if "phase1_static_w" in summary:
         try:
-            return float(raw)
-        except ValueError:
-            return raw
-
-
-def worker_sort_key(name: str) -> Tuple[int, str]:
-    match = WORKER_RE.match(name)
-    if match:
-        return int(match.group(1)), name
-    return 10**9, name
-
-
-def mode_sort_key(name: str) -> Tuple[int, str]:
-    return MODE_ORDER.get(name.upper(), 10**9), name
-
-
-def relpath(path: Path, start: Path) -> str:
-    return path.relative_to(start).as_posix()
-
-
-def load_json(path: Path) -> dict:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def load_jsonl(path: Path) -> List[dict]:
-    rows: List[dict] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line:
-            rows.append(json.loads(line))
-    return rows
-
-
-def positive_ylim(max_value: float) -> Optional[Tuple[float, float]]:
-    if max_value <= 0:
-        return None
-    return 0.0, max_value * 1.05
-
-
-def find_mode_dirs(experiment_root: Path) -> List[Path]:
-    mode_dirs: List[Path] = []
-    for child in sorted(experiment_root.iterdir(), key=lambda p: mode_sort_key(p.name)):
-        if not child.is_dir():
-            continue
-        if list(child.glob("*_summary.json")) or list(child.glob("*_step_metrics.jsonl")):
-            mode_dirs.append(child)
-    return mode_dirs
-
-
-def find_experiment_dirs(matrix_root: Path) -> List[Path]:
-    dirs: List[Path] = []
-    for child in sorted(matrix_root.iterdir()):
-        if child.is_dir() and EXPERIMENT_RE.match(child.name):
-            if child.name == ".matrix_status":
-                continue
-            if child.joinpath("env_setup.json").exists() or find_mode_dirs(child):
-                dirs.append(child)
-    return dirs
-
-
-def is_matrix_root(path: Path) -> bool:
-    return path.joinpath("matrix_manifest.json").exists() or bool(find_experiment_dirs(path))
-
-
-def percentile_from_counter(counter: Counter, q: float) -> float:
-    if not counter:
-        return 0.0
-    total = sum(counter.values())
-    if total <= 0:
-        return 0.0
-    threshold = max(1, math.ceil(total * q))
-    seen = 0
-    for value in sorted(counter.keys(), key=float):
-        seen += counter[value]
-        if seen >= threshold:
-            return float(value)
-    return float(max(counter.keys(), key=float))
-
-
-def summarize_nccl_logs(mode_dir: Path) -> dict:
-    log_paths = sorted(mode_dir.glob("*/nccl.*.log"))
-    log_progress(
-        f"scan mode logs start mode_dir={mode_dir.as_posix()} files={len(log_paths)}"
-    )
-    specific_alias_keys = set()
-    for log_path in log_paths:
-        worker = log_path.parent.name
-        log_progress(
-            f"scan aliases file={log_path.name} worker={worker} size={human_size(log_path.stat().st_size)}"
-        )
-        with log_path.open("r", encoding="utf-8", errors="replace") as handle:
-            for raw_line in handle:
-                line = raw_line.rstrip("\n")
-                match = PHASE_RE.search(line)
-                if not match:
-                    continue
-                phase = match.group(1)
-                payload = match.group(2)
-                fields = {key: parse_value(value) for key, value in KV_RE.findall(payload)}
-                event_name = fields.get("event")
-                if not event_name:
-                    continue
-                family = None
-                if str(event_name).endswith("WINDOW_CFG"):
-                    family = "WINDOW_CFG"
-                elif str(event_name).endswith("RECV_WSTALL"):
-                    family = "RECV_WSTALL"
-                if family and ("_B2_" in str(event_name) or "_B3_" in str(event_name)):
-                    specific_alias_keys.add(
-                        (
-                            worker,
-                            fields.get("tNs"),
-                            fields.get("peer"),
-                            fields.get("channel"),
-                            fields.get("slot"),
-                            family,
-                        )
-                    )
-
-    event_counts: Counter = Counter()
-    worker_event_counts: Dict[str, Counter] = defaultdict(Counter)
-    worker_wstall_counts: Counter = Counter()
-    worker_recv_wstall_counts: Counter = Counter()
-    worker_send_wstall_counts: Counter = Counter()
-    decision_counts: Counter = Counter()
-    w_eff_values: List[float] = []
-    pressure_scores: List[float] = []
-    occ_pd_counter: Counter = Counter()
-    occ_tr_counter: Counter = Counter()
-
-    recv_wstall_count = 0
-    send_wstall_count = 0
-
-    for log_path in log_paths:
-        worker = log_path.parent.name
-        log_progress(
-            f"scan events file={log_path.name} worker={worker} size={human_size(log_path.stat().st_size)}"
-        )
-        with log_path.open("r", encoding="utf-8", errors="replace") as handle:
-            for raw_line in handle:
-                line = raw_line.rstrip("\n")
-                match = PHASE_RE.search(line)
-                if not match:
-                    continue
-                payload = match.group(2)
-                entry = {key: parse_value(value) for key, value in KV_RE.findall(payload)}
-                event_name = str(entry.get("event", ""))
-                if not event_name:
-                    continue
-
-                family = None
-                if event_name == "PROXY_WINDOW_CFG":
-                    family = "WINDOW_CFG"
-                elif event_name == "PROXY_RECV_WSTALL":
-                    family = "RECV_WSTALL"
-                if family:
-                    key = (
-                        worker,
-                        entry.get("tNs"),
-                        entry.get("peer"),
-                        entry.get("channel"),
-                        entry.get("slot"),
-                        family,
-                    )
-                    if key in specific_alias_keys:
-                        continue
-
-                event_counts[event_name] += 1
-                worker_event_counts[worker][event_name] += 1
-
-                if "WSTALL" in event_name:
-                    worker_wstall_counts[worker] += 1
-                    if "RECV" in event_name:
-                        worker_recv_wstall_counts[worker] += 1
-                        recv_wstall_count += 1
-                    if "SEND" in event_name:
-                        worker_send_wstall_counts[worker] += 1
-                        send_wstall_count += 1
-
-                if event_name.endswith("DECISION") and "reason" in entry:
-                    decision_counts[str(entry["reason"])] += 1
-
-                if "wEff" in entry:
-                    try:
-                        w_eff_values.append(float(entry["wEff"]))
-                    except (TypeError, ValueError):
-                        pass
-                elif "newW" in entry:
-                    try:
-                        w_eff_values.append(float(entry["newW"]))
-                    except (TypeError, ValueError):
-                        pass
-
-                if "pressureScore" in entry:
-                    try:
-                        pressure_scores.append(float(entry["pressureScore"]))
-                    except (TypeError, ValueError):
-                        pass
-
-                if "occPd" in entry:
-                    try:
-                        occ_pd_counter[float(entry["occPd"])] += 1
-                    except (TypeError, ValueError):
-                        pass
-                if "occTr" in entry:
-                    try:
-                        occ_tr_counter[float(entry["occTr"])] += 1
-                    except (TypeError, ValueError):
-                        pass
-
-    return {
-        "event_counts": event_counts,
-        "worker_event_counts": worker_event_counts,
-        "worker_wstall_counts": worker_wstall_counts,
-        "worker_recv_wstall_counts": worker_recv_wstall_counts,
-        "worker_send_wstall_counts": worker_send_wstall_counts,
-        "decision_counts": decision_counts,
-        "w_eff_values": sorted({int(v) if float(v).is_integer() else v for v in w_eff_values}, key=float),
-        "w_eff_counter": Counter(int(v) if float(v).is_integer() else v for v in w_eff_values),
-        "pressure_scores": pressure_scores,
-        "occ_pd_values": [],
-        "occ_tr_values": [],
-        "total_events": int(sum(event_counts.values())),
-        "total_wstall_count": int(recv_wstall_count + send_wstall_count),
-        "recv_wstall_count": int(recv_wstall_count),
-        "send_wstall_count": int(send_wstall_count),
-        "max_occ_pd": max(occ_pd_counter.keys()) if occ_pd_counter else 0.0,
-        "p99_occ_pd": percentile_from_counter(occ_pd_counter, 0.99),
-        "max_occ_tr": max(occ_tr_counter.keys()) if occ_tr_counter else 0.0,
-        "p99_occ_tr": percentile_from_counter(occ_tr_counter, 0.99),
-        "pressure_score_p95": percentile(pressure_scores, 0.95),
-    }
+            return int(summary["phase1_static_w"])
+        except (TypeError, ValueError):
+            pass
+    upper = str(mode or "").upper()
+    if upper == "STOCK":
+        return 0
+    if upper.startswith("B2_W"):
+        try:
+            return int(upper.split("_W", 1)[1])
+        except (IndexError, ValueError):
+            return -1
+    return -1
 
 
 def effective_rows(step_rows: List[dict]) -> List[dict]:
@@ -372,448 +68,196 @@ def effective_rows(step_rows: List[dict]) -> List[dict]:
     return rows if rows else step_rows
 
 
-def compute_summary_from_steps(step_rows: List[dict]) -> dict:
-    rows = effective_rows(step_rows)
-    return {
-        "step_ms_avg": mean(float(row["step_ms_max"]) for row in rows),
-        "step_ms_p95": percentile([float(row["step_ms_max"]) for row in rows], 0.95),
-        "collective_gbps_avg": mean(float(row["collective_gbps_est"]) for row in rows),
-        "collective_gbps_p95": percentile([float(row["collective_gbps_est"]) for row in rows], 0.95),
-    }
+def experiment_label_from_env(experiment_root: Path, env_setup: Optional[dict]) -> str:
+    if env_setup and env_setup.get("experiment_label"):
+        return str(env_setup["experiment_label"])
+    return experiment_root.name
 
 
-def extract_ts_ns(value: Any) -> Optional[int]:
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        abs_value = abs(value)
-        if abs_value >= 10**17:
-            return value
-        if abs_value >= 10**14:
-            return value * 1000
-        if abs_value >= 10**11:
-            return value * 1_000_000
-        if abs_value >= 10**9:
-            return value * 1_000_000_000
-        return None
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            return None
-        abs_value = abs(value)
-        if abs_value >= 10**17:
-            return int(value)
-        if abs_value >= 10**9:
-            return int(value * 1_000_000_000)
-        return None
-    if isinstance(value, str):
-        raw = value.strip()
-        if not raw:
-            return None
-        if raw.isdigit():
-            return extract_ts_ns(int(raw))
-        try:
-            return extract_ts_ns(float(raw))
-        except ValueError:
-            pass
-        normalized = raw[:-1] + "+00:00" if raw.endswith("Z") else raw
-        try:
-            return int(dt.datetime.fromisoformat(normalized).timestamp() * 1_000_000_000)
-        except ValueError:
-            return None
-    return None
+def workload_label(collective: str, algo: str) -> str:
+    algo = str(algo or "auto")
+    if collective == "allreduce":
+        return f"{collective}_{algo.lower()}"
+    return f"{collective}_{algo.lower()}"
 
 
-def extract_record_ts_ns(record: dict) -> Optional[int]:
-    for key in (
-        "ts_unix_ns",
-        "timestamp_ns",
-        "unix_ns",
-        "ts_ns",
-        "time_ns",
-        "timestamp",
-        "ts",
-        "time",
-        "collected_at",
-        "sample_time",
-    ):
-        if key in record:
-            ts_ns = extract_ts_ns(record.get(key))
-            if ts_ns is not None:
-                return ts_ns
-    for value in record.values():
-        if isinstance(value, dict):
-            ts_ns = extract_record_ts_ns(value)
-            if ts_ns is not None:
-                return ts_ns
-    return None
-
-
-def flatten_numeric_named_values(node: Any, prefix: str = "") -> List[Tuple[str, float]]:
-    values: List[Tuple[str, float]] = []
-    if isinstance(node, dict):
-        for key, value in node.items():
-            name = f"{prefix}/{key}" if prefix else str(key)
-            values.extend(flatten_numeric_named_values(value, name))
-    elif isinstance(node, list):
-        for idx, value in enumerate(node):
-            name = f"{prefix}/{idx}" if prefix else str(idx)
-            values.extend(flatten_numeric_named_values(value, name))
-    elif isinstance(node, (int, float)) and not isinstance(node, bool):
-        values.append((prefix, float(node)))
-    return values
-
-
-def is_counter_like_key(name: str) -> bool:
-    lower = name.lower()
-    tail = lower.split("/")[-1]
-    if any(token in lower for token in ("timestamp", "time_ns", "unix_ns", "collected_at", "sample_time", "elapsed")):
-        return False
-    if tail in {"ts", "time", "date", "priority", "port", "queue", "index", "pid", "interval", "interval_sec", "sample"}:
-        return False
-    return True
-
-
-def aggregate_switch_counter(record: dict) -> float:
-    total = 0.0
-    for name, value in flatten_numeric_named_values(record):
-        if is_counter_like_key(name):
-            total += max(0.0, float(value))
-    return total
-
-
-def load_switch_counter_samples(path: Path) -> List[Tuple[int, float]]:
-    samples: List[Tuple[int, float]] = []
-    for row in load_jsonl(path):
-        ts_ns = extract_record_ts_ns(row)
-        if ts_ns is None:
-            continue
-        samples.append((ts_ns, aggregate_switch_counter(row)))
-    samples.sort(key=lambda item: item[0])
-    return samples
-
-
-def compute_switch_delta_series(samples: List[Tuple[int, float]]) -> List[Tuple[int, float]]:
-    deltas: List[Tuple[int, float]] = []
-    for (prev_ts, prev_total), (cur_ts, cur_total) in zip(samples, samples[1:]):
-        dt_sec = (cur_ts - prev_ts) / 1_000_000_000.0
-        if dt_sec <= 0.0:
-            continue
-        delta = max(0.0, cur_total - prev_total)
-        deltas.append((cur_ts, delta / dt_sec))
-    return deltas
-
-
-def resolve_switch_log_dir(experiment_root: Path, env_setup: Optional[dict]) -> Optional[Path]:
-    if not env_setup or int(env_setup.get("switch_log_enable", 0) or 0) != 1:
-        return None
-    candidates: List[Path] = []
-    local_dir = env_setup.get("switch_log_local_dir")
-    if local_dir:
-        candidates.append(Path(str(local_dir)))
-    run_id = env_setup.get("switch_log_run_id")
-    if run_id:
-        candidates.append(SWITCH_SHARED_ROOT_DEFAULT / str(run_id))
-    remote_dir = env_setup.get("switch_log_dir")
-    if remote_dir:
-        candidates.append(Path(str(remote_dir)))
-    seen = set()
-    unique: List[Path] = []
-    for candidate in candidates:
-        key = candidate.as_posix()
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(candidate)
-    for candidate in unique:
-        if candidate.exists():
-            return candidate
-    return unique[0] if unique else None
-
-
-def step_time_bounds(step_rows: List[dict]) -> Optional[Tuple[int, int]]:
-    starts = [extract_ts_ns(row.get("ts_start_unix_ns")) for row in step_rows]
-    starts = [value for value in starts if value is not None]
-    ends = [extract_ts_ns(row.get("ts_end_unix_ns")) for row in step_rows]
-    ends = [value for value in ends if value is not None]
-    mids = [extract_ts_ns(row.get("ts_mid_unix_ns")) for row in step_rows]
-    mids = [value for value in mids if value is not None]
-    if starts and ends:
-        return min(starts), max(ends)
-    if mids:
-        return min(mids), max(mids)
-    return None
-
-
-def step_midpoint_series(step_rows: List[dict]) -> List[Tuple[int, float]]:
-    points: List[Tuple[int, float]] = []
-    for row in effective_rows(step_rows):
-        ts_ns = extract_ts_ns(row.get("ts_mid_unix_ns"))
-        if ts_ns is None:
-            ts_ns = extract_ts_ns(row.get("ts_end_unix_ns"))
-        if ts_ns is None:
-            ts_ns = extract_ts_ns(row.get("ts_start_unix_ns"))
-        if ts_ns is None:
-            continue
-        points.append((ts_ns, float(row["step_ms_max"])))
-    points.sort(key=lambda item: item[0])
-    return points
-
-
-def find_mode_marker_bounds(markers: List[dict], run_id: str, mode: str) -> Optional[Tuple[int, int]]:
-    starts: List[int] = []
-    ends: List[int] = []
-    mode_token = f"mode={mode.upper()}"
-    run_token = f"run_id={run_id}" if run_id else ""
-    for record in markers:
-        marker_name = str(record.get("marker") or record.get("event") or "")
-        message = str(record.get("message") or "")
-        if mode_token not in message:
-            continue
-        if run_token and run_token not in message:
-            continue
-        ts_ns = extract_record_ts_ns(record)
-        if ts_ns is None:
-            continue
-        if marker_name == "mode_start":
-            starts.append(ts_ns)
-        elif marker_name == "mode_end":
-            ends.append(ts_ns)
-    if starts and ends:
-        return min(starts), max(ends)
-    return None
-
-
-def build_mode_time_windows(mode_data: List[dict], env_setup: Optional[dict], markers: List[dict]) -> Dict[str, Tuple[int, int]]:
-    run_id = str(env_setup.get("run_id", "")) if env_setup else ""
-    windows: Dict[str, Tuple[int, int]] = {}
+def extract_experiment_algo(env_setup: Optional[dict], mode_data: List[dict]) -> str:
+    env_algo = str((env_setup or {}).get("nccl_algo", "") or "").strip()
+    if env_algo and env_algo != "auto":
+        return env_algo
     for item in mode_data:
-        bounds = step_time_bounds(item["step_rows"])
-        if bounds is None:
-            bounds = find_mode_marker_bounds(markers, run_id, item["mode"])
-        if bounds is not None:
-            windows[item["mode"]] = bounds
-    return windows
+        algo = str(item["summary"].get("algo", "") or "").strip()
+        if algo:
+            return algo
+    return "auto"
 
 
-def load_switch_bundle(experiment_root: Path, env_setup: Optional[dict]) -> Optional[dict]:
-    log_dir = resolve_switch_log_dir(experiment_root, env_setup)
-    if log_dir is None or not log_dir.exists():
-        return None
-    series = {}
-    file_map = {
-        "spine": log_dir / "spine_roce_counters.jsonl",
-        "rackA": log_dir / "rackA_pfc_statistics.jsonl",
-        "rackB": log_dir / "rackB_pfc_statistics.jsonl",
-    }
-    for label, path in file_map.items():
-        if not path.exists():
+def mode_step_window_series(mode_item: dict) -> Tuple[List[int], List[float]]:
+    worker_windows = mode_item["nccl"]["worker_windows"]
+    per_step: Dict[int, List[float]] = {}
+    for worker, info in worker_windows.items():
+        trace_steps = info.get("trace_step", [])
+        trace_w = info.get("trace_w", [])
+        if not trace_steps or not trace_w:
             continue
-        rate_series = compute_switch_delta_series(load_switch_counter_samples(path))
-        if rate_series:
-            series[label] = rate_series
-    markers_path = log_dir / "markers.jsonl"
-    markers = load_jsonl(markers_path) if markers_path.exists() else []
-    if not series and not markers:
-        return None
-    return {
-        "log_dir": log_dir,
-        "series": series,
-        "markers": markers,
-    }
+        last_by_step: Dict[int, float] = {}
+        for step, w_value in zip(trace_steps, trace_w):
+            if step is None or int(step) < 0:
+                continue
+            last_by_step[int(step)] = float(w_value)
+        for step, w_value in last_by_step.items():
+            per_step.setdefault(step, []).append(w_value)
+    if not per_step:
+        return [], []
+    steps = sorted(per_step.keys())
+    values = [base.mean(per_step[step]) for step in steps]
+    return steps, values
 
 
-def save_switch_overlay_plot(
-    path: Path,
+def compute_switch_metrics(
     experiment_root: Path,
     env_setup: Optional[dict],
     mode_data: List[dict],
-) -> Optional[Path]:
-    switch_bundle = load_switch_bundle(experiment_root, env_setup)
-    if not switch_bundle or not switch_bundle.get("series"):
-        return None
-
-    mode_windows = build_mode_time_windows(mode_data, env_setup, switch_bundle.get("markers", []))
-    if not mode_windows:
-        return None
-
-    global_start = min(start for start, _ in mode_windows.values())
-    global_end = max(end for _, end in mode_windows.values())
-    if global_end <= global_start:
-        return None
-
-    switch_series = {}
-    for label, rows in switch_bundle["series"].items():
-        filtered = [((ts_ns - global_start) / 1_000_000_000.0, rate) for ts_ns, rate in rows if global_start <= ts_ns <= global_end]
-        if filtered:
-            switch_series[label] = filtered
-    if not switch_series:
-        return None
-
-    step_series = []
+    switch_log_dir_override: Optional[str],
+) -> Dict[str, dict]:
+    switch_bundle = base.load_switch_bundle(experiment_root, env_setup, switch_log_dir_override)
+    if not switch_bundle:
+        return {}
+    mode_windows = base.build_mode_time_windows(mode_data, env_setup, switch_bundle.get("markers", []))
+    metrics: Dict[str, dict] = {}
     for item in mode_data:
-        points = [((ts_ns - global_start) / 1_000_000_000.0, value) for ts_ns, value in step_midpoint_series(item["step_rows"]) if global_start <= ts_ns <= global_end]
-        if points:
-            step_series.append((item["mode"], points))
-
-    colors = {"spine": "#d04e00", "rackA": "#1f77b4", "rackB": "#2ca02c"}
-    fig, axes = plt.subplots(2, 1, figsize=(12, 7.5), sharex=True, gridspec_kw={"height_ratios": [1.0, 1.0]})
-    ax_top, ax_bottom = axes
-
-    for label, points in switch_series.items():
-        ax_top.plot([x for x, _ in points], [y for _, y in points], linewidth=1.8, label=label, color=colors.get(label))
-
-    for _, (start_ns, end_ns) in mode_windows.items():
-        rel_start = (start_ns - global_start) / 1_000_000_000.0
-        rel_end = (end_ns - global_start) / 1_000_000_000.0
-        ax_top.axvspan(rel_start, rel_end, color="#8aa1c1", alpha=0.06)
-        ax_bottom.axvspan(rel_start, rel_end, color="#8aa1c1", alpha=0.06)
-        ax_top.axvline(rel_start, color="#6c7f99", linestyle="--", alpha=0.35, linewidth=0.9)
-        ax_bottom.axvline(rel_start, color="#6c7f99", linestyle="--", alpha=0.35, linewidth=0.9)
-
-    for mode, points in step_series:
-        ax_bottom.plot([x for x, _ in points], [y for _, y in points], marker="o", linewidth=1.5, markersize=2.8, label=mode)
-
-    ax_top.set_title(f"{experiment_root.name} Switch Pressure Overlay")
-    ax_top.set_ylabel("switch delta / sec")
-    ax_top.grid(True, alpha=0.25)
-    if switch_series:
-        ax_top.legend()
-
-    ax_bottom.set_xlabel("elapsed sec")
-    ax_bottom.set_ylabel("step_ms_max")
-    ax_bottom.grid(True, alpha=0.25)
-    if step_series:
-        ax_bottom.legend()
-
-    fig.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=180)
-    plt.close(fig)
-    return path
+      mode = item["mode"]
+      bounds = mode_windows.get(mode)
+      if bounds is None:
+          metrics[mode] = {"switch_pfc_total": 0.0, "switch_pfc_peak_rate": 0.0}
+          continue
+      start_ns, end_ns = bounds
+      total = 0.0
+      peak = 0.0
+      for label in ("rackA", "rackB"):
+          snapshots = switch_bundle.get("snapshots", {}).get(label, [])
+          if snapshots:
+              start_value = base.interpolate_switch_snapshot_value(snapshots, start_ns)
+              end_value = base.interpolate_switch_snapshot_value(snapshots, end_ns)
+              if start_value is not None and end_value is not None:
+                  total += max(0.0, float(end_value) - float(start_value))
+          for ts_ns, rate in switch_bundle.get("series", {}).get(label, []):
+              if start_ns <= ts_ns <= end_ns:
+                  peak = max(peak, float(rate))
+      metrics[mode] = {
+          "switch_pfc_total": total,
+          "switch_pfc_peak_rate": peak,
+      }
+    return metrics
 
 
 def load_mode_data(mode_dir: Path) -> dict:
-    log_progress(f"load mode start mode_dir={mode_dir.as_posix()}")
-    summary_files = sorted(mode_dir.glob("*_summary.json"))
-    if not summary_files:
-        raise FileNotFoundError(f"no *_summary.json found in {mode_dir}")
-    summary_path = summary_files[0]
-    summary = load_json(summary_path)
-
-    step_files = sorted(mode_dir.glob("*_step_metrics.jsonl"))
-    step_path = step_files[0] if step_files else None
-    step_rows = load_jsonl(step_path) if step_path else []
-
-    if "step_ms_avg" not in summary and step_rows:
-        summary.update(compute_summary_from_steps(step_rows))
-
-    nccl_summary = summarize_nccl_logs(mode_dir)
-    mode_name = str(summary.get("run_tag") or summary.get("phase2_mode") or mode_dir.name).upper()
-    log_progress(
-        f"load mode complete mode={mode_name} step_rows={len(step_rows)} total_events={nccl_summary['total_events']}"
-    )
-
-    return {
-        "mode": mode_name,
-        "summary_path": summary_path,
-        "step_path": step_path,
-        "summary": summary,
-        "step_rows": step_rows,
-        "events": [],
-        "nccl": nccl_summary,
-        "mode_dir": mode_dir,
-    }
+    return base.load_mode_data(mode_dir)
 
 
-def load_experiment_mode_data(experiment_root: Path) -> List[dict]:
-    mode_dirs = find_mode_dirs(experiment_root)
-    if not mode_dirs:
-        raise FileNotFoundError(f"no mode directories found in {experiment_root}")
-    mode_data = [load_mode_data(mode_dir) for mode_dir in mode_dirs]
-    mode_data.sort(key=lambda item: mode_sort_key(item["mode"]))
-    return mode_data
-
-
-def render_table(headers: List[str], rows: List[List[object]]) -> str:
-    head = "".join(f"<th>{html.escape(str(h))}</th>" for h in headers)
-    body = []
-    for row in rows:
-        body.append("<tr>" + "".join(f"<td>{html.escape(str(cell))}</td>" for cell in row) + "</tr>")
-    return "<table><thead><tr>" + head + "</tr></thead><tbody>" + "".join(body) + "</tbody></table>"
-
-
-def render_table_raw(headers: List[str], rows: List[List[str]]) -> str:
-    head = "".join(f"<th>{html.escape(str(h))}</th>" for h in headers)
-    body = []
-    for row in rows:
-        body.append("<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>")
-    return "<table><thead><tr>" + head + "</tr></thead><tbody>" + "".join(body) + "</tbody></table>"
-
-
-def render_field_help_card(title: str, field_help: Dict[str, str], wanted_fields: List[str]) -> str:
-    rows = [[field, field_help[field]] for field in wanted_fields if field in field_help]
-    return '<div class="card"><h2>' + html.escape(title) + '</h2>' + render_table(["field", "meaning"], rows) + '</div>'
-
-
-def render_plot_help_card(title: str, rows: List[Tuple[str, str, str]]) -> str:
-    formatted = [[name, source, meaning] for name, source, meaning in rows]
-    return '<div class="card"><h2>' + html.escape(title) + '</h2>' + render_table(["plot", "source", "meaning"], formatted) + '</div>'
-
-
-def collect_worker_stats(nccl: dict) -> List[dict]:
-    workers = sorted(
-        set(nccl["worker_event_counts"].keys())
-        | set(nccl["worker_wstall_counts"].keys())
-        | set(nccl.get("worker_recv_wstall_counts", {}).keys())
-        | set(nccl.get("worker_send_wstall_counts", {}).keys()),
-        key=worker_sort_key,
-    )
-    rows: List[dict] = []
-    for worker in workers:
-        event_counter = nccl["worker_event_counts"].get(worker, Counter())
-        total_events = int(sum(event_counter.values()))
-        recv_wstall = int(nccl.get("worker_recv_wstall_counts", {}).get(worker, 0))
-        send_wstall = int(nccl.get("worker_send_wstall_counts", {}).get(worker, 0))
-        total_wstall = int(nccl["worker_wstall_counts"].get(worker, recv_wstall + send_wstall))
-        top_events = ", ".join(f"{name}:{count}" for name, count in event_counter.most_common(5)) or "-"
-        rows.append({
-            "worker": worker,
-            "total_events": total_events,
-            "recv_wstall": recv_wstall,
-            "send_wstall": send_wstall,
-            "total_wstall": total_wstall,
-            "top_events": top_events,
-        })
+def load_rank_validations(mode_dir: Path) -> Dict[str, dict]:
+    rows: Dict[str, dict] = {}
+    for path in sorted(mode_dir.glob("*/" + mode_dir.name + "_rank_validation.json")):
+        row = base.load_json(path)
+        rows[str(row.get("worker") or path.parent.name)] = row
     return rows
 
 
-def build_worker_stats_section(mode_data: List[dict]) -> str:
-    cards: List[str] = []
-    for item in mode_data:
-        rows = collect_worker_stats(item["nccl"])
-        if not rows:
+def compare_final_output_vs_stock(mode_data: List[dict]) -> Dict[str, dict]:
+    validations = {item["mode"]: load_rank_validations(item["mode_dir"]) for item in mode_data}
+    stock_rows = validations.get("STOCK", {})
+    result: Dict[str, dict] = {}
+    stock_total = len(stock_rows)
+    result["STOCK"] = {
+        "all_match": True,
+        "matched_workers": stock_total,
+        "total_workers": stock_total,
+    }
+    for mode, mode_rows in validations.items():
+        if mode == "STOCK":
             continue
-        table_rows = [
-            [
-                row["worker"],
-                row["total_events"],
-                row["recv_wstall"],
-                row["send_wstall"],
-                row["total_wstall"],
-                row["top_events"],
-            ]
-            for row in rows
-        ]
-        cards.append(
-            '<div class="card"><h2>'
-            + html.escape(f'{item["mode"]} Worker Summary')
-            + '</h2>'
-            + render_table(["worker", "total_events", "recv_wstall", "send_wstall", "total_wstall", "top_events"], table_rows)
-            + '</div>'
-        )
-    if not cards:
-        return ""
-    return '<section class="section"><h2>Worker Statistics</h2><div class="grid-2">' + "".join(cards) + '</div></section>'
+        workers = sorted(set(stock_rows.keys()) | set(mode_rows.keys()))
+        matched = 0
+        for worker in workers:
+            s = stock_rows.get(worker)
+            m = mode_rows.get(worker)
+            if s and m and s.get("final_sha256") == m.get("final_sha256"):
+                matched += 1
+        total = len(workers)
+        result[mode] = {
+            "all_match": total > 0 and matched == total,
+            "matched_workers": matched,
+            "total_workers": total,
+        }
+    return result
+
+
+def summarize_modes(
+    experiment_root: Path,
+    env_setup: Optional[dict],
+    mode_data: List[dict],
+    switch_log_dir_override: Optional[str],
+) -> List[dict]:
+    switch_metrics = compute_switch_metrics(experiment_root, env_setup, mode_data, switch_log_dir_override)
+    stock_digest_match = compare_final_output_vs_stock(mode_data)
+    stock = next((item for item in mode_data if item["mode"] == "STOCK"), None)
+    rows = []
+    experiment_label = experiment_label_from_env(experiment_root, env_setup)
+    algo = extract_experiment_algo(env_setup, mode_data)
+
+    for item in mode_data:
+        summary = item["summary"]
+        nccl = item["nccl"]
+        mode = item["mode"]
+        static_w_cfg = static_w_from_mode(mode, summary)
+        switch_row = switch_metrics.get(mode, {"switch_pfc_total": 0.0, "switch_pfc_peak_rate": 0.0})
+        row = {
+            "experiment": experiment_label,
+            "mode": mode,
+            "static_w_cfg": static_w_cfg,
+            "collective": summary.get("collective", ""),
+            "algo": algo,
+            "workload": workload_label(str(summary.get("collective", "")), algo),
+            "payload_mb": float(summary.get("payload_mb", 0.0)),
+            "step_ms_avg": float(summary.get("step_ms_avg", 0.0)),
+            "step_ms_p95": float(summary.get("step_ms_p95", 0.0)),
+            "collective_gbps_avg": float(summary.get("collective_gbps_avg", 0.0)),
+            "collective_gbps_p95": float(summary.get("collective_gbps_p95", 0.0)),
+            "total_events": int(nccl["total_events"]),
+            "recv_wstall_count": int(nccl["recv_wstall_count"]),
+            "send_wstall_count": int(nccl["send_wstall_count"]),
+            "total_wstall_count": int(nccl["total_wstall_count"]),
+            "p99_occ_pd": float(nccl["p99_occ_pd"]),
+            "p99_occ_tr": float(nccl["p99_occ_tr"]),
+            "w_eff_values": ",".join(str(v) for v in nccl["w_eff_values"]) or "-",
+            "switch_pfc_total": float(switch_row["switch_pfc_total"]),
+            "switch_pfc_peak_rate": float(switch_row["switch_pfc_peak_rate"]),
+            "final_output_match_vs_stock": "-",
+            "final_output_match_workers": "-",
+            "delta_step_vs_stock_pct": 0.0,
+            "delta_bw_vs_stock_pct": 0.0,
+            "delta_occ_tr_vs_stock_pct": 0.0,
+            "delta_wstall_vs_stock_pct": 0.0,
+            "delta_pfc_total_vs_stock_pct": 0.0,
+            "delta_pfc_peak_vs_stock_pct": 0.0,
+        }
+        digest_row = stock_digest_match.get(mode)
+        if digest_row is not None:
+            row["final_output_match_vs_stock"] = "PASS" if digest_row["all_match"] else "FAIL"
+            row["final_output_match_workers"] = f'{digest_row["matched_workers"]}/{digest_row["total_workers"]}'
+        if stock is not None and mode != "STOCK":
+            stock_summary = stock["summary"]
+            stock_nccl = stock["nccl"]
+            stock_switch = switch_metrics.get("STOCK", {"switch_pfc_total": 0.0, "switch_pfc_peak_rate": 0.0})
+            row["delta_step_vs_stock_pct"] = base.rel_change(float(stock_summary.get("step_ms_avg", 0.0)), row["step_ms_avg"])
+            row["delta_bw_vs_stock_pct"] = base.rel_change(float(stock_summary.get("collective_gbps_avg", 0.0)), row["collective_gbps_avg"])
+            row["delta_occ_tr_vs_stock_pct"] = base.rel_change(float(stock_nccl["p99_occ_tr"]), row["p99_occ_tr"])
+            row["delta_wstall_vs_stock_pct"] = base.rel_change(float(stock_nccl["total_wstall_count"]), row["total_wstall_count"])
+            row["delta_pfc_total_vs_stock_pct"] = base.rel_change(float(stock_switch["switch_pfc_total"]), row["switch_pfc_total"])
+            row["delta_pfc_peak_vs_stock_pct"] = base.rel_change(float(stock_switch["switch_pfc_peak_rate"]), row["switch_pfc_peak_rate"])
+        rows.append(row)
+    rows.sort(key=lambda row: mode_sort_key(str(row["mode"])))
+    return rows
 
 
 def render_html(title: str, sections: List[str]) -> str:
@@ -880,27 +324,7 @@ def render_html(title: str, sections: List[str]) -> str:
       line-height: 1.2;
     }}
     p {{ margin: 10px 0 0; color: var(--muted); }}
-    .meta {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-top: 16px;
-    }}
-    .chip {{
-      border: 1px solid var(--border);
-      background: var(--panel-soft);
-      border-radius: 999px;
-      padding: 8px 12px;
-      font-size: 13px;
-      color: var(--muted);
-    }}
-    .grid-2, .grid-3 {{
-      display: grid;
-      gap: 14px;
-      margin-top: 16px;
-    }}
-    .grid-2 {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
-    .grid-3 {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
+    .grid-2 {{ display: grid; gap: 14px; margin-top: 16px; grid-template-columns: repeat(2, minmax(0, 1fr)); }}
     .card {{
       background: var(--panel-soft);
       border: 1px solid var(--border);
@@ -918,9 +342,7 @@ def render_html(title: str, sections: List[str]) -> str:
       text-align: left;
       vertical-align: top;
     }}
-    th {{
-      background: #f4f7fb;
-    }}
+    th {{ background: #f4f7fb; }}
     figure {{
       margin: 18px 0 0;
       padding: 12px;
@@ -939,6 +361,8 @@ def render_html(title: str, sections: List[str]) -> str:
       color: var(--muted);
       font-size: 14px;
     }}
+    ul {{ margin: 10px 0 0; padding-left: 20px; }}
+    li + li {{ margin-top: 8px; }}
     code {{
       font-family: Consolas, "SFMono-Regular", Monaco, monospace;
       font-size: 0.93em;
@@ -948,10 +372,8 @@ def render_html(title: str, sections: List[str]) -> str:
       padding: 1px 6px;
       color: #1d2b3a;
     }}
-    ul {{ margin: 10px 0 0; padding-left: 20px; }}
-    li + li {{ margin-top: 8px; }}
     @media (max-width: 920px) {{
-      .grid-2, .grid-3 {{ grid-template-columns: 1fr; }}
+      .grid-2 {{ grid-template-columns: 1fr; }}
     }}
   </style>
 </head>
@@ -960,7 +382,7 @@ def render_html(title: str, sections: List[str]) -> str:
     <header class="hero">
       <div class="eyebrow">Phase2 Reporter</div>
       <h1>{html.escape(title)}</h1>
-      <p>Phase2 runner가 남긴 env_setup, summary, step_metrics, NCCL PHASE logs를 읽어 PNG plot과 HTML report를 생성한다.</p>
+      <p>4-node static receiver window sweep report. B3 path is disabled during collection; only stock and PHASE1 static W override runs are visualized.</p>
     </header>
     {''.join(sections)}
   </div>
@@ -968,297 +390,192 @@ def render_html(title: str, sections: List[str]) -> str:
 </html>"""
 
 
-def save_line_plot(
-    path: Path,
-    title: str,
-    xlabel: str,
-    ylabel: str,
-    series: List[Tuple[str, List[float], List[float]]],
-) -> None:
-    if not series:
-        return
-    plt.figure(figsize=(11, 5.5))
-    max_value = 0.0
-    for label, x_values, y_values in series:
-        if not x_values or not y_values:
-            continue
-        plt.plot(x_values, y_values, marker="o", linewidth=1.7, markersize=3, label=label)
-        max_value = max(max_value, max(y_values))
-    plt.title(title)
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    ylim = positive_ylim(max_value)
-    if ylim:
-      plt.ylim(*ylim)
-    plt.grid(True, alpha=0.25)
-    plt.legend()
-    plt.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(path, dpi=180)
-    plt.close()
+def build_collection_plan_card_matrix(experiment_dirs: List[Path]) -> str:
+    total_logs = 0
+    total_step_timing = 0
+    for experiment_dir in experiment_dirs:
+        for mode_dir in base.find_mode_dirs(experiment_dir):
+            total_logs += len(list(mode_dir.glob("*/nccl.*.log")))
+            total_step_timing += len(list(mode_dir.glob("*/**/*_worker_step_timing.jsonl")))
+    rows = [
+        ["matrix_manifest.json", "experiment matrix, mode sweep, worker pool definition"],
+        ["NN_experiment/env_setup.json", "experiment metadata, static-W sweep contract, B3 disabled flag"],
+        ["NN_experiment/MODE/*_summary.json", "mode absolute performance summary"],
+        ["NN_experiment/MODE/*_step_metrics.jsonl", "per-step collective latency / throughput timeline"],
+        [f"NN_experiment/MODE/workerXX/*_worker_step_timing.jsonl ({total_step_timing} files)", "worker-local timing used to align W traces on collective step axis"],
+        [f"NN_experiment/MODE/workerXX/nccl.*.log ({total_logs} files)", "PHASE0 logs used for W_eff, outstanding depth, WSTALL"],
+        ["switch_log/*.jsonl", "override or env_setup-provided switch PFC / ROCE logs"],
+    ]
+    return '<div class="card"><h2>Collected Logs</h2>' + base.render_table(["source", "meaning"], rows) + '</div>'
 
 
-def save_grouped_bar(
-    path: Path,
-    title: str,
-    categories: List[str],
-    series: List[Tuple[str, List[float]]],
-    ylabel: str,
-    rotate_labels: bool = False,
-) -> None:
-    if not categories or not series:
-        return
-    plt.figure(figsize=(max(10, len(categories) * 0.9), 5.8))
-    x = list(range(len(categories)))
-    width = 0.8 / max(len(series), 1)
-    max_value = 0.0
-    for idx, (label, values) in enumerate(series):
-        offset = (idx - (len(series) - 1) / 2.0) * width
-        plt.bar([pos + offset for pos in x], values, width=width, label=label)
-        if values:
-            max_value = max(max_value, max(values))
-    plt.title(title)
-    plt.ylabel(ylabel)
-    plt.xticks(x, categories, rotation=35 if rotate_labels else 0, ha="right" if rotate_labels else "center")
-    ylim = positive_ylim(max_value)
-    if ylim:
-        plt.ylim(*ylim)
-    plt.grid(True, axis="y", alpha=0.25)
-    plt.legend()
-    plt.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(path, dpi=180)
-    plt.close()
+def build_visualization_plan_card_matrix() -> str:
+    rows = [
+        ["stock_vs_b2_latency.png", "experiment별 STOCK/B2_W step latency 비교"],
+        ["stock_vs_b2_throughput.png", "experiment별 STOCK/B2_W throughput 비교"],
+        ["stock_vs_b2_switch_pfc_counts.png", "experiment별 STOCK/B2_W PFC total count 비교"],
+        ["stock_vs_b2_step_window_trace.png", "experiment별 step-axis 평균 W trace"],
+        ["b2_matrix_latency.png", "B2만 남겨 W sweep × workload latency heatmap"],
+        ["b2_matrix_throughput.png", "B2만 남겨 W sweep × workload throughput heatmap"],
+        ["b2_matrix_pfc_count.png", "B2만 남겨 W sweep × workload PFC total heatmap"],
+        ["b2_matrix_pfc_severity.png", "B2만 남겨 W sweep × workload PFC peak rate heatmap"],
+    ]
+    return '<div class="card"><h2>Visualization Plan</h2>' + base.render_table(["plot", "meaning"], rows) + '</div>'
 
 
-def save_horizontal_bar(path: Path, title: str, labels: List[str], values: List[float], xlabel: str) -> None:
-    if not labels:
-        return
-    plt.figure(figsize=(10, max(4.5, len(labels) * 0.45)))
-    y = list(range(len(labels)))
-    plt.barh(y, values)
-    plt.yticks(y, labels)
-    plt.xlabel(xlabel)
-    plt.title(title)
-    max_value = max(values) if values else 0.0
-    ylim = positive_ylim(max_value)
-    if ylim:
-        plt.xlim(*ylim)
-    plt.grid(True, axis="x", alpha=0.25)
-    plt.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(path, dpi=180)
-    plt.close()
-
-
-def save_event_counts_plot(path: Path, mode_data: List[dict], top_n: int) -> Optional[Path]:
-    total = Counter()
-    for item in mode_data:
-        total.update(item["nccl"]["event_counts"])
-    labels = [name for name, _ in total.most_common(top_n)]
-    if not labels:
-        return None
+def save_window_trace_by_mode_plot(path: Path, mode_data: List[dict], title: str) -> Optional[Path]:
     series = []
     for item in mode_data:
-        values = [float(item["nccl"]["event_counts"].get(label, 0)) for label in labels]
-        series.append((item["mode"], values))
-    save_grouped_bar(path, "Top NCCL Event Counts by Mode", labels, series, "count", rotate_labels=True)
-    return path
+        x_values, y_values = mode_step_window_series(item)
+        if x_values and y_values:
+            series.append((item["mode"], x_values, y_values))
+    if not series:
+        return None
+    return base.save_line_plot(path, title, "collective step", "avg receiver W_eff", series)
 
 
-def save_worker_wstall_plot(path: Path, mode_data: List[dict]) -> Optional[Path]:
-    workers = sorted(
-        {worker for item in mode_data for worker in item["nccl"]["worker_wstall_counts"].keys()},
-        key=worker_sort_key,
-    )
+def save_switch_pfc_counts_plot(path: Path, summary_rows: List[dict], title: str) -> Optional[Path]:
+    categories = [row["mode"] for row in summary_rows]
+    if not categories:
+        return None
+    series = [
+        ("pfc_total", [float(row["switch_pfc_total"]) for row in summary_rows]),
+        ("pfc_peak_rate", [float(row["switch_pfc_peak_rate"]) for row in summary_rows]),
+    ]
+    return base.save_grouped_bar(path, title, categories, series, "switch PFC metric")
+
+
+def save_worker_window_trace_plot(path: Path, mode_item: dict) -> Optional[Path]:
+    worker_windows = mode_item["nccl"]["worker_windows"]
+    workers = [worker for worker, info in sorted(worker_windows.items(), key=lambda item: base.worker_sort_key(item[0])) if info["trace_x"] and info["trace_w"]]
     if not workers:
         return None
-    series = []
-    for item in mode_data:
-        counter = item["nccl"]["worker_wstall_counts"]
-        series.append((item["mode"], [float(counter.get(worker, 0)) for worker in workers]))
-    save_grouped_bar(path, "Window Stall Count by Worker", workers, series, "wstall count")
+    base.plt.figure(figsize=(11, 5.5))
+    max_value = 0.0
+    for worker in workers:
+        trace_steps = worker_windows[worker].get("trace_step", [])
+        trace_w = worker_windows[worker]["trace_w"]
+        if trace_steps and any(step >= 0 for step in trace_steps):
+            per_step: Dict[int, float] = {}
+            for step, w_value in zip(trace_steps, trace_w):
+                if int(step) < 0:
+                    continue
+                per_step[int(step)] = float(w_value)
+            if not per_step:
+                continue
+            plot_x = sorted(per_step.keys())
+            plot_y = [per_step[idx] for idx in plot_x]
+        else:
+            plot_x = worker_windows[worker]["trace_x"]
+            plot_y = trace_w
+        base.plt.plot(plot_x, plot_y, marker="o", linewidth=1.5, markersize=3, label=worker)
+        max_value = max(max_value, max(plot_y))
+    base.plt.title(f"{mode_item['mode']} Receiver Window Trace by Worker")
+    base.plt.xlabel("collective step")
+    base.plt.ylabel("W_eff")
+    ylim = base.positive_ylim(max_value)
+    if ylim:
+        base.plt.ylim(*ylim)
+    base.plt.grid(True, alpha=0.25)
+    base.plt.legend(ncol=2)
+    base.plt.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    base.plt.savefig(path, dpi=180)
+    base.plt.close()
     return path
 
 
-def save_window_distribution_plot(path: Path, mode_data: List[dict]) -> Optional[Path]:
-    windows = sorted(
-        {window for item in mode_data for window in item["nccl"]["w_eff_counter"].keys()},
-        key=float,
-    )
-    if not windows:
+def save_matrix_step_window_trace_plot(path: Path, experiment_payloads: List[Tuple[str, List[dict]]]) -> Optional[Path]:
+    if not experiment_payloads:
         return None
-    labels = [str(window) for window in windows]
-    series = []
-    for item in mode_data:
-        counter = item["nccl"]["w_eff_counter"]
-        series.append((item["mode"], [float(counter.get(window, 0)) for window in windows]))
-    save_grouped_bar(path, "Selected Window Distribution", labels, series, "count")
-    return path
-
-
-def save_decision_counts_plot(path: Path, mode_data: List[dict]) -> Optional[Path]:
-    reasons = sorted(
-        {reason for item in mode_data for reason in item["nccl"]["decision_counts"].keys()}
-    )
-    if not reasons:
+    fig, axes = base.plt.subplots(len(experiment_payloads), 1, figsize=(12, 3.6 * len(experiment_payloads)), sharex=False)
+    if len(experiment_payloads) == 1:
+        axes = [axes]
+    any_series = False
+    for ax, (experiment_name, mode_data) in zip(axes, experiment_payloads):
+        for item in mode_data:
+            x_values, y_values = mode_step_window_series(item)
+            if not x_values or not y_values:
+                continue
+            any_series = True
+            ax.plot(x_values, y_values, marker="o", linewidth=1.5, markersize=2.8, label=item["mode"])
+        ax.set_title(experiment_name)
+        ax.set_xlabel("collective step")
+        ax.set_ylabel("avg W_eff")
+        ax.grid(True, alpha=0.25)
+        ax.legend(ncol=4)
+    if not any_series:
+        base.plt.close(fig)
         return None
-    series = []
-    for item in mode_data:
-        counts = item["nccl"]["decision_counts"]
-        series.append((item["mode"], [float(counts.get(reason, 0)) for reason in reasons]))
-    save_grouped_bar(path, "Decision Reason Counts", reasons, series, "count")
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=180)
+    base.plt.close(fig)
     return path
 
 
-def save_pressure_summary_plot(path: Path, mode_data: List[dict]) -> Optional[Path]:
-    modes = [item["mode"] for item in mode_data if item["nccl"]["pressure_scores"]]
-    if not modes:
+def save_heatmap(
+    path: Path,
+    title: str,
+    row_labels: Sequence[str],
+    col_labels: Sequence[str],
+    values: Sequence[Sequence[float]],
+    colorbar_label: str,
+) -> Optional[Path]:
+    if not row_labels or not col_labels or not values:
         return None
-    p50_values = [percentile(item["nccl"]["pressure_scores"], 0.50) for item in mode_data if item["nccl"]["pressure_scores"]]
-    p95_values = [percentile(item["nccl"]["pressure_scores"], 0.95) for item in mode_data if item["nccl"]["pressure_scores"]]
-    save_grouped_bar(
-        path,
-        "Pressure Score Summary",
-        modes,
-        [("p50", p50_values), ("p95", p95_values)],
-        "pressure score",
-    )
+    fig, ax = base.plt.subplots(figsize=(max(8, len(col_labels) * 1.0), max(4, len(row_labels) * 0.8 + 1.5)))
+    im = ax.imshow(values, aspect="auto", cmap="Blues")
+    ax.set_title(title)
+    ax.set_xticks(range(len(col_labels)))
+    ax.set_xticklabels(col_labels)
+    ax.set_yticks(range(len(row_labels)))
+    ax.set_yticklabels(row_labels)
+    for y, row in enumerate(values):
+        for x, value in enumerate(row):
+            ax.text(x, y, f"{value:.2f}", ha="center", va="center", color="#111", fontsize=9)
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label(colorbar_label)
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=180)
+    base.plt.close(fig)
     return path
 
 
-def save_occupancy_summary_plot(path: Path, mode_data: List[dict]) -> Optional[Path]:
-    modes = [item["mode"] for item in mode_data]
-    if not any(
-        float(item["nccl"].get("max_occ_pd", 0.0)) > 0.0
-        or float(item["nccl"].get("max_occ_tr", 0.0)) > 0.0
-        for item in mode_data
-    ):
-        return None
-    save_grouped_bar(
-        path,
-        "Outstanding Depth Summary by Mode",
-        modes,
-        [
-            ("p99_occ_pd", [float(item["nccl"]["p99_occ_pd"]) for item in mode_data]),
-            ("p99_occ_tr", [float(item["nccl"]["p99_occ_tr"]) for item in mode_data]),
-        ],
-        "depth",
-    )
-    return path
-
-
-def summarize_modes(mode_data: List[dict]) -> List[dict]:
-    stock_summary = None
-    for item in mode_data:
-        if item["mode"].upper() == "STOCK":
-            stock_summary = item["summary"]
-            break
-
+def build_worker_window_table(mode_item: dict) -> str:
     rows = []
-    for item in mode_data:
-        summary = item["summary"]
-        nccl = item["nccl"]
-        row = {
-            "mode": item["mode"],
-            "phase2_mode": summary.get("phase2_mode", "").upper() or item["mode"],
-            "collective": summary.get("collective", ""),
-            "world_size": int(summary.get("world_size", 0)),
-            "payload_mb": float(summary.get("payload_mb", 0.0)),
-            "step_ms_avg": float(summary.get("step_ms_avg", 0.0)),
-            "step_ms_p95": float(summary.get("step_ms_p95", 0.0)),
-            "collective_gbps_avg": float(summary.get("collective_gbps_avg", 0.0)),
-            "collective_gbps_p95": float(summary.get("collective_gbps_p95", 0.0)),
-            "total_events": nccl["total_events"],
-            "total_wstall_count": nccl["total_wstall_count"],
-            "recv_wstall_count": nccl["recv_wstall_count"],
-            "send_wstall_count": nccl["send_wstall_count"],
-            "p99_occ_pd": float(nccl["p99_occ_pd"]),
-            "p99_occ_tr": float(nccl["p99_occ_tr"]),
-            "w_eff_values": ",".join(str(v) for v in nccl["w_eff_values"]),
-            "decision_counts": ", ".join(f"{k}:{v}" for k, v in sorted(nccl["decision_counts"].items())) or "-",
-            "pressure_score_p95": float(nccl["pressure_score_p95"]),
-            "delta_step_vs_stock_pct": 0.0,
-            "delta_bw_vs_stock_pct": 0.0,
-            "delta_occ_tr_vs_stock_pct": 0.0,
-            "delta_wstall_vs_stock_pct": 0.0,
-        }
-        if stock_summary is not None and item["mode"].upper() != "STOCK":
-            row["delta_step_vs_stock_pct"] = rel_change(
-                float(stock_summary.get("step_ms_avg", 0.0)),
-                float(summary.get("step_ms_avg", 0.0)),
-            )
-            row["delta_bw_vs_stock_pct"] = rel_change(
-                float(stock_summary.get("collective_gbps_avg", 0.0)),
-                float(summary.get("collective_gbps_avg", 0.0)),
-            )
-            stock_nccl = next(m["nccl"] for m in mode_data if m["mode"].upper() == "STOCK")
-            row["delta_occ_tr_vs_stock_pct"] = rel_change(
-                float(stock_nccl["p99_occ_tr"]),
-                float(nccl["p99_occ_tr"]),
-            )
-            row["delta_wstall_vs_stock_pct"] = rel_change(
-                float(stock_nccl["total_wstall_count"]),
-                float(nccl["total_wstall_count"]),
-            )
-        rows.append(row)
-    return rows
-
-
-def build_collection_plan_card_single(experiment_root: Path, env_setup: Optional[dict], mode_data: List[dict]) -> str:
-    total_logs = sum(len(list(item["mode_dir"].glob("*/nccl.*.log"))) for item in mode_data)
-    rows = [
-        ["env_setup.json", "single experiment 설정값. collective, payload, mode, rack map 등을 기록."],
-        ["MODE/*_summary.json", "mode별 최종 요약. step latency와 collective throughput의 평균/p95를 제공."],
-        ["MODE/*_step_metrics.jsonl", "step별 시계열. warmup 여부와 step_ms_max/mean, collective_gbps_est를 포함."],
-        [f"MODE/workerXX/nccl.*.log ({total_logs} files)", "PHASE0/1/2 이벤트 로그. WSTALL, WINDOW_CFG, pressure/decision trace를 포함할 수 있음."],
-    ]
-    if env_setup and int(env_setup.get("switch_log_enable", 0) or 0) == 1:
-        switch_dir = env_setup.get("switch_log_local_dir") or (str(SWITCH_SHARED_ROOT_DEFAULT / str(env_setup.get("switch_log_run_id", ""))) if env_setup.get("switch_log_run_id") else "")
-        if switch_dir:
-            rows.append(["switch_log_local_dir", switch_dir])
-        rows.append(["switch_log/*.jsonl", "switch pressure 로그. spine ROCE, rackA/rackB PFC, markers.jsonl 을 포함."])
-    if env_setup and "run_modes" in env_setup:
-        rows.append(["run_modes", str(env_setup["run_modes"])])
-    return '<div class="card"><h2>Collected Logs</h2>' + render_table(["source", "meaning"], rows) + '</div>'
-
-
-def build_visualization_plan_card_single(mode_data: List[dict], env_setup: Optional[dict] = None) -> str:
-    rows = [
-        ("step_timeline.png", "*_step_metrics.jsonl", "mode별 step_ms_max / step_ms_mean 시계열 비교"),
-        ("throughput_timeline.png", "*_step_metrics.jsonl", "mode별 collective_gbps_est 시계열 비교"),
-        ("summary_latency.png", "*_summary.json", "mode별 step_ms_avg / step_ms_p95 비교"),
-        ("summary_throughput.png", "*_summary.json", "mode별 collective_gbps_avg / p95 비교"),
-        ("event_counts.png", "nccl.*.log", "top NCCL event 분포 비교"),
-        ("wstall_by_worker.png", "nccl.*.log", "worker별 WSTALL 편차 확인"),
-        ("selected_window_distribution.png", "WINDOW_CFG / DECISION log", "선택된 W_eff 분포 확인"),
-        ("occupancy_summary.png", "nccl.*.log", "p99_occ_pd / p99_occ_tr 비교"),
-    ]
-    if env_setup and int(env_setup.get("switch_log_enable", 0) or 0) == 1:
-        rows.append(("switch_overlay.png", "switch_log/*.jsonl + *_step_metrics.jsonl", "switch PFC/ROCE delta/sec 와 step latency overlay"))
-    if any(item["nccl"]["decision_counts"] for item in mode_data):
-        rows.append(("decision_counts.png", "DECISION log", "shrink / hold / recover reason count"))
-    if any(item["nccl"]["pressure_scores"] for item in mode_data):
-        rows.append(("pressure_summary.png", "PRESSURE log", "mode별 pressure score p50 / p95"))
-    return render_plot_help_card("Visualization Plan", rows)
+    worker_windows = mode_item["nccl"]["worker_windows"]
+    for worker, info in sorted(worker_windows.items(), key=lambda item: base.worker_sort_key(item[0])):
+        rows.append([
+            worker,
+            ",".join(str(v) for v in info["initial_w_values"]) or "-",
+            ",".join(str(v) for v in info["final_w_values"]) or "-",
+            len(info["trace_x"]),
+        ])
+    return base.render_table(["worker", "initial_w", "final_w", "samples"], rows)
 
 
 def build_single_experiment_report(
     experiment_root: Path,
     output_dir: Path,
     top_events: int,
-    mode_data: Optional[List[dict]] = None,
+    switch_log_dir_override: Optional[str],
 ) -> Path:
-    log_progress(f"build single report start experiment={experiment_root.name}")
-    env_setup = load_json(experiment_root / "env_setup.json") if (experiment_root / "env_setup.json").exists() else None
-    mode_data = mode_data if mode_data is not None else load_experiment_mode_data(experiment_root)
-    summary_rows = summarize_modes(mode_data)
+    base.log_progress(f"build single report start experiment={experiment_root.name}")
+    env_setup = base.load_json(experiment_root / "env_setup.json") if (experiment_root / "env_setup.json").exists() else None
+    mode_dirs = base.find_mode_dirs(experiment_root)
+    if not mode_dirs:
+        raise FileNotFoundError(f"no mode directories found in {experiment_root}")
+
+    mode_data = [load_mode_data(mode_dir) for mode_dir in mode_dirs]
+    mode_data.sort(key=lambda item: mode_sort_key(item["mode"]))
+    summary_rows = summarize_modes(experiment_root, env_setup, mode_data, switch_log_dir_override)
 
     plots_dir = output_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
     step_series_max = []
-    step_series_mean = []
     bw_series = []
     for item in mode_data:
         rows = item["step_rows"]
@@ -1266,92 +583,127 @@ def build_single_experiment_report(
             continue
         steps = [int(row["step"]) for row in rows]
         step_series_max.append((f'{item["mode"]} step_ms_max', steps, [float(row["step_ms_max"]) for row in rows]))
-        step_series_mean.append((f'{item["mode"]} step_ms_mean', steps, [float(row["step_ms_mean"]) for row in rows]))
         bw_series.append((item["mode"], steps, [float(row["collective_gbps_est"]) for row in rows]))
 
-    p_step = plots_dir / "step_timeline.png"
-    save_line_plot(p_step, f"{experiment_root.name} Step Timeline", "step", "latency (ms)", step_series_max + step_series_mean)
-
-    p_bw = plots_dir / "throughput_timeline.png"
-    save_line_plot(p_bw, f"{experiment_root.name} Collective Throughput Estimate", "step", "Gbps", bw_series)
-
-    categories = [row["mode"] for row in summary_rows]
-    p_step_summary = plots_dir / "summary_latency.png"
-    save_grouped_bar(
-        p_step_summary,
+    p_step = base.save_line_plot(plots_dir / "step_timeline.png", f"{experiment_root.name} Step Timeline", "collective step", "latency (ms)", step_series_max)
+    p_bw = base.save_line_plot(plots_dir / "throughput_timeline.png", f"{experiment_root.name} Throughput Estimate", "collective step", "Gbps", bw_series)
+    p_step_summary = base.save_grouped_bar(
+        plots_dir / "summary_latency.png",
         "Latency Summary by Mode",
-        categories,
+        [row["mode"] for row in summary_rows],
         [("avg", [float(row["step_ms_avg"]) for row in summary_rows]), ("p95", [float(row["step_ms_p95"]) for row in summary_rows])],
         "ms",
     )
-
-    p_bw_summary = plots_dir / "summary_throughput.png"
-    save_grouped_bar(
-        p_bw_summary,
+    p_bw_summary = base.save_grouped_bar(
+        plots_dir / "summary_throughput.png",
         "Throughput Summary by Mode",
-        categories,
+        [row["mode"] for row in summary_rows],
         [("avg", [float(row["collective_gbps_avg"]) for row in summary_rows]), ("p95", [float(row["collective_gbps_p95"]) for row in summary_rows])],
         "Gbps",
     )
+    p_window = save_window_trace_by_mode_plot(plots_dir / "step_window_trace.png", mode_data, f"{experiment_root.name} Step-Axis Window Trace")
+    p_pfc = save_switch_pfc_counts_plot(plots_dir / "switch_pfc_counts.png", summary_rows, "Switch PFC Metrics by Mode")
+    p_occ = base.save_grouped_bar(
+        plots_dir / "occupancy_summary.png",
+        "Outstanding Depth Summary by Mode",
+        [row["mode"] for row in summary_rows],
+        [("p99_occ_pd", [float(row["p99_occ_pd"]) for row in summary_rows]), ("p99_occ_tr", [float(row["p99_occ_tr"]) for row in summary_rows])],
+        "depth",
+    )
+    p_events = base.save_event_counts_plot(plots_dir / "event_counts.png", mode_data, top_events)
+    p_wstall = base.save_worker_wstall_plot(plots_dir / "wstall_by_worker.png", mode_data)
+    p_dist = base.save_window_distribution_plot(plots_dir / "window_distribution.png", mode_data)
+    p_switch = base.save_switch_overlay_plot(plots_dir / "switch_overlay.png", experiment_root, env_setup, mode_data, switch_log_dir_override)
+    p_switch_phase = base.save_switch_phase_pfc_plot(plots_dir / "switch_pfc_phase_overlay.png", experiment_root, env_setup, mode_data, switch_log_dir_override)
 
-    p_events = save_event_counts_plot(plots_dir / "event_counts.png", mode_data, top_events)
-    p_wstall = save_worker_wstall_plot(plots_dir / "wstall_by_worker.png", mode_data)
-    p_window = save_window_distribution_plot(plots_dir / "selected_window_distribution.png", mode_data)
-    p_occ = save_occupancy_summary_plot(plots_dir / "occupancy_summary.png", mode_data)
-    p_decision = save_decision_counts_plot(plots_dir / "decision_counts.png", mode_data)
-    p_pressure = save_pressure_summary_plot(plots_dir / "pressure_summary.png", mode_data)
-    p_switch = save_switch_overlay_plot(plots_dir / "switch_overlay.png", experiment_root, env_setup, mode_data)
+    worker_trace_paths = []
+    for item in mode_data:
+        trace_path = save_worker_window_trace_plot(plots_dir / f"worker_window_trace_{item['mode'].lower()}.png", item)
+        if trace_path is not None:
+            worker_trace_paths.append((trace_path, f"{item['mode']} worker window trace"))
+
+    info_rows = [["experiment_root", experiment_root.as_posix()], ["modes", ", ".join(item["mode"] for item in mode_data)]]
+    if env_setup:
+        for key in ["experiment_label", "collective", "run_modes", "payload_mb", "dtype", "nccl_algo", "nccl_proto", "policy_name", "policy_formula", "b3_disabled_by_runner", "switch_log_run_id", "switch_log_local_dir"]:
+            if key in env_setup:
+                info_rows.append([key, env_setup[key]])
+    if switch_log_dir_override:
+        info_rows.append(["switch_log_override", switch_log_dir_override])
 
     summary_headers = [
-        "mode", "collective", "payload_mb", "step_ms_avg", "step_ms_p95",
-        "collective_gbps_avg", "collective_gbps_p95", "total_wstall_count",
-        "p99_occ_tr", "w_eff_values", "delta_step_vs_stock_pct", "delta_bw_vs_stock_pct",
+        "mode", "static_w_cfg", "workload", "collective", "algo", "payload_mb", "step_ms_avg", "step_ms_p95",
+        "collective_gbps_avg", "switch_pfc_total", "switch_pfc_peak_rate", "p99_occ_tr", "w_eff_values",
+        "final_output_match_vs_stock", "final_output_match_workers",
+        "delta_step_vs_stock_pct", "delta_bw_vs_stock_pct", "delta_pfc_total_vs_stock_pct",
     ]
     summary_table = [
         [
-            row["mode"], row["collective"], f'{row["payload_mb"]:.3f}', f'{row["step_ms_avg"]:.3f}', f'{row["step_ms_p95"]:.3f}',
-            f'{row["collective_gbps_avg"]:.3f}', f'{row["collective_gbps_p95"]:.3f}', row["total_wstall_count"], f'{row["p99_occ_tr"]:.3f}',
-            row["w_eff_values"] or "-", f'{row["delta_step_vs_stock_pct"]:.2f}', f'{row["delta_bw_vs_stock_pct"]:.2f}',
+            row["mode"],
+            row["static_w_cfg"],
+            row["workload"],
+            row["collective"],
+            row["algo"],
+            f'{row["payload_mb"]:.3f}',
+            f'{row["step_ms_avg"]:.3f}',
+            f'{row["step_ms_p95"]:.3f}',
+            f'{row["collective_gbps_avg"]:.3f}',
+            f'{row["switch_pfc_total"]:.3f}',
+            f'{row["switch_pfc_peak_rate"]:.3f}',
+            f'{row["p99_occ_tr"]:.3f}',
+            row["w_eff_values"],
+            row["final_output_match_vs_stock"],
+            row["final_output_match_workers"],
+            f'{row["delta_step_vs_stock_pct"]:.2f}',
+            f'{row["delta_bw_vs_stock_pct"]:.2f}',
+            f'{row["delta_pfc_total_vs_stock_pct"]:.2f}',
         ]
         for row in summary_rows
     ]
 
-    info_rows = [["experiment_root", experiment_root.as_posix()], ["modes", ", ".join(item["mode"] for item in mode_data)]]
-    if env_setup:
-        for key in ["collective", "run_modes", "payload_mb", "dtype", "master_addr", "master_port_base", "policy_name", "master_server", "switch_log_run_id", "switch_log_local_dir"]:
-            if key in env_setup:
-                info_rows.append([key, env_setup[key]])
+    collection_rows = [
+        ["env_setup.json", "experiment metadata, static W sweep setup, B3 disabled flag"],
+        ["MODE/*_summary.json", "mode absolute latency / throughput summary"],
+        ["MODE/*_step_metrics.jsonl", "per-step collective metrics"],
+        ["MODE/workerXX/*_worker_step_timing.jsonl", "worker-local timing for step-axis W alignment"],
+        ["MODE/workerXX/*_rank_validation.json", "worker별 final output digest. STOCK 대비 semantic match 표시에 사용"],
+        ["MODE/workerXX/nccl.*.log", "PHASE0 logs for W_eff / occupancy / WSTALL"],
+        ["switch_log/*.jsonl", "switch PFC / ROCE logs"],
+    ]
+    visualization_rows = [
+        ["step_timeline.png", "mode별 collective step latency timeline"],
+        ["throughput_timeline.png", "mode별 throughput timeline"],
+        ["step_window_trace.png", "mode별 평균 receiver W step trace"],
+        ["switch_pfc_counts.png", "mode별 PFC total / peak 비교"],
+        ["switch_overlay.png", "switch pressure and step latency overlay"],
+    ]
 
     sections = [
-        '<section class="section"><h2>Experiment Metadata</h2>' + render_table(["field", "value"], info_rows) + "</section>",
-        '<section class="section"><div class="grid-2">' + build_collection_plan_card_single(experiment_root, env_setup, mode_data) + build_visualization_plan_card_single(mode_data, env_setup) + "</div></section>",
-        '<section class="section"><div class="grid-2">'
-        + render_field_help_card("Run Summary Field Meanings", RUN_SUMMARY_FIELD_HELP, ["mode", "phase2_mode", "collective", "world_size", "payload_mb", "step_ms_avg", "step_ms_p95", "collective_gbps_avg", "collective_gbps_p95", "delta_step_vs_stock_pct", "delta_bw_vs_stock_pct"])
-        + render_field_help_card("NCCL Summary Field Meanings", NCCL_SUMMARY_FIELD_HELP, ["total_events", "total_wstall_count", "recv_wstall_count", "send_wstall_count", "p99_occ_pd", "p99_occ_tr", "w_eff_values", "decision_counts", "pressure_score_p95"])
-        + "</div></section>",
-        '<section class="section"><h2>Mode Summary</h2>' + render_table(summary_headers, summary_table) + "</section>",
+        '<section class="section"><h2>Experiment Metadata</h2>' + base.render_table(["field", "value"], info_rows) + "</section>",
+        '<section class="section"><div class="grid-2"><div class="card"><h2>Collected Logs</h2>' + base.render_table(["source", "meaning"], collection_rows) + '</div><div class="card"><h2>Visualization Plan</h2>' + base.render_table(["plot", "meaning"], visualization_rows) + "</div></div></section>",
+        '<section class="section"><h2>Mode Summary</h2>' + base.render_table(summary_headers, summary_table) + "</section>",
     ]
-    worker_stats_section = build_worker_stats_section(mode_data)
-    if worker_stats_section:
-        sections.append(worker_stats_section)
+
+    for item in mode_data:
+        sections.append(f'<section class="section"><h2>{html.escape(item["mode"])} Receiver Window by Worker</h2>{build_worker_window_table(item)}</section>')
 
     figure_fragments = []
-    for plot_path, caption in [
-        (p_step, "mode별 step latency timeline"),
+    for path, caption in [
+        (p_step, "mode별 collective step latency timeline"),
         (p_bw, "mode별 collective throughput estimate"),
-        (p_step_summary, "mode별 latency summary"),
-        (p_bw_summary, "mode별 throughput summary"),
-        (p_events, "mode별 top NCCL event counts"),
+        (p_step_summary, "mode별 absolute latency"),
+        (p_bw_summary, "mode별 absolute throughput"),
+        (p_window, "mode별 step-axis window trace"),
+        (p_pfc, "mode별 PFC total / peak"),
+        (p_occ, "mode별 outstanding depth"),
+        (p_events, "mode별 top NCCL events"),
         (p_wstall, "worker별 WSTALL count"),
-        (p_window, "selected W_eff distribution"),
-        (p_occ, "occupancy summary"),
-        (p_decision, "decision reason count"),
-        (p_pressure, "pressure score summary"),
-        (p_switch, "switch PFC / ROCE pressure overlay"),
-    ]:
-        if plot_path is None or not plot_path.exists():
+        (p_dist, "receiver W distribution"),
+        (p_switch, "switch pressure overlay"),
+        (p_switch_phase, "phase-aligned PFC overlay"),
+    ] + worker_trace_paths:
+        if path is None or not path.exists():
             continue
-        figure_fragments.append(f'<figure><img src="{html.escape(relpath(plot_path, output_dir))}" alt="{html.escape(caption)}"><figcaption>{html.escape(caption)}</figcaption></figure>')
+        figure_fragments.append(f'<figure><img src="{html.escape(base.relpath(path, output_dir))}" alt="{html.escape(caption)}"><figcaption>{html.escape(caption)}</figcaption></figure>')
     sections.append('<section class="section"><h2>Plots</h2>' + "".join(figure_fragments) + "</section>")
 
     html_path = output_dir / "phase2_report.html"
@@ -1363,9 +715,7 @@ def build_single_experiment_report(
             {
                 "experiment": experiment_root.name,
                 "env_setup": env_setup,
-                "modes": summary_rows,
-                "worker_stats_by_mode": {item["mode"]: collect_worker_stats(item["nccl"]) for item in mode_data},
-                "switch_overlay_plot": relpath(p_switch, output_dir) if p_switch is not None and p_switch.exists() else None,
+                "mode_summary": summary_rows,
             },
             indent=2,
             ensure_ascii=False,
@@ -1374,158 +724,87 @@ def build_single_experiment_report(
     )
 
     report_csv = output_dir / "phase2_report.csv"
-    with report_csv.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(summary_rows[0].keys()) if summary_rows else [])
-        if summary_rows:
+    if summary_rows:
+        with report_csv.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(summary_rows[0].keys()))
             writer.writeheader()
             writer.writerows(summary_rows)
 
-    log_progress(f"build single report complete experiment={experiment_root.name} html={html_path.as_posix()}")
+    base.log_progress(f"build single report complete experiment={experiment_root.name} html={html_path.as_posix()}")
     return html_path
 
 
-def collect_matrix_rows(experiment_name: str, mode_rows: List[dict]) -> List[dict]:
-    rows: List[dict] = []
-    for row in mode_rows:
-        flat = dict(row)
-        flat["experiment"] = experiment_name
-        rows.append(flat)
-    return rows
+def save_stock_vs_b2_grouped_plot(path: Path, title: str, experiment_names: List[str], matrix_rows: List[dict], metric: str, ylabel: str) -> Optional[Path]:
+    mode_names = sorted({row["mode"] for row in matrix_rows}, key=mode_sort_key)
+    series = []
+    for mode_name in mode_names:
+        values = []
+        for experiment_name in experiment_names:
+            row = next((item for item in matrix_rows if item["experiment"] == experiment_name and item["mode"] == mode_name), None)
+            values.append(float(row[metric]) if row else 0.0)
+        series.append((mode_name, values))
+    return base.save_grouped_bar(path, title, experiment_names, series, ylabel, rotate_labels=True)
 
 
-def build_collection_plan_card_matrix(matrix_root: Path, manifest: Optional[dict], experiment_dirs: List[Path]) -> str:
-    total_logs = 0
-    for experiment_dir in experiment_dirs:
-        for mode_dir in find_mode_dirs(experiment_dir):
-            total_logs += len(list(mode_dir.glob("*/nccl.*.log")))
-    rows = [
-        ["matrix_manifest.json", "matrix 전체 조합과 worker pool 정의."],
-        ["NN_experiment/env_setup.json", "각 experiment의 collective, payload, run_modes, policy 정보."],
-        ["NN_experiment/MODE/*_summary.json", "mode별 절대 성능 요약."],
-        ["NN_experiment/MODE/*_step_metrics.jsonl", "step 시계열."],
-        [f"NN_experiment/MODE/workerXX/nccl.*.log ({total_logs} files)", "NCCL PHASE 이벤트 로그."],
-    ]
-    if manifest and "experiments" in manifest:
-        rows.append(["experiment_count", len(manifest["experiments"])])
-    return '<div class="card"><h2>Collected Logs</h2>' + render_table(["source", "meaning"], rows) + '</div>'
+def save_b2_only_heatmap(path: Path, title: str, matrix_rows: List[dict], metric: str, colorbar_label: str) -> Optional[Path]:
+    b2_rows = [row for row in matrix_rows if str(row["mode"]).startswith("B2_W")]
+    if not b2_rows:
+        return None
+    experiment_names = sorted({row["experiment"] for row in b2_rows})
+    w_values = sorted({int(row["static_w_cfg"]) for row in b2_rows})
+    grid: List[List[float]] = []
+    for experiment_name in experiment_names:
+        row_values = []
+        for w_value in w_values:
+            row = next((item for item in b2_rows if item["experiment"] == experiment_name and int(item["static_w_cfg"]) == w_value), None)
+            row_values.append(float(row[metric]) if row else 0.0)
+        grid.append(row_values)
+    return save_heatmap(path, title, experiment_names, [str(v) for v in w_values], grid, colorbar_label)
 
 
-def build_visualization_plan_card_matrix() -> str:
-    rows = [
-        ("matrix_step_latency.png", "per-experiment summary", "experiment별 mode 절대 step latency 비교"),
-        ("matrix_throughput.png", "per-experiment summary", "experiment별 mode 절대 throughput 비교"),
-        ("matrix_step_delta_vs_stock.png", "summary + stock baseline", "stock 대비 latency 변화율 비교"),
-        ("matrix_bw_delta_vs_stock.png", "summary + stock baseline", "stock 대비 throughput 변화율 비교"),
-        ("matrix_occ_tr_delta_vs_stock.png", "NCCL logs + stock baseline", "stock 대비 p99_occ_tr 변화율 비교"),
-        ("matrix_wstall_delta_vs_stock.png", "NCCL logs + stock baseline", "stock 대비 total_wstall_count 변화율 비교"),
-    ]
-    return render_plot_help_card("Visualization Plan", rows)
-
-
-def build_matrix_report(matrix_root: Path, output_dir: Path, top_events: int) -> Path:
-    manifest = load_json(matrix_root / "matrix_manifest.json") if (matrix_root / "matrix_manifest.json").exists() else None
-    experiment_dirs = find_experiment_dirs(matrix_root)
+def build_matrix_report(matrix_root: Path, output_dir: Path, top_events: int, switch_log_dir_override: Optional[str]) -> Path:
+    experiment_dirs = base.find_experiment_dirs(matrix_root)
     if not experiment_dirs:
         raise FileNotFoundError(f"no experiment directories found in {matrix_root}")
-    log_progress(
-        f"build matrix report start matrix_root={matrix_root.as_posix()} experiments={len(experiment_dirs)}"
-    )
+    base.log_progress(f"build matrix report start matrix_root={matrix_root.as_posix()} experiments={len(experiment_dirs)}")
 
     per_experiment_links: Dict[str, str] = {}
     matrix_rows: List[dict] = []
+    experiment_payloads: List[Tuple[str, List[dict]]] = []
 
     for experiment_dir in experiment_dirs:
-        log_progress(f"matrix experiment start name={experiment_dir.name}")
-        mode_data = load_experiment_mode_data(experiment_dir)
         per_output = output_dir / experiment_dir.name
         per_output.mkdir(parents=True, exist_ok=True)
-        per_html = build_single_experiment_report(experiment_dir, per_output, top_events, mode_data=mode_data)
-        per_experiment_links[experiment_dir.name] = relpath(per_html, output_dir)
-        matrix_rows.extend(collect_matrix_rows(experiment_dir.name, summarize_modes(mode_data)))
-        log_progress(f"matrix experiment complete name={experiment_dir.name}")
+        per_html = build_single_experiment_report(experiment_dir, per_output, top_events, switch_log_dir_override)
+        env_setup = base.load_json(experiment_dir / "env_setup.json") if (experiment_dir / "env_setup.json").exists() else None
+        experiment_label = experiment_label_from_env(experiment_dir, env_setup)
+        per_experiment_links[experiment_label] = base.relpath(per_html, output_dir)
+        mode_data = [load_mode_data(mode_dir) for mode_dir in base.find_mode_dirs(experiment_dir)]
+        mode_data.sort(key=lambda item: mode_sort_key(item["mode"]))
+        summary_rows = summarize_modes(experiment_dir, env_setup, mode_data, switch_log_dir_override)
+        matrix_rows.extend(summary_rows)
+        experiment_payloads.append((experiment_label, mode_data))
 
-    experiment_names = [exp.name for exp in experiment_dirs]
-    mode_names = sorted({row["mode"] for row in matrix_rows}, key=mode_sort_key)
-
-    def values_for(metric: str, mode_name: str) -> List[float]:
-        values = []
-        for exp_name in experiment_names:
-            row = next((item for item in matrix_rows if item["experiment"] == exp_name and item["mode"] == mode_name), None)
-            values.append(float(row[metric]) if row else 0.0)
-        return values
+    experiment_names = [label for label, _ in experiment_payloads]
 
     plots_dir = output_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    p_abs_step = plots_dir / "matrix_step_latency.png"
-    save_grouped_bar(
-        p_abs_step,
-        "Matrix - Step Latency by Experiment",
-        experiment_names,
-        [(mode_name, values_for("step_ms_avg", mode_name)) for mode_name in mode_names],
-        "step_ms_avg",
-        rotate_labels=True,
-    )
+    p_latency = save_stock_vs_b2_grouped_plot(plots_dir / "stock_vs_b2_latency.png", "STOCK vs B2 Latency", experiment_names, matrix_rows, "step_ms_avg", "step_ms_avg")
+    p_bw = save_stock_vs_b2_grouped_plot(plots_dir / "stock_vs_b2_throughput.png", "STOCK vs B2 Throughput", experiment_names, matrix_rows, "collective_gbps_avg", "collective_gbps_avg")
+    p_pfc = save_stock_vs_b2_grouped_plot(plots_dir / "stock_vs_b2_switch_pfc_counts.png", "STOCK vs B2 PFC Counts", experiment_names, matrix_rows, "switch_pfc_total", "switch_pfc_total")
+    p_trace = save_matrix_step_window_trace_plot(plots_dir / "stock_vs_b2_step_window_trace.png", experiment_payloads)
 
-    p_abs_bw = plots_dir / "matrix_throughput.png"
-    save_grouped_bar(
-        p_abs_bw,
-        "Matrix - Throughput by Experiment",
-        experiment_names,
-        [(mode_name, values_for("collective_gbps_avg", mode_name)) for mode_name in mode_names],
-        "collective_gbps_avg",
-        rotate_labels=True,
-    )
-
-    candidate_modes = [mode for mode in mode_names if mode != "STOCK"]
-    p_delta_step = None
-    p_delta_bw = None
-    p_delta_occ = None
-    p_delta_wstall = None
-    if candidate_modes:
-        p_delta_step = plots_dir / "matrix_step_delta_vs_stock.png"
-        save_grouped_bar(
-            p_delta_step,
-            "Matrix - Step Latency Change vs Stock",
-            experiment_names,
-            [(mode_name, values_for("delta_step_vs_stock_pct", mode_name)) for mode_name in candidate_modes],
-            "delta_step_vs_stock_pct",
-            rotate_labels=True,
-        )
-
-        p_delta_bw = plots_dir / "matrix_bw_delta_vs_stock.png"
-        save_grouped_bar(
-            p_delta_bw,
-            "Matrix - Throughput Change vs Stock",
-            experiment_names,
-            [(mode_name, values_for("delta_bw_vs_stock_pct", mode_name)) for mode_name in candidate_modes],
-            "delta_bw_vs_stock_pct",
-            rotate_labels=True,
-        )
-
-        p_delta_occ = plots_dir / "matrix_occ_tr_delta_vs_stock.png"
-        save_grouped_bar(
-            p_delta_occ,
-            "Matrix - p99_occ_tr Change vs Stock",
-            experiment_names,
-            [(mode_name, values_for("delta_occ_tr_vs_stock_pct", mode_name)) for mode_name in candidate_modes],
-            "delta_occ_tr_vs_stock_pct",
-            rotate_labels=True,
-        )
-
-        p_delta_wstall = plots_dir / "matrix_wstall_delta_vs_stock.png"
-        save_grouped_bar(
-            p_delta_wstall,
-            "Matrix - Total WSTALL Change vs Stock",
-            experiment_names,
-            [(mode_name, values_for("delta_wstall_vs_stock_pct", mode_name)) for mode_name in candidate_modes],
-            "delta_wstall_vs_stock_pct",
-            rotate_labels=True,
-        )
+    p_b2_latency = save_b2_only_heatmap(plots_dir / "b2_matrix_latency.png", "B2 Matrix Latency", matrix_rows, "step_ms_avg", "step_ms_avg")
+    p_b2_bw = save_b2_only_heatmap(plots_dir / "b2_matrix_throughput.png", "B2 Matrix Throughput", matrix_rows, "collective_gbps_avg", "collective_gbps_avg")
+    p_b2_pfc_count = save_b2_only_heatmap(plots_dir / "b2_matrix_pfc_count.png", "B2 Matrix PFC Count", matrix_rows, "switch_pfc_total", "switch_pfc_total")
+    p_b2_pfc_peak = save_b2_only_heatmap(plots_dir / "b2_matrix_pfc_severity.png", "B2 Matrix PFC Severity", matrix_rows, "switch_pfc_peak_rate", "switch_pfc_peak_rate")
 
     summary_headers = [
-        "experiment", "mode", "collective", "payload_mb", "step_ms_avg", "collective_gbps_avg",
-        "total_wstall_count", "p99_occ_tr", "delta_step_vs_stock_pct", "delta_bw_vs_stock_pct", "report",
+        "experiment", "mode", "static_w_cfg", "workload", "step_ms_avg", "collective_gbps_avg",
+        "switch_pfc_total", "switch_pfc_peak_rate", "p99_occ_tr", "w_eff_values",
+        "final_output_match_vs_stock", "final_output_match_workers",
+        "delta_step_vs_stock_pct", "delta_bw_vs_stock_pct", "delta_pfc_total_vs_stock_pct", "report",
     ]
     summary_rows_html = []
     for row in matrix_rows:
@@ -1533,67 +812,53 @@ def build_matrix_report(matrix_root: Path, output_dir: Path, top_events: int) ->
         summary_rows_html.append([
             html.escape(str(row["experiment"])),
             html.escape(str(row["mode"])),
-            html.escape(str(row["collective"])),
-            f'{row["payload_mb"]:.3f}',
+            str(row["static_w_cfg"]),
+            html.escape(str(row["workload"])),
             f'{row["step_ms_avg"]:.3f}',
             f'{row["collective_gbps_avg"]:.3f}',
-            str(row["total_wstall_count"]),
+            f'{row["switch_pfc_total"]:.3f}',
+            f'{row["switch_pfc_peak_rate"]:.3f}',
             f'{row["p99_occ_tr"]:.3f}',
+            html.escape(str(row["w_eff_values"])),
+            html.escape(str(row["final_output_match_vs_stock"])),
+            html.escape(str(row["final_output_match_workers"])),
             f'{row["delta_step_vs_stock_pct"]:.2f}',
             f'{row["delta_bw_vs_stock_pct"]:.2f}',
+            f'{row["delta_pfc_total_vs_stock_pct"]:.2f}',
             f'<a href="{html.escape(link)}">open</a>',
         ])
 
+    collection_card = build_collection_plan_card_matrix(experiment_dirs)
+    visualization_card = build_visualization_plan_card_matrix()
     sections = [
-        '<section class="section"><div class="grid-2">'
-        + build_collection_plan_card_matrix(matrix_root, manifest, experiment_dirs)
-        + build_visualization_plan_card_matrix()
-        + "</div></section>",
-        '<section class="section"><div class="grid-2">'
-        + render_field_help_card(
-            "Run Summary Field Meanings",
-            RUN_SUMMARY_FIELD_HELP,
-            ["mode", "collective", "payload_mb", "step_ms_avg", "step_ms_p95", "collective_gbps_avg", "collective_gbps_p95", "delta_step_vs_stock_pct", "delta_bw_vs_stock_pct"],
-        )
-        + render_field_help_card(
-            "NCCL Summary Field Meanings",
-            NCCL_SUMMARY_FIELD_HELP,
-            ["total_events", "total_wstall_count", "recv_wstall_count", "send_wstall_count", "p99_occ_pd", "p99_occ_tr", "w_eff_values", "decision_counts", "pressure_score_p95"],
-        )
-        + "</div></section>",
-        '<section class="section"><h2>Matrix Summary</h2>' + render_table_raw(summary_headers, summary_rows_html) + "</section>",
+        '<section class="section"><div class="grid-2">' + collection_card + visualization_card + "</div></section>",
+        '<section class="section"><h2>Matrix Summary</h2>' + base.render_table_raw(summary_headers, summary_rows_html) + "</section>",
     ]
 
     figure_fragments = []
     for path, caption in [
-        (p_abs_step, "experiment별 step latency"),
-        (p_abs_bw, "experiment별 throughput"),
-        (p_delta_step, "stock 대비 step latency 변화율"),
-        (p_delta_bw, "stock 대비 throughput 변화율"),
-        (p_delta_occ, "stock 대비 p99_occ_tr 변화율"),
-        (p_delta_wstall, "stock 대비 total WSTALL 변화율"),
+        (p_latency, "stock vs B2 latency"),
+        (p_bw, "stock vs B2 throughput"),
+        (p_pfc, "stock vs B2 PFC count"),
+        (p_trace, "stock vs B2 step-axis W trace"),
+        (p_b2_latency, "B2 latency heatmap"),
+        (p_b2_bw, "B2 throughput heatmap"),
+        (p_b2_pfc_count, "B2 PFC count heatmap"),
+        (p_b2_pfc_peak, "B2 PFC severity heatmap"),
     ]:
         if path is None or not path.exists():
             continue
-        figure_fragments.append(
-            f'<figure><img src="{html.escape(relpath(path, output_dir))}" alt="{html.escape(caption)}"><figcaption>{html.escape(caption)}</figcaption></figure>'
-        )
+        figure_fragments.append(f'<figure><img src="{html.escape(base.relpath(path, output_dir))}" alt="{html.escape(caption)}"><figcaption>{html.escape(caption)}</figcaption></figure>')
     sections.append('<section class="section"><h2>Plots</h2>' + "".join(figure_fragments) + "</section>")
 
-    report_list = "".join(
-        f'<li><a href="{html.escape(link)}">{html.escape(name)}</a></li>'
-        for name, link in sorted(per_experiment_links.items())
-    )
+    report_list = "".join(f'<li><a href="{html.escape(link)}">{html.escape(name)}</a></li>' for name, link in sorted(per_experiment_links.items()))
     sections.append('<section class="section"><h2>Per-experiment Reports</h2><ul>' + report_list + "</ul></section>")
 
     html_path = output_dir / "phase2_report.html"
     html_path.write_text(render_html(f"Phase2 Matrix Report - {matrix_root.name}", sections), encoding="utf-8")
 
     report_json = output_dir / "phase2_report.json"
-    report_json.write_text(
-        json.dumps({"matrix_root": matrix_root.name, "rows": matrix_rows}, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    report_json.write_text(json.dumps({"matrix_root": matrix_root.name, "rows": matrix_rows}, indent=2, ensure_ascii=False), encoding="utf-8")
 
     report_csv = output_dir / "phase2_report.csv"
     if matrix_rows:
@@ -1602,48 +867,26 @@ def build_matrix_report(matrix_root: Path, output_dir: Path, top_events: int) ->
             writer.writeheader()
             writer.writerows(matrix_rows)
 
-    log_progress(f"build matrix report complete html={html_path.as_posix()}")
+    base.log_progress(f"build matrix report complete html={html_path.as_posix()}")
     return html_path
 
 
 def main() -> None:
-    global REPORT_LOG_PATH
     args = parse_args()
-    input_path = Path(args.input).resolve()
+    input_path = Path(args.input_dir).resolve()
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    if input_path.suffix.lower() == ".zip":
-        default_output = input_path.with_name(f"{input_path.stem}_report")
-        output_dir = Path(args.output_dir).resolve() if args.output_dir else default_output
-        output_dir.mkdir(parents=True, exist_ok=True)
-        REPORT_LOG_PATH = output_dir / "phase2_reporter.log"
-        REPORT_LOG_PATH.write_text("", encoding="utf-8")
-        log_progress(f"start input={input_path.as_posix()} output={output_dir.as_posix()}")
-        with tempfile.TemporaryDirectory(prefix="phase2_log_reporter_") as tempdir:
-            temp_root = Path(tempdir)
-            log_progress(f"extract zip start temp_root={temp_root.as_posix()}")
-            with zipfile.ZipFile(input_path) as zf:
-                zf.extractall(temp_root)
-                top_level_dirs = sorted({Path(name).parts[0] for name in zf.namelist() if name.strip("/")})
-            if not top_level_dirs:
-                raise FileNotFoundError(f"zip archive is empty: {input_path}")
-            extracted_root = temp_root / top_level_dirs[0]
-            log_progress(f"extract zip complete extracted_root={extracted_root.as_posix()}")
-            if is_matrix_root(extracted_root):
-                html_path = build_matrix_report(extracted_root, output_dir, args.top_events)
-            else:
-                html_path = build_single_experiment_report(extracted_root, output_dir, args.top_events)
+    base.REPORT_LOG_PATH = output_dir / "phase2_reporter.log"
+    base.REPORT_LOG_PATH.write_text("", encoding="utf-8")
+    base.log_progress(f"start input={input_path.as_posix()} output={output_dir.as_posix()}")
+
+    if base.is_matrix_root(input_path):
+        html_path = build_matrix_report(input_path, output_dir, args.top_events, args.switch_log)
     else:
-        output_dir = Path(args.output_dir).resolve() if args.output_dir else input_path / "report"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        REPORT_LOG_PATH = output_dir / "phase2_reporter.log"
-        REPORT_LOG_PATH.write_text("", encoding="utf-8")
-        log_progress(f"start input={input_path.as_posix()} output={output_dir.as_posix()}")
-        if is_matrix_root(input_path):
-            html_path = build_matrix_report(input_path, output_dir, args.top_events)
-        else:
-            html_path = build_single_experiment_report(input_path, output_dir, args.top_events)
+        html_path = build_single_experiment_report(input_path, output_dir, args.top_events, args.switch_log)
 
-    log_progress(f"wrote html={html_path.as_posix()}")
+    base.log_progress(f"wrote html={html_path.as_posix()}")
 
 
 if __name__ == "__main__":

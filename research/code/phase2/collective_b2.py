@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import os
 import time
@@ -11,7 +12,7 @@ import torch.distributed as dist
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Phase 2 B2 collective workload")
+    parser = argparse.ArgumentParser(description="Phase 2 static-W collective workload")
     parser.add_argument(
         "--collective",
         choices=["allreduce", "allgather", "reducescatter", "alltoall"],
@@ -19,7 +20,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--steps", type=int, default=40)
     parser.add_argument("--warmup-steps", type=int, default=5)
-    parser.add_argument("--payload-mb", type=int, default=64, help="Per-rank logical payload in MiB")
+    parser.add_argument("--payload-mb", type=int, default=128, help="Per-rank logical payload in MiB")
     parser.add_argument("--dtype", choices=["float16", "float32", "bfloat16"], default="float32")
     parser.add_argument("--sleep-ms", type=int, default=0)
     parser.add_argument("--output-dir", default=os.environ.get("PHASE2_OUTPUT_DIR"))
@@ -75,13 +76,18 @@ def main() -> None:
     payload_bytes = args.payload_mb * 1024 * 1024
     run_tag = args.tag or os.environ.get("PHASE2_MODE", "B2").upper()
     output_dir = Path(args.output_dir) if args.output_dir else None
+    worker_name = os.environ.get("WORKER_NAME", f"worker_rank{rank}")
     if rank == 0 and output_dir is not None:
-      output_dir.mkdir(parents=True, exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
     step_metrics_path = output_dir / f"{run_tag}_step_metrics.jsonl" if rank == 0 and output_dir is not None else None
+    worker_dir = output_dir / worker_name if output_dir is not None else None
+    step_timing_path = worker_dir / f"{run_tag}_worker_step_timing.jsonl" if worker_dir is not None else None
+    validation_path = worker_dir / f"{run_tag}_rank_validation.json" if worker_dir is not None else None
 
     traffic_bytes_est_rank = 0.0
     input_tensor = None
     output_tensor = None
+    final_output_tensor = None
 
     if args.collective == "allreduce":
         elems = max(1, payload_bytes // elem_size)
@@ -116,23 +122,31 @@ def main() -> None:
 
     payload_mb = payload_bytes / (1024.0 * 1024.0)
     traffic_mb_est_rank = traffic_bytes_est_rank / (1024.0 * 1024.0)
+    phase2_mode = os.environ.get("PHASE2_MODE", "b2").lower()
+    static_w = int(os.environ.get("NCCL_PHASE1_STATIC_W", "0"))
 
     if rank == 0:
         print(
             f"phase2_b2 collective={args.collective} steps={args.steps} warmup_steps={args.warmup_steps} "
             f"payload_mb={payload_mb:.3f} dtype={args.dtype} world_size={world_size} "
-            f"phase2_mode={os.environ.get('PHASE2_MODE', 'b2')} traffic_mb_est_rank={traffic_mb_est_rank:.3f}"
+            f"phase2_mode={phase2_mode} static_w={static_w} traffic_mb_est_rank={traffic_mb_est_rank:.3f}"
         )
 
     records = []
     dist.barrier()
     handle = step_metrics_path.open("w", encoding="utf-8") if step_metrics_path is not None else None
+    timing_handle = None
+    if worker_dir is not None:
+        worker_dir.mkdir(parents=True, exist_ok=True)
+        timing_handle = step_timing_path.open("w", encoding="utf-8")
+
     try:
         for step in range(args.steps):
             base_value = float(rank + 1 + step * 0.001)
             input_tensor.fill_(base_value)
 
             torch.cuda.synchronize(device)
+            step_start_ns = time.monotonic_ns()
             ts_start_unix_ns = time.time_ns()
             t0 = time.perf_counter()
 
@@ -148,6 +162,7 @@ def main() -> None:
             torch.cuda.synchronize(device)
             t1 = time.perf_counter()
             ts_end_unix_ns = time.time_ns()
+            step_end_ns = time.monotonic_ns()
 
             local_ms = (t1 - t0) * 1000.0
             local_times = torch.tensor([local_ms], device=device, dtype=torch.float64)
@@ -160,20 +175,26 @@ def main() -> None:
             if args.collective == "allreduce":
                 sample = float(input_tensor[0].float().item())
                 expected = expected_sum(world_size, step)
+                current_output_tensor = input_tensor
             elif args.collective == "allgather":
                 sample = float(output_tensor[0].float().item())
                 expected = 1.0 + step * 0.001
+                current_output_tensor = output_tensor
             elif args.collective == "reducescatter":
                 sample = float(output_tensor[0].float().item())
                 expected = expected_sum(world_size, step)
+                current_output_tensor = output_tensor
             else:
                 sample = float(output_tensor[0].float().item())
                 expected = 1.0 + step * 0.001
+                current_output_tensor = output_tensor
 
             if abs(sample - expected) > 1e-2:
                 raise RuntimeError(
                     f"rank {rank}: validation failed for {args.collective} at step {step}: got {sample}, expected {expected}"
                 )
+            if step == args.steps - 1:
+                final_output_tensor = current_output_tensor.detach()
 
             step_s = max(float(max_times[0].item()), 1e-9) / 1000.0
             collective_gbps_est = (traffic_bytes_est_rank * 8.0) / step_s / 1e9
@@ -181,8 +202,10 @@ def main() -> None:
             record = {
                 "step": step,
                 "tag": run_tag,
-                "phase2_mode": os.environ.get("PHASE2_MODE", "b2"),
+                "phase2_mode": phase2_mode,
+                "phase1_static_w": static_w,
                 "phase2_b2_enable": int(os.environ.get("NCCL_PHASE2_B2_ENABLE", "0")),
+                "phase3_b3_enable": int(os.environ.get("NCCL_PHASE3_B3_ENABLE", "0")),
                 "collective": args.collective,
                 "world_size": world_size,
                 "payload_mb": payload_mb,
@@ -196,7 +219,6 @@ def main() -> None:
                 "warmup": step < args.warmup_steps,
                 "algo": os.environ.get("NCCL_ALGO", ""),
                 "proto": os.environ.get("NCCL_PROTO", ""),
-                "rack_map_file": os.environ.get("NCCL_RACK_MAP_FILE", ""),
             }
 
             if rank == 0:
@@ -206,18 +228,63 @@ def main() -> None:
                     handle.write(json.dumps(record, sort_keys=True) + "\n")
                     handle.flush()
 
+            if timing_handle is not None:
+                timing_row = {
+                    "step": step,
+                    "rank": rank,
+                    "worker": worker_name,
+                    "phase2_mode": phase2_mode,
+                    "phase1_static_w": static_w,
+                    "collective": args.collective,
+                    "warmup": step < args.warmup_steps,
+                    "start_ns": step_start_ns,
+                    "end_ns": step_end_ns,
+                    "local_step_ms": local_ms,
+                }
+                timing_handle.write(json.dumps(timing_row, sort_keys=True) + "\n")
+                timing_handle.flush()
+
             if args.sleep_ms > 0:
                 time.sleep(args.sleep_ms / 1000.0)
     finally:
         if handle is not None:
             handle.close()
+        if timing_handle is not None:
+            timing_handle.close()
+
+    if validation_path is not None and final_output_tensor is not None:
+        cpu_tensor = final_output_tensor.detach().contiguous().cpu()
+        tensor_bytes = cpu_tensor.numpy().tobytes()
+        validation_row = {
+            "worker": worker_name,
+            "rank": rank,
+            "tag": run_tag,
+            "phase2_mode": phase2_mode,
+            "phase1_static_w": static_w,
+            "phase2_b2_enable": int(os.environ.get("NCCL_PHASE2_B2_ENABLE", "0")),
+            "phase3_b3_enable": int(os.environ.get("NCCL_PHASE3_B3_ENABLE", "0")),
+            "collective": args.collective,
+            "algo": os.environ.get("NCCL_ALGO", ""),
+            "proto": os.environ.get("NCCL_PROTO", ""),
+            "payload_mb": payload_mb,
+            "world_size": world_size,
+            "final_step": args.steps - 1,
+            "dtype": args.dtype,
+            "numel": int(cpu_tensor.numel()),
+            "local_validation_passed": True,
+            "final_sha256": hashlib.sha256(tensor_bytes).hexdigest(),
+            "final_head": cpu_tensor.flatten()[:8].tolist(),
+        }
+        validation_path.write_text(json.dumps(validation_row, indent=2, sort_keys=True), encoding="utf-8")
 
     if rank == 0 and output_dir is not None:
         effective = [r for r in records if not r["warmup"]]
         summary = {
             "run_tag": run_tag,
-            "phase2_mode": os.environ.get("PHASE2_MODE", "b2"),
+            "phase2_mode": phase2_mode,
+            "phase1_static_w": static_w,
             "phase2_b2_enable": int(os.environ.get("NCCL_PHASE2_B2_ENABLE", "0")),
+            "phase3_b3_enable": int(os.environ.get("NCCL_PHASE3_B3_ENABLE", "0")),
             "collective": args.collective,
             "world_size": world_size,
             "steps": args.steps,
@@ -228,7 +295,6 @@ def main() -> None:
             "dtype": args.dtype,
             "algo": os.environ.get("NCCL_ALGO", ""),
             "proto": os.environ.get("NCCL_PROTO", ""),
-            "rack_map_file": os.environ.get("NCCL_RACK_MAP_FILE", ""),
             "step_ms_avg": mean(r["step_ms_max"] for r in effective),
             "step_ms_p50": percentile([r["step_ms_max"] for r in effective], 0.50),
             "step_ms_p95": percentile([r["step_ms_max"] for r in effective], 0.95),

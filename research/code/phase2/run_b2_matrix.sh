@@ -7,24 +7,20 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/../../.." && pwd)
 RUN_ID=${RUN_ID:-phase2_b2_matrix_$(date +%y%m%d_%H%M%S)}
 MASTER_ADDR=${MASTER_ADDR:-172.16.0.101}
 MASTER_PORT_BASE=${MASTER_PORT_BASE:-31500}
+PORT_STRIDE=${PORT_STRIDE:-20}
 LOG_ROOT_BASE=${LOG_ROOT_BASE:-/mnt/nfs_share/cts_experiments}
 MATRIX_ROOT=${MATRIX_ROOT:-${LOG_ROOT_BASE}/${RUN_ID}}
-ALL_WORKERS=${ALL_WORKERS:-worker01,worker02,worker03,worker04,worker05,worker06,worker07,worker08}
-INTRA_RACK_HOSTS=${INTRA_RACK_HOSTS:-worker01,worker02,worker03,worker04}
-FULL_INTER_RACK_HOSTS=${FULL_INTER_RACK_HOSTS:-worker01,worker02,worker03,worker04,worker05,worker06,worker07,worker08}
-INTRA_PAYLOAD_MB=${INTRA_PAYLOAD_MB:-128}
-INTER_PAYLOAD_MB=${INTER_PAYLOAD_MB:-128}
-INTER_LARGE_PAYLOAD_MB=${INTER_LARGE_PAYLOAD_MB:-256}
-RUN_MODES=${RUN_MODES:-stock,b2}
+ALL_WORKERS=${ALL_WORKERS:-worker01,worker03,worker05,worker07}
+PAYLOAD_MB=${PAYLOAD_MB:-128}
+RUN_MODES=${RUN_MODES:-stock,b2_w2,b2_w4,b2_w5,b2_w6,b2_w7,b2_w8}
 DTYPE=${DTYPE:-float32}
 STEPS=${STEPS:-40}
 WARMUP_STEPS=${WARMUP_STEPS:-5}
 SLEEP_MS=${SLEEP_MS:-0}
 TORCH_ENV=${TORCH_ENV:-/workspace/venvs/torch-cu121-custom/bin/activate}
 INNER_SCRIPT=${INNER_SCRIPT:-research/code/phase2/run_b2_collective.sh}
-RACK_MAP_FILE=${NCCL_RACK_MAP_FILE:-${REPO_ROOT}/research/code/phase2/rack_map.txt}
 WORKER_NAME=${WORKER_NAME:-$(hostname -s)}
-MASTER_SERVER=${MASTER_SERVER:-}
+MASTER_SERVER=${MASTER_SERVER:-worker01}
 
 SWITCH_LOG_ENABLE=${SWITCH_LOG_ENABLE:-1}
 DPU_NODE_HOST=${DPU_NODE_HOST:-172.16.0.100}
@@ -37,9 +33,6 @@ SWITCH_METADATA_FILE=${SWITCH_METADATA_FILE:-${MATRIX_ROOT}/switch_logger.env}
 mkdir -p "${MATRIX_ROOT}"
 
 IFS=',' read -r -a ALL_WORKER_ARRAY <<< "${ALL_WORKERS}"
-if [[ -z "${MASTER_SERVER}" ]]; then
-  MASTER_SERVER=${ALL_WORKER_ARRAY[0]}
-fi
 
 contains_worker() {
   local worker=$1
@@ -111,6 +104,7 @@ SWITCH_LOG_DIR=
 SWITCH_LOG_LOCAL_DIR=
 SWITCH_LOG_PID_FILE=
 SWITCH_LOG_MARKERS_JSONL=
+CLEANUP_DONE=0
 
 write_switch_metadata() {
   cat > "${SWITCH_METADATA_FILE}" <<EOF2
@@ -144,15 +138,13 @@ wait_for_switch_metadata() {
 }
 
 start_switch_logger() {
+  if [[ -z "${NETWORK_NODE_PASSWORD:-}" || -z "${SWITCH_PASSWORD:-}" ]]; then
+    echo "[phase2-matrix] NETWORK_NODE_PASSWORD and SWITCH_PASSWORD must be set when SWITCH_LOG_ENABLE=1." >&2
+    exit 1
+  fi
   local cmd
   local output
-  cmd="cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && ./start_switch_congestion_loggers.sh --interval-sec $(printf '%q' "${SWITCH_LOG_INTERVAL_SEC}")"
-  if [[ -n "${NETWORK_NODE_PASSWORD:-}" ]]; then
-    cmd+=" --network-node-password $(printf '%q' "${NETWORK_NODE_PASSWORD}")"
-  fi
-  if [[ -n "${SWITCH_PASSWORD:-}" ]]; then
-    cmd+=" --switch-password $(printf '%q' "${SWITCH_PASSWORD}")"
-  fi
+  cmd="cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && ./start_switch_congestion_loggers.sh --interval-sec $(printf '%q' "${SWITCH_LOG_INTERVAL_SEC}") --network-node-password $(printf '%q' "${NETWORK_NODE_PASSWORD}") --switch-password $(printf '%q' "${SWITCH_PASSWORD}")"
   output=$(remote_dpu_bash "${cmd}")
   while IFS='=' read -r key value; do
     case "${key}" in
@@ -187,6 +179,10 @@ emit_switch_marker() {
   remote_dpu_bash "${cmd}" >/dev/null
 }
 
+emit_switch_marker_best_effort() {
+  emit_switch_marker "$@" || true
+}
+
 stop_switch_logger() {
   [[ "${SWITCH_LOG_ENABLE}" == "1" ]] || return 0
   [[ -n "${SWITCH_LOG_PID_FILE}" ]] || return 0
@@ -197,12 +193,16 @@ stop_switch_logger() {
 }
 
 cleanup() {
+  if (( CLEANUP_DONE == 1 )); then
+    return 0
+  fi
+  CLEANUP_DONE=1
   if (( SWITCH_LOG_STARTED == 1 )) && is_master_server; then
-    emit_switch_marker "matrix_end" "run_id=${RUN_ID}" "phase2_matrix"
+    emit_switch_marker_best_effort "matrix_end" "run_id=${RUN_ID}" "phase2_matrix"
     stop_switch_logger
   fi
 }
-trap cleanup EXIT
+trap cleanup EXIT INT TERM
 
 if [[ "${SWITCH_LOG_ENABLE}" == "1" ]]; then
   if is_master_server; then
@@ -214,51 +214,42 @@ if [[ "${SWITCH_LOG_ENABLE}" == "1" ]]; then
 fi
 
 EXPERIMENT_IDS=()
-EXPERIMENT_HOSTS=()
 EXPERIMENT_COLLS=()
-EXPERIMENT_PAYLOADS=()
+EXPERIMENT_ALGOS=()
 
 add_experiment() {
   EXPERIMENT_IDS+=("$1")
-  EXPERIMENT_HOSTS+=("$2")
-  EXPERIMENT_COLLS+=("$3")
-  EXPERIMENT_PAYLOADS+=("$4")
+  EXPERIMENT_COLLS+=("$2")
+  EXPERIMENT_ALGOS+=("$3")
 }
 
-add_experiment "intra_alltoall_${INTRA_PAYLOAD_MB}mb" "${INTRA_RACK_HOSTS}" "alltoall" "${INTRA_PAYLOAD_MB}"
-add_experiment "inter_alltoall_${INTER_PAYLOAD_MB}mb" "${FULL_INTER_RACK_HOSTS}" "alltoall" "${INTER_PAYLOAD_MB}"
-add_experiment "inter_alltoall_${INTER_LARGE_PAYLOAD_MB}mb" "${FULL_INTER_RACK_HOSTS}" "alltoall" "${INTER_LARGE_PAYLOAD_MB}"
+add_experiment "allreduce_ring_${PAYLOAD_MB}mb" "allreduce" "Ring"
+add_experiment "allreduce_tree_${PAYLOAD_MB}mb" "allreduce" "Tree"
+add_experiment "allgather_auto_${PAYLOAD_MB}mb" "allgather" "auto"
+add_experiment "reducescatter_auto_${PAYLOAD_MB}mb" "reducescatter" "auto"
+add_experiment "alltoall_auto_${PAYLOAD_MB}mb" "alltoall" "auto"
 
 MANIFEST_JSON="${MATRIX_ROOT}/matrix_manifest.json"
-if [[ "${WORKER_NAME}" == "${ALL_WORKER_ARRAY[0]}" ]]; then
+if is_master_server; then
   {
     echo "{"
-    echo "  \"run_id\": \"${RUN_ID}\"," 
-    echo "  \"master_addr\": \"${MASTER_ADDR}\"," 
+    echo "  \"run_id\": \"${RUN_ID}\","
+    echo "  \"master_addr\": \"${MASTER_ADDR}\","
     echo "  \"master_port_base\": ${MASTER_PORT_BASE},"
-    echo "  \"run_modes\": \"${RUN_MODES}\"," 
-    echo "  \"dtype\": \"${DTYPE}\"," 
-    echo "  \"intra_payload_mb\": ${INTRA_PAYLOAD_MB},"
-    echo "  \"inter_payload_mb\": ${INTER_PAYLOAD_MB},"
-    echo "  \"inter_large_payload_mb\": ${INTER_LARGE_PAYLOAD_MB},"
+    echo "  \"port_stride\": ${PORT_STRIDE},"
+    echo "  \"run_modes\": \"${RUN_MODES}\","
+    echo "  \"dtype\": \"${DTYPE}\","
+    echo "  \"payload_mb\": ${PAYLOAD_MB},"
     echo "  \"steps\": ${STEPS},"
     echo "  \"warmup_steps\": ${WARMUP_STEPS},"
-    echo "  \"rack_map_file\": \"${RACK_MAP_FILE}\"," 
-    echo "  \"worker_pool\": \"${ALL_WORKERS}\"," 
-    echo "  \"intra_rack_hosts\": \"${INTRA_RACK_HOSTS}\"," 
-    echo "  \"full_inter_rack_hosts\": \"${FULL_INTER_RACK_HOSTS}\"," 
-    echo "  \"master_server\": \"${MASTER_SERVER}\"," 
+    echo "  \"worker_pool\": \"${ALL_WORKERS}\","
+    echo "  \"switch_log_enable\": ${SWITCH_LOG_ENABLE},"
     if [[ "${SWITCH_LOG_ENABLE}" == "1" && -f "${SWITCH_METADATA_FILE}" ]]; then
       # shellcheck disable=SC1090
       source "${SWITCH_METADATA_FILE}"
-      echo "  \"switch_log_enable\": 1,"
-      echo "  \"switch_log_run_id\": \"${SWITCH_LOG_RUN_ID}\"," 
-      echo "  \"switch_log_dir\": \"${SWITCH_LOG_DIR}\"," 
-      echo "  \"switch_log_local_dir\": \"${SWITCH_LOG_LOCAL_DIR}\"," 
-      echo "  \"switch_log_markers_jsonl\": \"${SWITCH_LOG_MARKERS_JSONL}\"," 
-      echo "  \"dpu_node_host\": \"${DPU_NODE_HOST}\"," 
-    else
-      echo "  \"switch_log_enable\": 0,"
+      echo "  \"switch_log_run_id\": \"${SWITCH_LOG_RUN_ID}\","
+      echo "  \"switch_log_dir\": \"${SWITCH_LOG_DIR}\","
+      echo "  \"switch_log_local_dir\": \"${SWITCH_LOG_LOCAL_DIR}\","
     fi
     echo "  \"experiments\": ["
     for idx in "${!EXPERIMENT_IDS[@]}"; do
@@ -266,15 +257,15 @@ if [[ "${WORKER_NAME}" == "${ALL_WORKER_ARRAY[0]}" ]]; then
       if (( idx == ${#EXPERIMENT_IDS[@]} - 1 )); then
         comma=""
       fi
-      cat <<EOF2
+      cat <<EOF
     {
       "index": ${idx},
       "id": "${EXPERIMENT_IDS[$idx]}",
-      "hosts": "${EXPERIMENT_HOSTS[$idx]}",
       "collective": "${EXPERIMENT_COLLS[$idx]}",
-      "payload_mb": ${EXPERIMENT_PAYLOADS[$idx]}
+      "algo": "${EXPERIMENT_ALGOS[$idx]}",
+      "payload_mb": ${PAYLOAD_MB}
     }${comma}
-EOF2
+EOF
     done
     echo "  ]"
     echo "}"
@@ -286,34 +277,29 @@ echo "[phase2-matrix] WORKER_NAME=${WORKER_NAME}"
 echo "[phase2-matrix] MASTER_SERVER=${MASTER_SERVER}"
 echo "[phase2-matrix] MATRIX_ROOT=${MATRIX_ROOT}"
 echo "[phase2-matrix] TOTAL_EXPERIMENTS=${#EXPERIMENT_IDS[@]}"
-if [[ "${SWITCH_LOG_ENABLE}" == "1" ]]; then
-  echo "[phase2-matrix] SWITCH_METADATA_FILE=${SWITCH_METADATA_FILE}"
-fi
+echo "[phase2-matrix] PORT_STRIDE=${PORT_STRIDE}"
 
 for idx in "${!EXPERIMENT_IDS[@]}"; do
   exp_id=${EXPERIMENT_IDS[$idx]}
-  exp_hosts=${EXPERIMENT_HOSTS[$idx]}
   exp_coll=${EXPERIMENT_COLLS[$idx]}
-  exp_payload=${EXPERIMENT_PAYLOADS[$idx]}
-  exp_nodes=$(count_in_list "${exp_hosts}")
+  exp_algo=${EXPERIMENT_ALGOS[$idx]}
+  exp_nodes=$(count_in_list "${ALL_WORKERS}")
   exp_root="${MATRIX_ROOT}/$(printf "%02d_%s" "$((idx+1))" "${exp_id}")"
   status_dir="${MATRIX_ROOT}/.matrix_status/$(printf "%02d_%s" "$((idx+1))" "${exp_id}")"
   status_file="${status_dir}/${WORKER_NAME}.status"
-  port_base=$((MASTER_PORT_BASE + idx * 10))
+  port_base=$((MASTER_PORT_BASE + idx * PORT_STRIDE))
 
   mkdir -p "${status_dir}"
   rm -f "${status_file}"
 
   if is_master_server && [[ "${SWITCH_LOG_ENABLE}" == "1" ]]; then
-    emit_switch_marker "exp_start" "experiment=${exp_id} collective=${exp_coll} payload_mb=${exp_payload}" "phase2_matrix"
+    emit_switch_marker_best_effort "exp_start" "experiment=${exp_id} collective=${exp_coll} algo=${exp_algo} payload_mb=${PAYLOAD_MB}" "phase2_matrix"
   fi
 
   run_rc=0
-  participated=0
-  if contains_worker "${WORKER_NAME}" "${exp_hosts}"; then
-    participated=1
-    exp_rank=$(index_in_list "${WORKER_NAME}" "${exp_hosts}")
-    echo "[phase2-matrix] start idx=${idx} id=${exp_id} rank=${exp_rank}/${exp_nodes} coll=${exp_coll} payload=${exp_payload}MB"
+  if contains_worker "${WORKER_NAME}" "${ALL_WORKERS}"; then
+    exp_rank=$(index_in_list "${WORKER_NAME}" "${ALL_WORKERS}")
+    echo "[phase2-matrix] start idx=${idx} id=${exp_id} rank=${exp_rank}/${exp_nodes} coll=${exp_coll} algo=${exp_algo} payload=${PAYLOAD_MB}MB"
     set +e
     RUN_ID="${exp_id}" \
     LOG_ROOT="${exp_root}" \
@@ -332,25 +318,22 @@ for idx in "${!EXPERIMENT_IDS[@]}"; do
     SWITCH_LOG_SHARED_ROOT="${SWITCH_LOG_SHARED_ROOT}" \
     SWITCH_LOG_LOCAL_DIR="${SWITCH_LOG_LOCAL_DIR}" \
     COLLECTIVE="${exp_coll}" \
+    EXPERIMENT_LABEL="${exp_id}" \
     RUN_MODES="${RUN_MODES}" \
-    PAYLOAD_MB="${exp_payload}" \
+    PAYLOAD_MB="${PAYLOAD_MB}" \
     DTYPE="${DTYPE}" \
     STEPS="${STEPS}" \
     WARMUP_STEPS="${WARMUP_STEPS}" \
     SLEEP_MS="${SLEEP_MS}" \
-    NCCL_ALGO="auto" \
+    NCCL_ALGO="${exp_algo}" \
     NCCL_PROTO="auto" \
-    NCCL_RACK_MAP_FILE="${RACK_MAP_FILE}" \
     TORCH_ENV="${TORCH_ENV}" \
     bash "${REPO_ROOT}/${INNER_SCRIPT}"
     run_rc=$?
     set -e
-  else
-    echo "[phase2-matrix] skip idx=${idx} id=${exp_id} worker=${WORKER_NAME}"
   fi
 
   {
-    echo "participated=${participated}"
     echo "rc=${run_rc}"
   } > "${status_file}"
 
@@ -378,7 +361,7 @@ for idx in "${!EXPERIMENT_IDS[@]}"; do
   done
 
   if is_master_server && [[ "${SWITCH_LOG_ENABLE}" == "1" ]]; then
-    emit_switch_marker "exp_end" "experiment=${exp_id} collective=${exp_coll} payload_mb=${exp_payload} rc=${failed}" "phase2_matrix"
+    emit_switch_marker_best_effort "exp_end" "experiment=${exp_id} collective=${exp_coll} algo=${exp_algo} payload_mb=${PAYLOAD_MB} rc=${failed}" "phase2_matrix"
   fi
 
   if (( failed == 1 )); then

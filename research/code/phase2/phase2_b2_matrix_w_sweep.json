@@ -1,0 +1,147 @@
+{
+  "phase": "phase2",
+  "name": "b2_w_sweep_4node_switch",
+  "description": "4-node fixed-host B2 static-W sweep with switch PFC logging. No intra/inter placement label is used in the experiment ids.",
+  "runner_contract": {
+    "worker_pool": [
+      "worker01",
+      "worker03",
+      "worker05",
+      "worker07"
+    ],
+    "nnodes": 4,
+    "nproc_per_node": 1,
+    "master_addr": "172.16.0.101",
+    "master_port_base": 31500,
+    "torch_env": "/workspace/venvs/torch-cu121-custom/bin/activate",
+    "target_script": "research/code/phase2/collective_b2.py"
+  },
+  "payload": {
+    "payload_mb": 128,
+    "dtype": "float32",
+    "steps": 40,
+    "warmup_steps": 5
+  },
+  "switch_logging": {
+    "enabled": true,
+    "interval_sec": 1,
+    "required_env": [
+      "DPU_NODE_PWD",
+      "NETWORK_NODE_PASSWORD",
+      "SWITCH_PASSWORD"
+    ],
+    "manual_ref": "research/docs/switch/switch_congestion_logger_manual.html"
+  },
+  "mode_matrix": [
+    {
+      "mode_id": "stock",
+      "label": "STOCK",
+      "policy": "baseline_nccl",
+      "phase2_b2_enable": 0,
+      "static_w": null
+    },
+    {
+      "mode_id": "b2_w2",
+      "label": "B2_W2",
+      "policy": "static_receiver_window",
+      "phase2_b2_enable": 1,
+      "static_w": 2
+    },
+    {
+      "mode_id": "b2_w4",
+      "label": "B2_W4",
+      "policy": "static_receiver_window",
+      "phase2_b2_enable": 1,
+      "static_w": 4
+    },
+    {
+      "mode_id": "b2_w5",
+      "label": "B2_W5",
+      "policy": "static_receiver_window",
+      "phase2_b2_enable": 1,
+      "static_w": 5
+    },
+    {
+      "mode_id": "b2_w6",
+      "label": "B2_W6",
+      "policy": "static_receiver_window",
+      "phase2_b2_enable": 1,
+      "static_w": 6
+    },
+    {
+      "mode_id": "b2_w7",
+      "label": "B2_W7",
+      "policy": "static_receiver_window",
+      "phase2_b2_enable": 1,
+      "static_w": 7
+    },
+    {
+      "mode_id": "b2_w8",
+      "label": "B2_W8",
+      "policy": "static_receiver_window",
+      "phase2_b2_enable": 1,
+      "static_w": 8
+    }
+  ],
+  "workload_matrix": [
+    {
+      "experiment_id": "allreduce_ring_128mb",
+      "collective": "allreduce",
+      "nccl_algo": "Ring",
+      "nccl_proto": "auto",
+      "payload_mb": 128
+    },
+    {
+      "experiment_id": "allreduce_tree_128mb",
+      "collective": "allreduce",
+      "nccl_algo": "Tree",
+      "nccl_proto": "auto",
+      "payload_mb": 128
+    },
+    {
+      "experiment_id": "allgather_auto_128mb",
+      "collective": "allgather",
+      "nccl_algo": "auto",
+      "nccl_proto": "auto",
+      "payload_mb": 128
+    },
+    {
+      "experiment_id": "reducescatter_auto_128mb",
+      "collective": "reducescatter",
+      "nccl_algo": "auto",
+      "nccl_proto": "auto",
+      "payload_mb": 128
+    },
+    {
+      "experiment_id": "alltoall_auto_128mb",
+      "collective": "alltoall",
+      "nccl_algo": "auto",
+      "nccl_proto": "auto",
+      "payload_mb": 128
+    }
+  ],
+  "report_requirements": {
+    "input_arg": "--input-dir",
+    "output_arg": "--output-dir",
+    "switch_log_arg": "--switch-log",
+    "required_png_plots": [
+      "stock_vs_b2_throughput.png",
+      "stock_vs_b2_latency.png",
+      "stock_vs_b2_switch_pfc_counts.png",
+      "stock_vs_b2_step_window_trace.png",
+      "b2_matrix_latency.png",
+      "b2_matrix_throughput.png",
+      "b2_matrix_pfc_count.png",
+      "b2_matrix_pfc_severity.png"
+    ],
+    "required_tables": [
+      "stock_vs_b2_summary",
+      "b2_workload_by_w_summary"
+    ]
+  },
+  "analysis_goals": [
+    "Check whether static window reduction reduces in-flight traffic indicators.",
+    "Check which workload and algorithm combinations show meaningful latency or throughput changes.",
+    "Check whether switch PFC count and severity track with the window sweep."
+  ]
+}

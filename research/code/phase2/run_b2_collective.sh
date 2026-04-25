@@ -20,22 +20,22 @@ infer_node_rank() {
 RUN_ID=${RUN_ID:-phase2_b2_collective_$(date +%y%m%d_%H%M%S)}
 MASTER_ADDR=${MASTER_ADDR:-172.16.0.101}
 MASTER_PORT_BASE=${MASTER_PORT_BASE:-31500}
-NNODES=${NNODES:-8}
+NNODES=${NNODES:-4}
 NPROC_PER_NODE=${NPROC_PER_NODE:-1}
 WORKER_NAME=${WORKER_NAME:-$(hostname -s)}
 NODE_RANK=${NODE_RANK:-$(infer_node_rank "${WORKER_NAME}")}
-MASTER_SERVER=${MASTER_SERVER:-${WORKER_NAME}}
+MASTER_SERVER=${MASTER_SERVER:-worker01}
 TORCH_ENV=${TORCH_ENV:-/workspace/venvs/torch-cu121-custom/bin/activate}
 TARGET_SCRIPT=${TARGET_SCRIPT:-research/code/phase2/collective_b2.py}
 LOG_ROOT=${LOG_ROOT:-/mnt/nfs_share/cts_experiments/${RUN_ID}}
-RUN_MODES=${RUN_MODES:-stock,b2}
-COLLECTIVE=${COLLECTIVE:-alltoall}
+RUN_MODES=${RUN_MODES:-stock,b2_w2,b2_w4,b2_w5,b2_w6,b2_w7,b2_w8}
+COLLECTIVE=${COLLECTIVE:-allreduce}
+EXPERIMENT_LABEL=${EXPERIMENT_LABEL:-}
 STEPS=${STEPS:-40}
 WARMUP_STEPS=${WARMUP_STEPS:-5}
 PAYLOAD_MB=${PAYLOAD_MB:-128}
 DTYPE=${DTYPE:-float32}
 SLEEP_MS=${SLEEP_MS:-0}
-RACK_MAP_FILE=${NCCL_RACK_MAP_FILE:-${REPO_ROOT}/research/code/phase2/rack_map.txt}
 ALGO_SETTING=${NCCL_ALGO:-auto}
 PROTO_SETTING=${NCCL_PROTO:-auto}
 
@@ -54,10 +54,12 @@ source "${TORCH_ENV}"
 export LD_PRELOAD="/workspace/nccl/build/lib/libnccl.so${LD_PRELOAD:+:${LD_PRELOAD}}"
 export NCCL_PHASE0_LOG=${NCCL_PHASE0_LOG:-1}
 export NCCL_PHASE1_STATIC_W=0
-export NCCL_PHASE2_LOG=${NCCL_PHASE2_LOG:-1}
+export NCCL_PHASE2_B2_ENABLE=0
+export NCCL_PHASE2_LOG=${NCCL_PHASE2_LOG:-0}
+export NCCL_PHASE3_B3_ENABLE=0
+export NCCL_PHASE3_LOG=${NCCL_PHASE3_LOG:-0}
 export NCCL_DEBUG=${NCCL_DEBUG:-INFO}
 export NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-NET}
-export NCCL_RACK_MAP_FILE="${RACK_MAP_FILE}"
 export NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL:-0}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 export OMP_NUM_THREADS=${OMP_NUM_THREADS:-1}
@@ -151,23 +153,25 @@ IFS=',' read -r -a MODE_VALUES <<< "${RUN_MODES}"
 
 SWITCH_ENV_JSON=""
 if [[ "${SWITCH_LOG_ENABLE}" == "1" && -n "${SWITCH_LOG_RUN_ID:-}" ]]; then
-  SWITCH_ENV_JSON=$(cat <<EOF2
+  SWITCH_ENV_JSON=$(cat <<EOF
 ,
   "switch_log_enable": 1,
   "switch_log_run_id": "${SWITCH_LOG_RUN_ID}",
   "switch_log_dir": "${SWITCH_LOG_DIR:-}",
   "switch_log_local_dir": "${SWITCH_LOG_LOCAL_DIR:-}",
   "switch_log_markers_jsonl": "${SWITCH_LOG_MARKERS_JSONL:-}",
-  "dpu_node_host": "${DPU_NODE_HOST}"
-EOF2
+  "dpu_node_host": "${DPU_NODE_HOST}",
+  "master_server": "${MASTER_SERVER}"
+EOF
 )
 fi
 
 if [[ "${NODE_RANK}" == "0" ]]; then
-  cat > "${LOG_ROOT}/env_setup.json" <<EOF2
+  cat > "${LOG_ROOT}/env_setup.json" <<EOF
 {
   "phase": "B2",
   "run_id": "${RUN_ID}",
+  "experiment_label": "${EXPERIMENT_LABEL}",
   "collective": "${COLLECTIVE}",
   "run_modes": "${RUN_MODES}",
   "master_addr": "${MASTER_ADDR}",
@@ -180,15 +184,14 @@ if [[ "${NODE_RANK}" == "0" ]]; then
   "dtype": "${DTYPE}",
   "nccl_algo": "${ALGO_SETTING}",
   "nccl_proto": "${PROTO_SETTING}",
-  "rack_map_file": "${RACK_MAP_FILE}",
-  "master_server": "${MASTER_SERVER}",
-  "policy_name": "semantic_static_b2",
-  "policy_formula": "W_eff = clamp(W_min, W_base, W_base - (alltoall + tree))",
-  "w_min_rule": "2 if collAPI == AllToAll else 4",
-  "w_max_rule": "stock baseline",
-  "b2_penalty_rule": "collAPI +1, tree +1"${SWITCH_ENV_JSON}
+  "policy_name": "static_receiver_window_sweep",
+  "policy_formula": "W_eff = min(W_base, W_cfg) with PHASE1_STATIC_W override",
+  "phase2_b2_enable": 0,
+  "phase3_b3_enable": 0,
+  "b3_disabled_by_runner": true,
+  "worker_pool": "worker01,worker03,worker05,worker07"${SWITCH_ENV_JSON}
 }
-EOF2
+EOF
 fi
 
 echo "[phase2] RUN_ID=${RUN_ID}"
@@ -199,7 +202,6 @@ echo "[phase2] LOG_ROOT=${LOG_ROOT}"
 echo "[phase2] TARGET_SCRIPT=${TARGET_SCRIPT}"
 echo "[phase2] COLLECTIVE=${COLLECTIVE} RUN_MODES=${RUN_MODES}"
 echo "[phase2] PAYLOAD_MB=${PAYLOAD_MB} DTYPE=${DTYPE} NCCL_ALGO=${ALGO_SETTING} NCCL_PROTO=${PROTO_SETTING}"
-echo "[phase2] RACK_MAP_FILE=${RACK_MAP_FILE}"
 if [[ "${SWITCH_LOG_ENABLE}" == "1" && -n "${SWITCH_LOG_RUN_ID:-}" ]]; then
   echo "[phase2] SWITCH_LOG_RUN_ID=${SWITCH_LOG_RUN_ID} SWITCH_LOG_DIR=${SWITCH_LOG_DIR:-} SWITCH_LOG_LOCAL_DIR=${SWITCH_LOG_LOCAL_DIR:-}"
 fi
@@ -215,10 +217,10 @@ for idx in "${!MODE_VALUES[@]}"; do
 
   case "${MODE}" in
     stock)
-      export NCCL_PHASE2_B2_ENABLE=0
+      export NCCL_PHASE1_STATIC_W=0
       ;;
-    b2)
-      export NCCL_PHASE2_B2_ENABLE=1
+    b2_w*)
+      export NCCL_PHASE1_STATIC_W="${MODE#b2_w}"
       ;;
     *)
       echo "[phase2] unsupported RUN_MODES entry=${MODE}" >&2
@@ -227,12 +229,12 @@ for idx in "${!MODE_VALUES[@]}"; do
   esac
 
   export PHASE2_MODE="${MODE}"
-  export NCCL_DEBUG_FILE="${WORKER_LOG_ROOT}/nccl.%h.%p.log"
   export PHASE2_OUTPUT_DIR="${RUN_ROOT}"
+  export NCCL_DEBUG_FILE="${WORKER_LOG_ROOT}/nccl.%h.%p.log"
 
-  echo "[phase2] starting MODE=${MODE} MASTER_PORT=${MASTER_PORT}"
+  echo "[phase2] starting MODE=${MODE} MASTER_PORT=${MASTER_PORT} STATIC_W=${NCCL_PHASE1_STATIC_W}"
   echo "[phase2] NCCL_DEBUG_FILE=${NCCL_DEBUG_FILE}"
-  emit_switch_marker "mode_start" "run_id=${RUN_ID} mode=${MODE_UPPER} collective=${COLLECTIVE} payload_mb=${PAYLOAD_MB}" "phase2_collective"
+  emit_switch_marker "mode_start" "run_id=${RUN_ID} mode=${MODE_UPPER} collective=${COLLECTIVE} algo=${ALGO_SETTING} payload_mb=${PAYLOAD_MB} static_w=${NCCL_PHASE1_STATIC_W}" "phase2_collective"
 
   "${LAUNCHER[@]}" \
     --nnodes="${NNODES}" \
@@ -251,6 +253,6 @@ for idx in "${!MODE_VALUES[@]}"; do
     --tag "${MODE_UPPER}" \
     "$@"
 
-  emit_switch_marker "mode_end" "run_id=${RUN_ID} mode=${MODE_UPPER} collective=${COLLECTIVE} payload_mb=${PAYLOAD_MB}" "phase2_collective"
+  emit_switch_marker "mode_end" "run_id=${RUN_ID} mode=${MODE_UPPER} collective=${COLLECTIVE} algo=${ALGO_SETTING} payload_mb=${PAYLOAD_MB} static_w=${NCCL_PHASE1_STATIC_W}" "phase2_collective"
   sleep 2
 done
