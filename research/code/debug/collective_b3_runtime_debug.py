@@ -118,7 +118,8 @@ def main() -> None:
         step_metrics_path = output_dir / f"{run_tag}_step_metrics.jsonl" if rank == 0 and output_dir is not None else None
         worker_dir = output_dir / worker_name if output_dir is not None else None
         step_timing_path = worker_dir / f"{run_tag}_worker_step_timing.jsonl" if worker_dir is not None else None
-        debug_path = worker_dir / f"{run_tag}_runtime_debug.jsonl" if worker_dir is not None else None
+        debug_root = Path(os.environ["PHASE3_RUNTIME_DEBUG_ROOT"]) if os.environ.get("PHASE3_RUNTIME_DEBUG_ROOT") else worker_dir
+        debug_path = debug_root / f"{run_tag}_runtime_debug.jsonl" if debug_root is not None else None
         debug_logger = DebugLogger(debug_path, rank=rank, local_rank=local_rank, worker=worker_name)
 
         debug_logger.log(

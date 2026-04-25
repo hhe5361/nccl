@@ -7,8 +7,10 @@ REPO_ROOT=$(cd "${SCRIPT_DIR}/../../.." && pwd)
 RUN_ID=${RUN_ID:-phase3_runtime_debug_$(date +%y%m%d_%H%M%S)}
 WORKER_NAME=${WORKER_NAME:-$(hostname -s)}
 LOG_ROOT=${LOG_ROOT:-/mnt/nfs_share/cts_experiments/${RUN_ID}}
-DEBUG_ROOT="${LOG_ROOT}/_runtime_debug/${WORKER_NAME}"
-mkdir -p "${DEBUG_ROOT}"
+DEBUG_SHARED_ROOT=${DEBUG_SHARED_ROOT:-/mnt/nfs_share/cts_experiments/debug}
+DEBUG_RUN_ROOT="${DEBUG_SHARED_ROOT}/${RUN_ID}"
+DEBUG_WORKER_ROOT="${DEBUG_RUN_ROOT}/${WORKER_NAME}"
+mkdir -p "${DEBUG_WORKER_ROOT}"
 
 export TORCH_DISTRIBUTED_DEBUG=${TORCH_DISTRIBUTED_DEBUG:-DETAIL}
 export TORCH_SHOW_CPP_STACKTRACES=${TORCH_SHOW_CPP_STACKTRACES:-1}
@@ -21,11 +23,12 @@ export NCCL_PHASE3_LOG=${NCCL_PHASE3_LOG:-1}
 export TARGET_SCRIPT=${TARGET_SCRIPT:-research/code/debug/collective_b3_runtime_debug.py}
 export LOG_ROOT
 export RUN_ID
+export PHASE3_RUNTIME_DEBUG_ROOT="${DEBUG_WORKER_ROOT}"
 
-snapshot_file="${DEBUG_ROOT}/launcher_snapshot.txt"
-stdout_file="${DEBUG_ROOT}/launcher.stdout.log"
-stderr_file="${DEBUG_ROOT}/launcher.stderr.log"
-env_file="${DEBUG_ROOT}/debug_env.json"
+snapshot_file="${DEBUG_WORKER_ROOT}/launcher_snapshot.txt"
+stdout_file="${DEBUG_WORKER_ROOT}/launcher.stdout.log"
+stderr_file="${DEBUG_WORKER_ROOT}/launcher.stderr.log"
+env_file="${DEBUG_WORKER_ROOT}/debug_env.json"
 
 python3 - <<'PY' > "${env_file}"
 import json
@@ -56,6 +59,7 @@ keys = [
     "PYTHONFAULTHANDLER",
     "TARGET_SCRIPT",
     "LOG_ROOT",
+    "PHASE3_RUNTIME_DEBUG_ROOT",
 ]
 print(json.dumps({k: os.environ.get(k, "") for k in keys}, indent=2, sort_keys=True))
 PY
@@ -80,7 +84,7 @@ capture_snapshot() {
 }
 
 capture_nccl_tails() {
-  local out="${DEBUG_ROOT}/nccl_log_tails.txt"
+  local out="${DEBUG_WORKER_ROOT}/nccl_log_tails.txt"
   {
     echo "==== nccl log tail capture ===="
     date --iso-8601=ns 2>/dev/null || date
