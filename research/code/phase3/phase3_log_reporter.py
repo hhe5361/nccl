@@ -29,6 +29,7 @@ EXPERIMENT_RE = __import__("re").compile(r"^\d+_.+")
 MODE_ORDER = {"STOCK": 0, "B2": 1, "B3": 2}
 REPORT_LOG_PATH: Optional[Path] = None
 SWITCH_SHARED_ROOT_DEFAULT = Path("/mnt/nfs/cts_experiments/switch_log")
+SWITCH_AGGREGATE_BUCKET_NS = 1_000_000_000
 
 
 RUN_SUMMARY_FIELD_HELP = {
@@ -764,48 +765,53 @@ def extract_record_ts_ns(record: dict) -> Optional[int]:
     return None
 
 
-def flatten_numeric_named_values(node: Any, prefix: str = "") -> List[Tuple[str, float]]:
-    values: List[Tuple[str, float]] = []
-    if isinstance(node, dict):
-        for key, value in node.items():
-            name = f"{prefix}/{key}" if prefix else str(key)
-            values.extend(flatten_numeric_named_values(value, name))
-    elif isinstance(node, list):
-        for idx, value in enumerate(node):
-            name = f"{prefix}/{idx}" if prefix else str(idx)
-            values.extend(flatten_numeric_named_values(value, name))
-    elif isinstance(node, (int, float)) and not isinstance(node, bool):
-        values.append((prefix, float(node)))
-    return values
+def extract_switch_counter_value(record: dict) -> Optional[float]:
+    kind = str(record.get("kind") or "")
+    if kind == "fsos_pfc_statistics":
+        total = 0.0
+        found = False
+        for key in ("rx_pause", "tx_pause"):
+            value = record.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                total += max(0.0, float(value))
+                found = True
+        return total if found else None
+    if kind == "onyx_roce_counters":
+        total = 0.0
+        found = False
+        for key in ("rx_pause_packets", "tx_pause_packets"):
+            value = record.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                total += max(0.0, float(value))
+                found = True
+        return total if found else None
+    return None
 
 
-def is_counter_like_key(name: str) -> bool:
-    lower = name.lower()
-    tail = lower.split("/")[-1]
-    if any(token in lower for token in ("timestamp", "time_ns", "unix_ns", "collected_at", "sample_time", "elapsed")):
-        return False
-    if tail in {"ts", "time", "date", "priority", "port", "queue", "index", "pid", "interval", "interval_sec", "sample"}:
-        return False
-    return True
+def switch_snapshot_group_key(record: dict, ts_ns: int) -> str:
+    sample_id = record.get("sample_id")
+    if sample_id not in (None, ""):
+        return f"sample:{sample_id}"
+    bucket_ts = (ts_ns // SWITCH_AGGREGATE_BUCKET_NS) * SWITCH_AGGREGATE_BUCKET_NS
+    return f"bucket:{bucket_ts}"
 
 
-def aggregate_switch_counter(record: dict) -> float:
-    total = 0.0
-    for name, value in flatten_numeric_named_values(record):
-        if is_counter_like_key(name):
-            total += max(0.0, float(value))
-    return total
-
-
-def load_switch_counter_samples(path: Path) -> List[Tuple[int, float]]:
-    samples: List[Tuple[int, float]] = []
+def load_switch_counter_snapshots(path: Path) -> List[Tuple[int, float]]:
+    grouped: Dict[str, List[Tuple[int, float]]] = defaultdict(list)
     for row in load_jsonl(path):
         ts_ns = extract_record_ts_ns(row)
-        if ts_ns is None:
+        value = extract_switch_counter_value(row)
+        if ts_ns is None or value is None:
             continue
-        samples.append((ts_ns, aggregate_switch_counter(row)))
-    samples.sort(key=lambda item: item[0])
-    return samples
+        grouped[switch_snapshot_group_key(row, ts_ns)].append((ts_ns, value))
+    snapshots: List[Tuple[int, float]] = []
+    for rows in grouped.values():
+        rows.sort(key=lambda item: item[0])
+        ts_ns = int(sum(ts for ts, _ in rows) / len(rows))
+        total = float(sum(value for _, value in rows))
+        snapshots.append((ts_ns, total))
+    snapshots.sort(key=lambda item: item[0])
+    return snapshots
 
 
 def compute_switch_delta_series(samples: List[Tuple[int, float]]) -> List[Tuple[int, float]]:
@@ -817,6 +823,49 @@ def compute_switch_delta_series(samples: List[Tuple[int, float]]) -> List[Tuple[
         delta = max(0.0, cur_total - prev_total)
         deltas.append((cur_ts, delta / dt_sec))
     return deltas
+
+
+def interpolate_switch_snapshot_value(snapshots: List[Tuple[int, float]], ts_ns: int) -> Optional[float]:
+    if not snapshots:
+        return None
+    if ts_ns <= snapshots[0][0]:
+        return float(snapshots[0][1])
+    if ts_ns >= snapshots[-1][0]:
+        return float(snapshots[-1][1])
+    for (left_ts, left_value), (right_ts, right_value) in zip(snapshots, snapshots[1:]):
+        if left_ts <= ts_ns <= right_ts:
+            if right_ts == left_ts:
+                return float(right_value)
+            ratio = (ts_ns - left_ts) / float(right_ts - left_ts)
+            return float(left_value + (right_value - left_value) * ratio)
+    return None
+
+
+def build_phase_aligned_cumulative_series(
+    snapshots: List[Tuple[int, float]], start_ns: int, end_ns: int
+) -> List[Tuple[float, float]]:
+    if end_ns <= start_ns:
+        return []
+    start_value = interpolate_switch_snapshot_value(snapshots, start_ns)
+    end_value = interpolate_switch_snapshot_value(snapshots, end_ns)
+    if start_value is None or end_value is None:
+        return []
+
+    candidate_ts = [start_ns]
+    candidate_ts.extend(ts_ns for ts_ns, _ in snapshots if start_ns < ts_ns < end_ns)
+    candidate_ts.append(end_ns)
+
+    points: List[Tuple[float, float]] = []
+    seen = set()
+    for ts_ns in candidate_ts:
+        if ts_ns in seen:
+            continue
+        seen.add(ts_ns)
+        value = interpolate_switch_snapshot_value(snapshots, ts_ns)
+        if value is None:
+            continue
+        points.append(((ts_ns - start_ns) / 1_000_000_000.0, max(0.0, value - start_value)))
+    return points
 
 
 def resolve_switch_log_dir(experiment_root: Path, env_setup: Optional[dict], switch_log_dir_override: Optional[str] = None) -> Optional[Path]:
@@ -918,6 +967,7 @@ def load_switch_bundle(experiment_root: Path, env_setup: Optional[dict], switch_
     if log_dir is None or not log_dir.exists():
         return None
     series = {}
+    snapshots = {}
     file_map = {
         "spine": log_dir / "spine_roce_counters.jsonl",
         "rackA": log_dir / "rackA_pfc_statistics.jsonl",
@@ -926,17 +976,22 @@ def load_switch_bundle(experiment_root: Path, env_setup: Optional[dict], switch_
     for label, path in file_map.items():
         if not path.exists():
             continue
-        rate_series = compute_switch_delta_series(load_switch_counter_samples(path))
+        snapshot_series = load_switch_counter_snapshots(path)
+        if snapshot_series:
+            snapshots[label] = snapshot_series
+        rate_series = compute_switch_delta_series(snapshot_series)
         if rate_series:
             series[label] = rate_series
     markers_path = log_dir / "markers.jsonl"
     markers = load_jsonl(markers_path) if markers_path.exists() else []
-    if not series and not markers:
+    if not series and not snapshots and not markers:
         return None
     return {
         "log_dir": log_dir,
         "series": series,
+        "snapshots": snapshots,
         "markers": markers,
+        "bucket_ns": SWITCH_AGGREGATE_BUCKET_NS,
     }
 
 
@@ -993,7 +1048,7 @@ def save_switch_overlay_plot(
         ax_bottom.plot([x for x, _ in points], [y for _, y in points], marker="o", linewidth=1.5, markersize=2.8, label=mode)
 
     ax_top.set_title(f"{experiment_root.name} Switch Pressure Overlay")
-    ax_top.set_ylabel("switch delta / sec")
+    ax_top.set_ylabel("aggregated counter delta / sec")
     ax_top.grid(True, alpha=0.25)
     if switch_series:
         ax_top.legend()
@@ -1004,6 +1059,69 @@ def save_switch_overlay_plot(
     if step_series:
         ax_bottom.legend()
 
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    return path
+
+
+def save_switch_phase_pfc_plot(
+    path: Path,
+    experiment_root: Path,
+    env_setup: Optional[dict],
+    mode_data: List[dict],
+    switch_log_dir_override: Optional[str] = None,
+) -> Optional[Path]:
+    switch_bundle = load_switch_bundle(experiment_root, env_setup, switch_log_dir_override)
+    if not switch_bundle or not switch_bundle.get("snapshots"):
+        return None
+
+    mode_windows = build_mode_time_windows(mode_data, env_setup, switch_bundle.get("markers", []))
+    if not mode_windows:
+        return None
+
+    target_labels = [label for label in ("rackA", "rackB") if label in switch_bundle["snapshots"]]
+    if not target_labels:
+        return None
+
+    mode_colors = {"STOCK": "#1f77b4", "B2": "#ff7f0e", "B3": "#2ca02c"}
+    fig, axes = plt.subplots(len(target_labels), 1, figsize=(12, 4.6 + 2.2 * max(0, len(target_labels) - 1)), sharex=False)
+    if len(target_labels) == 1:
+        axes = [axes]
+
+    any_points = False
+    for ax, label in zip(axes, target_labels):
+        for item in mode_data:
+            bounds = mode_windows.get(item["mode"])
+            if bounds is None:
+                continue
+            start_ns, end_ns = bounds
+            points = build_phase_aligned_cumulative_series(switch_bundle["snapshots"][label], start_ns, end_ns)
+            if not points:
+                continue
+            any_points = True
+            ax.plot(
+                [x for x, _ in points],
+                [y for _, y in points],
+                marker="o",
+                linewidth=1.6,
+                markersize=2.8,
+                label=item["mode"],
+                color=mode_colors.get(item["mode"]),
+            )
+        ax.set_title(f"{label} PFC pause increase by phase")
+        ax.set_ylabel("pause count increase")
+        ax.grid(True, alpha=0.25)
+        ax.legend()
+        ax.axvline(0.0, color="#6c7f99", linestyle="--", alpha=0.35, linewidth=0.9)
+
+    if not any_points:
+        plt.close(fig)
+        return None
+
+    axes[-1].set_xlabel("elapsed sec from phase start")
+    fig.suptitle(f"{experiment_root.name} Phase-Aligned PFC Pause Count Overlay", y=0.995)
     fig.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=180)
@@ -1126,6 +1244,7 @@ def build_visualization_plan_card_single(env_setup: Optional[dict] = None, switc
     ]
     if switch_log_dir_override or (env_setup and int(env_setup.get("switch_log_enable", 0) or 0) == 1):
         rows.append(("switch_overlay.png", "switch_log/*.jsonl + *_step_metrics.jsonl", "switch PFC/ROCE delta/sec 와 step latency overlay"))
+        rows.append(("switch_pfc_phase_overlay.png", "switch_log/*.jsonl + *_step_metrics.jsonl", "phase start 기준으로 정렬한 rackA/rackB PFC pause count overlay"))
     return render_plot_help_card("Visualization Plan", rows)
 
 
@@ -1330,6 +1449,7 @@ def build_single_experiment_report(
     p_decision = save_decision_counts_plot(plots_dir / "decision_counts.png", mode_data)
     p_pressure = save_pressure_summary_plot(plots_dir / "pressure_summary.png", mode_data)
     p_switch = save_switch_overlay_plot(plots_dir / "switch_overlay.png", experiment_root, env_setup, mode_data, switch_log_dir_override)
+    p_switch_phase = save_switch_phase_pfc_plot(plots_dir / "switch_pfc_phase_overlay.png", experiment_root, env_setup, mode_data, switch_log_dir_override)
 
     worker_trace_paths = []
     for item in mode_data:
@@ -1400,6 +1520,7 @@ def build_single_experiment_report(
         (p_decision, "decision reason count"),
         (p_pressure, "pressure score summary"),
         (p_switch, "switch PFC / ROCE pressure overlay"),
+        (p_switch_phase, "phase-aligned PFC pause count overlay"),
     ] + worker_trace_paths:
         if path is None or not path.exists():
             continue
@@ -1410,7 +1531,20 @@ def build_single_experiment_report(
     html_path.write_text(render_html(f"Phase3 Report - {experiment_root.name}", sections), encoding="utf-8")
 
     report_json = output_dir / "phase3_report.json"
-    report_json.write_text(json.dumps({"experiment": experiment_root.name, "env_setup": env_setup, "modes": summary_rows, "switch_overlay_plot": relpath(p_switch, output_dir) if p_switch is not None and p_switch.exists() else None}, indent=2, ensure_ascii=False), encoding="utf-8")
+    report_json.write_text(
+        json.dumps(
+            {
+                "experiment": experiment_root.name,
+                "env_setup": env_setup,
+                "modes": summary_rows,
+                "switch_overlay_plot": relpath(p_switch, output_dir) if p_switch is not None and p_switch.exists() else None,
+                "switch_pfc_phase_plot": relpath(p_switch_phase, output_dir) if p_switch_phase is not None and p_switch_phase.exists() else None,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
 
     report_csv = output_dir / "phase3_report.csv"
     if summary_rows:
