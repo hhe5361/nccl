@@ -2018,6 +2018,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
           struct phase2WindowDecision semanticDecision = phase2SelectWindow(proxyState, args, sub);
           struct phase3WindowDecision phase3Decision = phase3SnapshotWindow(sub, &semanticDecision);
           int wEff = wBase;
+          int slotDepth = wBase;
           if (wCfg > 0) {
             wEff = phase1WindowEff(args);
           } else if (phase3Decision.enabled) {
@@ -2057,7 +2058,9 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
                 ptrs[subCount] = sub->recvbuff + sub->posted * NCCL_MAX_NET_SIZE;
                 sizes[subCount] = std::min(NCCL_MAX_NET_SIZE, (ssize_t)(sub->nbytes - sub->posted * NCCL_MAX_NET_SIZE));
               } else {
-                int sharedBuffSlot = sub->posted % wEff;
+                // Keep shared buffer slot indexing stable across sender/receiver.
+                // Dynamic W only gates how far the receiver can advance.
+                int sharedBuffSlot = sub->posted % slotDepth;
                 int offset;
                 NCCLCHECK(sharedBuffersGet(proxyState, sub->channelId, sharedBuffSlot * args->nsubs + s + i, &offset, sizes + subCount));
                 connFifo[buffSlot].offset = offset;
