@@ -26,6 +26,8 @@ CONTAINER_REPO_ROOT=${CONTAINER_REPO_ROOT:-/workspace/$(basename "${REPO_ROOT}")
 CONTAINER_NAME=${CONTAINER_NAME:-nccl-cu121-dev}
 WORKER_SSH_USER=${WORKER_SSH_USER:-}
 WORKER_SSH_USER_MAP=${WORKER_SSH_USER_MAP:-}
+WORKER_SSH_PORT=${WORKER_SSH_PORT:-22}
+WORKER_SSH_PORT_MAP=${WORKER_SSH_PORT_MAP:-}
 WORKER_SSH_PASSWORD=${WORKER_SSH_PASSWORD:-}
 SSH_CONNECT_TIMEOUT_SEC=${SSH_CONNECT_TIMEOUT_SEC:-10}
 NETWORK_TOPOLOGY_FILE=${NETWORK_TOPOLOGY_FILE:-${REPO_ROOT}/research/env/network_topology_internal_ips.txt}
@@ -122,11 +124,29 @@ resolve_worker_ssh_host() {
   echo "${ssh_host}"
 }
 
+resolve_worker_ssh_port() {
+  local worker=$1
+  local mapping entry map_worker map_port
+  if [[ -n "${WORKER_SSH_PORT_MAP}" ]]; then
+    IFS=',' read -r -a mapping <<< "${WORKER_SSH_PORT_MAP}"
+    for entry in "${mapping[@]}"; do
+      map_worker=${entry%%=*}
+      map_port=${entry#*=}
+      if [[ "${map_worker}" == "${worker}" && -n "${map_port}" ]]; then
+        echo "${map_port}"
+        return 0
+      fi
+    done
+  fi
+  echo "${WORKER_SSH_PORT}"
+}
+
 remote_worker_bash() {
   local worker=$1
   local cmd=$2
   local ssh_user
   local ssh_host
+  local ssh_port
   if [[ "${worker}" == "${MASTER_SERVER}" ]]; then
     bash -lc "${cmd}"
     return
@@ -135,13 +155,14 @@ remote_worker_bash() {
   require_sshpass
   ssh_user=$(resolve_worker_ssh_user "${worker}")
   ssh_host=$(resolve_worker_ssh_host "${worker}")
+  ssh_port=$(resolve_worker_ssh_port "${worker}")
   if [[ -n "${WORKER_SSH_PASSWORD}" ]]; then
     sshpass -p "${WORKER_SSH_PASSWORD}" \
-      ssh -o ConnectTimeout="${SSH_CONNECT_TIMEOUT_SEC}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      ssh -p "${ssh_port}" -o ConnectTimeout="${SSH_CONNECT_TIMEOUT_SEC}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       "${ssh_user}@${ssh_host}" \
       "bash -lc $(printf '%q' "${cmd}")"
   else
-    ssh -o ConnectTimeout="${SSH_CONNECT_TIMEOUT_SEC}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    ssh -p "${ssh_port}" -o ConnectTimeout="${SSH_CONNECT_TIMEOUT_SEC}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
       "${ssh_user}@${ssh_host}" \
       "bash -lc $(printf '%q' "${cmd}")"
   fi
@@ -303,6 +324,8 @@ done
   echo "  \"execution_model\": \"master_orchestrated_single_port\","
   echo "  \"network_topology_file\": \"${NETWORK_TOPOLOGY_FILE}\","
   echo "  \"ssh_host_resolution\": \"resolve worker internal IP from [Workers] section in network topology file\","
+  echo "  \"worker_ssh_port\": \"${WORKER_SSH_PORT}\","
+  echo "  \"worker_ssh_port_map\": \"${WORKER_SSH_PORT_MAP}\","
   echo "  \"container_name\": \"${CONTAINER_NAME}\","
   echo "  \"container_reset_at_start\": ${CONTAINER_RESET_AT_START},"
   echo "  \"switch_log_enable\": ${SWITCH_LOG_ENABLE},"
