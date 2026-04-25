@@ -261,9 +261,9 @@ prepare_worker_container() {
   local worker=$1
   local cmd
   if [[ "${CONTAINER_RESET_AT_START}" == "1" ]]; then
-    cmd="docker rm -f $(printf '%q' "${CONTAINER_NAME}") >/dev/null 2>&1 || true; cd $(printf '%q' "${REMOTE_REPO_ROOT}") && ./research/code/deploy/run_dev_container.sh true >/dev/null"
+    cmd="docker rm -f $(printf '%q' "${CONTAINER_NAME}") >/dev/null 2>&1 || true; cd $(printf '%q' "${REMOTE_REPO_ROOT}") && bash ./research/code/deploy/run_dev_container.sh true >/dev/null"
   else
-    cmd="cd $(printf '%q' "${REMOTE_REPO_ROOT}") && ./research/code/deploy/run_dev_container.sh true >/dev/null"
+    cmd="cd $(printf '%q' "${REMOTE_REPO_ROOT}") && bash ./research/code/deploy/run_dev_container.sh true >/dev/null"
   fi
   echo "[phase2-matrix] prepare container worker=${worker} reset=${CONTAINER_RESET_AT_START}"
   remote_worker_bash "${worker}" "${cmd}"

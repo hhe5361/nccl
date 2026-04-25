@@ -305,13 +305,13 @@ read_status_field() {
 container_bootstrap_cmd() {
   cat <<EOF
 docker rm -f $(printf '%q' "${CONTAINER_NAME}") >/dev/null 2>&1 || true
-cd $(printf '%q' "${REMOTE_REPO_ROOT}") && ./research/code/deploy/run_dev_container.sh true >/dev/null
+cd $(printf '%q' "${REMOTE_REPO_ROOT}") && bash ./research/code/deploy/run_dev_container.sh true >/dev/null
 EOF
 }
 
 ensure_container_ready() {
   local worker=$1
-  local cmd="cd $(printf '%q' "${REMOTE_REPO_ROOT}") && ./research/code/deploy/run_dev_container.sh true >/dev/null"
+  local cmd="cd $(printf '%q' "${REMOTE_REPO_ROOT}") && bash ./research/code/deploy/run_dev_container.sh true >/dev/null"
   if [[ "${CONTAINER_RESET_AT_START}" == "1" ]]; then
     cmd=$(container_bootstrap_cmd)
   fi
@@ -322,7 +322,7 @@ ensure_container_ready() {
 cleanup_worker_processes() {
   local worker=$1
   local cmd
-  cmd="cd $(printf '%q' "${REMOTE_REPO_ROOT}") && ./research/code/deploy/run_dev_container.sh bash -lc $(printf '%q' "pkill -f 'torchrun|torch\\.distributed\\.run|collective_b2\\.py' >/dev/null 2>&1 || true; sleep 1; ps -ef | grep -E 'torchrun|torch\\.distributed\\.run|collective_b2\\.py' | grep -v grep || true")"
+  cmd="cd $(printf '%q' "${REMOTE_REPO_ROOT}") && bash ./research/code/deploy/run_dev_container.sh bash -lc $(printf '%q' "pkill -f 'torchrun|torch\\.distributed\\.run|collective_b2\\.py' >/dev/null 2>&1 || true; sleep 1; ps -ef | grep -E 'torchrun|torch\\.distributed\\.run|collective_b2\\.py' | grep -v grep || true")"
   remote_worker_bash "${worker}" "${cmd}" >/dev/null 2>&1 || true
 }
 
@@ -370,7 +370,7 @@ EOF
 )
 
   cat <<EOF
-cd $(printf '%q' "${REMOTE_REPO_ROOT}") && ./research/code/deploy/run_dev_container.sh bash -lc $(printf '%q' "${inner}")
+cd $(printf '%q' "${REMOTE_REPO_ROOT}") && bash ./research/code/deploy/run_dev_container.sh bash -lc $(printf '%q' "${inner}")
 EOF
 }
 
