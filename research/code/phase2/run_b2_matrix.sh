@@ -205,10 +205,11 @@ start_switch_logger() {
   fi
   local cmd
   local output
-  cmd="cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && ./start_switch_congestion_loggers.sh --interval-sec $(printf '%q' "${SWITCH_LOG_INTERVAL_SEC}") --network-node-password $(printf '%q' "${NETWORK_NODE_PASSWORD}") --switch-password $(printf '%q' "${SWITCH_PASSWORD}")"
+  cmd="cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && "
   if [[ -n "${NETWORK_NODE_PORT}" ]]; then
-    cmd+=" --network-node-port $(printf '%q' "${NETWORK_NODE_PORT}")"
+    cmd+="export NETWORK_NODE_PORT=$(printf '%q' "${NETWORK_NODE_PORT}") && "
   fi
+  cmd+="./start_switch_congestion_loggers.sh --interval-sec $(printf '%q' "${SWITCH_LOG_INTERVAL_SEC}") --network-node-password $(printf '%q' "${NETWORK_NODE_PASSWORD}") --switch-password $(printf '%q' "${SWITCH_PASSWORD}")"
   output=$(remote_dpu_bash "${cmd}")
   while IFS='=' read -r key value; do
     case "${key}" in
