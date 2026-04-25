@@ -46,6 +46,7 @@ SWITCH_LOG_ENABLE=${SWITCH_LOG_ENABLE:-0}
 SWITCH_METADATA_FILE=${SWITCH_METADATA_FILE:-}
 DPU_NODE_HOST=${DPU_NODE_HOST:-172.16.0.100}
 DPU_NODE_USER=${DPU_NODE_USER:-ubuntu}
+DPU_NODE_PORT=${DPU_NODE_PORT:-22}
 SWITCH_LOGGER_ROOT=${SWITCH_LOGGER_ROOT:-/home/ubuntu/hyoeun/switch_setup_task/switch_congestion_logger}
 SWITCH_LOG_SHARED_ROOT=${SWITCH_LOG_SHARED_ROOT:-/mnt/nfs/cts_experiments/switch_log}
 
@@ -204,7 +205,7 @@ emit_switch_marker() {
     exit 1
   fi
   sshpass -p "${DPU_NODE_PWD}" \
-    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    ssh -p "${DPU_NODE_PORT}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "${DPU_NODE_USER}@${DPU_NODE_HOST}" \
     "bash -lc $(printf '%q' "${cmd}")" >/dev/null
 }
@@ -546,6 +547,7 @@ EOF
   "ssh_host_resolution": "resolve worker internal IP from [Workers] section in network topology file",
   "worker_ssh_port": "${WORKER_SSH_PORT}",
   "worker_ssh_port_map": "${WORKER_SSH_PORT_MAP}",
+  "dpu_node_port": "${DPU_NODE_PORT}",
   "status_ddp_contract": "1=running,0=success,-1=failed",
   "mode_timeout_sec": ${MODE_TIMEOUT_SEC},
   "container_name": "${CONTAINER_NAME}",

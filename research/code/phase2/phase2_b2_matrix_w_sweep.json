@@ -68,6 +68,10 @@
       "NETWORK_NODE_PASSWORD",
       "SWITCH_PASSWORD"
     ],
+    "optional_env": [
+      "DPU_NODE_PORT",
+      "NETWORK_NODE_PORT"
+    ],
     "manual_ref": "research/docs/switch/switch_congestion_logger_manual.html"
   },
   "mode_matrix": [

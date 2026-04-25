@@ -38,6 +38,8 @@ STOP_ON_FAILURE=${STOP_ON_FAILURE:-0}
 SWITCH_LOG_ENABLE=${SWITCH_LOG_ENABLE:-1}
 DPU_NODE_HOST=${DPU_NODE_HOST:-172.16.0.100}
 DPU_NODE_USER=${DPU_NODE_USER:-ubuntu}
+DPU_NODE_PORT=${DPU_NODE_PORT:-22}
+NETWORK_NODE_PORT=${NETWORK_NODE_PORT:-}
 SWITCH_LOGGER_ROOT=${SWITCH_LOGGER_ROOT:-/home/ubuntu/hyoeun/switch_setup_task/switch_congestion_logger}
 SWITCH_LOG_INTERVAL_SEC=${SWITCH_LOG_INTERVAL_SEC:-1}
 SWITCH_LOG_SHARED_ROOT=${SWITCH_LOG_SHARED_ROOT:-/mnt/nfs/cts_experiments/switch_log}
@@ -172,7 +174,7 @@ remote_dpu_bash() {
   local cmd=$1
   require_sshpass
   sshpass -p "${DPU_NODE_PWD}" \
-    ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    ssh -p "${DPU_NODE_PORT}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
     "${DPU_NODE_USER}@${DPU_NODE_HOST}" \
     "bash -lc $(printf '%q' "${cmd}")"
 }
@@ -204,6 +206,9 @@ start_switch_logger() {
   local cmd
   local output
   cmd="cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && ./start_switch_congestion_loggers.sh --interval-sec $(printf '%q' "${SWITCH_LOG_INTERVAL_SEC}") --network-node-password $(printf '%q' "${NETWORK_NODE_PASSWORD}") --switch-password $(printf '%q' "${SWITCH_PASSWORD}")"
+  if [[ -n "${NETWORK_NODE_PORT}" ]]; then
+    cmd+=" --network-node-port $(printf '%q' "${NETWORK_NODE_PORT}")"
+  fi
   output=$(remote_dpu_bash "${cmd}")
   while IFS='=' read -r key value; do
     case "${key}" in
@@ -326,6 +331,8 @@ done
   echo "  \"ssh_host_resolution\": \"resolve worker internal IP from [Workers] section in network topology file\","
   echo "  \"worker_ssh_port\": \"${WORKER_SSH_PORT}\","
   echo "  \"worker_ssh_port_map\": \"${WORKER_SSH_PORT_MAP}\","
+  echo "  \"dpu_node_port\": \"${DPU_NODE_PORT}\","
+  echo "  \"network_node_port\": \"${NETWORK_NODE_PORT}\","
   echo "  \"container_name\": \"${CONTAINER_NAME}\","
   echo "  \"container_reset_at_start\": ${CONTAINER_RESET_AT_START},"
   echo "  \"switch_log_enable\": ${SWITCH_LOG_ENABLE},"
