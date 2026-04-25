@@ -30,6 +30,17 @@ def build_digest_map(mode_dir: Path):
     return result
 
 
+def iter_mode_dirs(experiment_root: Path):
+    for candidate in sorted(p for p in experiment_root.iterdir() if p.is_dir()):
+        if candidate.name.startswith("."):
+            continue
+        if candidate.name.upper() == "STOCK":
+            continue
+        if not any(candidate.glob("*/*_rank_validation.json")):
+            continue
+        yield candidate
+
+
 def compare_mode(stock_map, mode_map):
     workers = sorted(set(stock_map) | set(mode_map))
     matches = 0
@@ -81,10 +92,8 @@ def main():
         "modes": [],
     }
 
-    for mode_dir in sorted(p for p in experiment_root.iterdir() if p.is_dir()):
+    for mode_dir in iter_mode_dirs(experiment_root):
         mode_name = mode_dir.name.upper()
-        if mode_name == "STOCK":
-            continue
         mode_map = build_digest_map(mode_dir)
         compared = compare_mode(stock_map, mode_map)
         compared["mode"] = mode_name

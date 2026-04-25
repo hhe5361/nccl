@@ -1,0 +1,129 @@
+{
+  "phase": "phase3",
+  "name": "b3_runtime_receiver_window_8node_master_orchestrated",
+  "description": "8-node STOCK vs B3 runtime receiver-window experiment matrix with master-only orchestration from worker01, a single fixed rendezvous port, STATUS_DDP worker status files, and switch PFC logging markers for per-mode overlay.",
+  "runner_contract": {
+    "entrypoint": "research/code/phase3/run_b3_matrix.sh",
+    "master_server": "worker01",
+    "worker_pool": [
+      "worker01",
+      "worker02",
+      "worker03",
+      "worker04",
+      "worker05",
+      "worker06",
+      "worker07",
+      "worker08"
+    ],
+    "nnodes": 8,
+    "nproc_per_node": 1,
+    "master_addr": "172.16.0.101",
+    "master_port": 40000,
+    "network_topology_file": "research/env/network_topology_internal_ips.txt",
+    "execution_model": "master_orchestrated_single_port",
+    "target_script": "research/code/phase2/collective_b2.py",
+    "worker_script": "research/code/phase3/run_b3_mode_worker.sh",
+    "status_contract": {
+      "env_var": "STATUS_DDP",
+      "meaning": {
+        "1": "worker is in-flight",
+        "0": "worker finished successfully and is about to exit",
+        "-1": "worker failed"
+      },
+      "sync_file_pattern": ".ddp_status/<MODE>/<worker>.status"
+    }
+  },
+  "payload": {
+    "payload_mb_default": 128,
+    "dtype": "float32",
+    "steps": 40,
+    "warmup_steps": 5,
+    "mode_timeout_sec": 600
+  },
+  "mode_matrix": [
+    {
+      "mode_id": "stock",
+      "label": "STOCK",
+      "policy": "baseline_nccl",
+      "phase1_static_w": 0,
+      "phase2_b2_enable": 0,
+      "phase3_b3_enable": 0
+    },
+    {
+      "mode_id": "b3",
+      "label": "B3",
+      "policy": "runtime_receiver_window",
+      "phase1_static_w": 0,
+      "phase2_b2_enable": 0,
+      "phase3_b3_enable": 1,
+      "semantic_prior": "topology excluded; AllToAll and Tree penalties only",
+      "runtime_feedback": [
+        "occTr = transmitted - done",
+        "recvLag = received - transmitted, normalized by current W",
+        "completionDelay EWMA from recv post to recv net done"
+      ]
+    }
+  ],
+  "workload_matrix": [
+    {
+      "experiment_id": "allreduce_ring_128mb",
+      "collective": "allreduce",
+      "nccl_algo": "Ring",
+      "nccl_proto": "auto",
+      "payload_mb": 128
+    },
+    {
+      "experiment_id": "allreduce_tree_128mb",
+      "collective": "allreduce",
+      "nccl_algo": "Tree",
+      "nccl_proto": "auto",
+      "payload_mb": 128
+    },
+    {
+      "experiment_id": "allgather_auto_128mb",
+      "collective": "allgather",
+      "nccl_algo": "auto",
+      "nccl_proto": "auto",
+      "payload_mb": 128
+    },
+    {
+      "experiment_id": "reducescatter_auto_128mb",
+      "collective": "reducescatter",
+      "nccl_algo": "auto",
+      "nccl_proto": "auto",
+      "payload_mb": 128
+    },
+    {
+      "experiment_id": "alltoall_auto_128mb",
+      "collective": "alltoall",
+      "nccl_algo": "auto",
+      "nccl_proto": "auto",
+      "payload_mb": 128
+    }
+  ],
+  "switch_logging": {
+    "enabled_default": true,
+    "interval_sec_default": 1,
+    "metadata_file": "<matrix_root>/switch_logger.env",
+    "required_env": [
+      "DPU_NODE_PWD",
+      "NETWORK_NODE_PASSWORD",
+      "SWITCH_PASSWORD"
+    ],
+    "markers": [
+      "matrix_start",
+      "matrix_end",
+      "exp_start",
+      "exp_end",
+      "mode_start",
+      "mode_end"
+    ],
+    "overlay_requirement": "reporter should compute PFC counter deltas between mode_start and mode_end for STOCK and B3 within each experiment and overlay the PFC count increase flow."
+  },
+  "analysis_goals": [
+    "Compare STOCK and B3 latency/throughput for each collective.",
+    "Confirm that B3 runtime W_eff changes are visible in PHASE3 logs.",
+    "Overlay switch PFC count increase flow for STOCK and B3 per workload.",
+    "Verify final output equivalence for B3 against STOCK."
+  ]
+}

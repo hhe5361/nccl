@@ -3,6 +3,10 @@
 *.gcov
 /coverage/
 research/code/**/output/
+research/code/**/__pycache__/
+research/docs
+research/venv
+research/codex/
 *.html
 *.log
 **/venv

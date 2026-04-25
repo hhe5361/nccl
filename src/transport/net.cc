@@ -804,7 +804,7 @@ static inline struct phase3WindowDecision phase3SnapshotWindow(
   decision.delayBaseNs = sub->phase3DelayBaseNs;
   decision.delayEwmaNs = sub->phase3DelayEwmaNs;
   decision.occRatioPct = phase3RatioPct((uint64_t)decision.occTr, (uint64_t)std::max(1, decision.wCur));
-  decision.lagRatioPct = phase3RatioPct((uint64_t)decision.recvLag, 1);
+  decision.lagRatioPct = phase3RatioPct((uint64_t)decision.recvLag, (uint64_t)std::max(1, decision.wCur));
   decision.delayRatioPct = phase3RatioPct(decision.delayEwmaNs, std::max<uint64_t>(1, decision.delayBaseNs));
   decision.hiCount = sub->phase3HiCount;
   decision.loCount = sub->phase3LoCount;
@@ -830,7 +830,7 @@ static inline struct phase3WindowDecision phase3UpdateController(
   decision.delayBaseNs = sub->phase3DelayBaseNs;
   decision.delayEwmaNs = sub->phase3DelayEwmaNs;
   decision.occRatioPct = phase3RatioPct((uint64_t)decision.occTr, (uint64_t)std::max(1, sub->phase3CurrentW));
-  decision.lagRatioPct = phase3RatioPct((uint64_t)decision.recvLag, 1);
+  decision.lagRatioPct = phase3RatioPct((uint64_t)decision.recvLag, (uint64_t)std::max(1, sub->phase3CurrentW));
   decision.delayRatioPct = phase3RatioPct(decision.delayEwmaNs, std::max<uint64_t>(1, decision.delayBaseNs));
 
   decision.pressureScore = 0;
