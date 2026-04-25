@@ -12,9 +12,10 @@ DEBUG_RUN_ROOT="${DEBUG_SHARED_ROOT}/${RUN_ID}"
 DEBUG_WORKER_ROOT="${DEBUG_RUN_ROOT}/${WORKER_NAME}"
 mkdir -p "${DEBUG_WORKER_ROOT}"
 
-export TORCH_DISTRIBUTED_DEBUG=${TORCH_DISTRIBUTED_DEBUG:-DETAIL}
+export TORCH_DISTRIBUTED_DEBUG=${TORCH_DISTRIBUTED_DEBUG:-INFO}
 export TORCH_SHOW_CPP_STACKTRACES=${TORCH_SHOW_CPP_STACKTRACES:-1}
 export PYTHONFAULTHANDLER=${PYTHONFAULTHANDLER:-1}
+export TORCH_DISABLE_ADDR2LINE=${TORCH_DISABLE_ADDR2LINE:-1}
 export NCCL_DEBUG=${NCCL_DEBUG:-INFO}
 export NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-INIT,NET}
 export NCCL_PHASE0_LOG=${NCCL_PHASE0_LOG:-1}
@@ -83,6 +84,59 @@ capture_snapshot() {
   } > "${snapshot_file}" 2>&1 || true
 }
 
+preflight_validate() {
+  if [[ -z "${MASTER_ADDR:-}" ]]; then
+    echo "[runtime-debug] MASTER_ADDR must be set" >&2
+    exit 2
+  fi
+  if [[ -z "${MASTER_PORT_BASE:-}" ]]; then
+    echo "[runtime-debug] MASTER_PORT_BASE must be set" >&2
+    exit 2
+  fi
+  if [[ -z "${NNODES:-}" ]]; then
+    echo "[runtime-debug] NNODES must be set" >&2
+    exit 2
+  fi
+  if ! [[ "${NNODES}" =~ ^[0-9]+$ ]]; then
+    echo "[runtime-debug] NNODES must be numeric: '${NNODES}'" >&2
+    exit 2
+  fi
+  if ! [[ "${MASTER_PORT_BASE}" =~ ^[0-9]+$ ]]; then
+    echo "[runtime-debug] MASTER_PORT_BASE must be numeric: '${MASTER_PORT_BASE}'" >&2
+    exit 2
+  fi
+  if (( NNODES < 1 )); then
+    echo "[runtime-debug] NNODES must be >= 1" >&2
+    exit 2
+  fi
+  if ! [[ "${WORKER_NAME}" =~ ^worker([0-9]+)$ ]]; then
+    echo "[runtime-debug] WORKER_NAME must look like worker01..worker08: '${WORKER_NAME}'" >&2
+    exit 2
+  fi
+  local idx=${BASH_REMATCH[1]}
+  local node_rank=$((10#${idx} - 1))
+  if (( node_rank < 0 || node_rank >= NNODES )); then
+    echo "[runtime-debug] inferred node rank ${node_rank} is outside NNODES=${NNODES}" >&2
+    exit 2
+  fi
+}
+
+is_master_node() {
+  [[ "${WORKER_NAME}" == "worker01" || "${WORKER_NAME}" == "${MASTER_SERVER:-}" ]]
+}
+
+preflight_port_check() {
+  if ! is_master_node; then
+    return 0
+  fi
+  local port=${MASTER_PORT_BASE}
+  if ss -ltnp 2>/dev/null | grep -q "[.:]${port}[[:space:]]"; then
+    echo "[runtime-debug] rendezvous port ${port} is already in use on ${WORKER_NAME}" >&2
+    ss -ltnp 2>/dev/null | grep "[.:]${port}[[:space:]]" >&2 || true
+    exit 3
+  fi
+}
+
 capture_nccl_tails() {
   local out="${DEBUG_WORKER_ROOT}/nccl_log_tails.txt"
   {
@@ -97,6 +151,8 @@ capture_nccl_tails() {
   } > "${out}" 2>&1 || true
 }
 
+preflight_validate
+preflight_port_check
 capture_snapshot
 
 set +e
