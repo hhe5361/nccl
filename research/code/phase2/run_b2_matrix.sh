@@ -22,6 +22,7 @@ TORCH_ENV=${TORCH_ENV:-/workspace/venvs/torch-cu121-custom/bin/activate}
 INNER_SCRIPT=${INNER_SCRIPT:-research/code/phase2/run_b2_collective.sh}
 HOST_REPO_ROOT=${HOST_REPO_ROOT:-${REPO_ROOT}}
 REMOTE_REPO_ROOT=${REMOTE_REPO_ROOT:-${HOST_REPO_ROOT}}
+REMOTE_REPO_ROOT_MAP=${REMOTE_REPO_ROOT_MAP:-}
 CONTAINER_REPO_ROOT=${CONTAINER_REPO_ROOT:-/workspace/$(basename "${REPO_ROOT}")}
 CONTAINER_NAME=${CONTAINER_NAME:-nccl-cu121-dev}
 WORKER_SSH_USER=${WORKER_SSH_USER:-}
@@ -124,6 +125,31 @@ resolve_worker_ssh_host() {
     return 1
   fi
   echo "${ssh_host}"
+}
+
+resolve_remote_repo_root() {
+  local worker=$1
+  local ssh_user root mapping entry map_worker map_root path_tail
+  ssh_user=$(resolve_worker_ssh_user "${worker}")
+  if [[ -n "${REMOTE_REPO_ROOT_MAP}" ]]; then
+    IFS=',' read -r -a mapping <<< "${REMOTE_REPO_ROOT_MAP}"
+    for entry in "${mapping[@]}"; do
+      map_worker=${entry%%=*}
+      map_root=${entry#*=}
+      if [[ "${map_worker}" == "${worker}" && -n "${map_root}" ]]; then
+        echo "${map_root}"
+        return 0
+      fi
+    done
+  fi
+  root="${REMOTE_REPO_ROOT}"
+  root="${root//\{worker\}/${worker}}"
+  root="${root//\{user\}/${ssh_user}}"
+  if [[ "${root}" == "${REMOTE_REPO_ROOT}" && "${root}" == /home/*/* ]]; then
+    path_tail=${root#/home/*/}
+    root="/home/${ssh_user}/${path_tail}"
+  fi
+  echo "${root}"
 }
 
 resolve_worker_ssh_port() {
@@ -259,11 +285,13 @@ stop_switch_logger() {
 
 prepare_worker_container() {
   local worker=$1
+  local remote_repo_root
   local cmd
+  remote_repo_root=$(resolve_remote_repo_root "${worker}")
   if [[ "${CONTAINER_RESET_AT_START}" == "1" ]]; then
-    cmd="docker rm -f $(printf '%q' "${CONTAINER_NAME}") >/dev/null 2>&1 || true; cd $(printf '%q' "${REMOTE_REPO_ROOT}") && bash ./research/code/deploy/run_dev_container.sh true >/dev/null"
+    cmd="docker rm -f $(printf '%q' "${CONTAINER_NAME}") >/dev/null 2>&1 || true; cd $(printf '%q' "${remote_repo_root}") && bash ./research/code/deploy/run_dev_container.sh true >/dev/null"
   else
-    cmd="cd $(printf '%q' "${REMOTE_REPO_ROOT}") && bash ./research/code/deploy/run_dev_container.sh true >/dev/null"
+    cmd="cd $(printf '%q' "${remote_repo_root}") && bash ./research/code/deploy/run_dev_container.sh true >/dev/null"
   fi
   echo "[phase2-matrix] prepare container worker=${worker} reset=${CONTAINER_RESET_AT_START}"
   remote_worker_bash "${worker}" "${cmd}"
@@ -330,6 +358,8 @@ done
   echo "  \"execution_model\": \"master_orchestrated_single_port\","
   echo "  \"network_topology_file\": \"${NETWORK_TOPOLOGY_FILE}\","
   echo "  \"ssh_host_resolution\": \"resolve worker internal IP from [Workers] section in network topology file\","
+  echo "  \"remote_repo_root\": \"${REMOTE_REPO_ROOT}\","
+  echo "  \"remote_repo_root_map\": \"${REMOTE_REPO_ROOT_MAP}\","
   echo "  \"worker_ssh_port\": \"${WORKER_SSH_PORT}\","
   echo "  \"worker_ssh_port_map\": \"${WORKER_SSH_PORT_MAP}\","
   echo "  \"dpu_node_port\": \"${DPU_NODE_PORT}\","
@@ -402,6 +432,8 @@ for idx in "${!EXPERIMENT_IDS[@]}"; do
   RESTART_CONTAINERS_ON_FAILURE="${RESTART_CONTAINERS_ON_FAILURE}" \
   WORKER_SSH_USER="${WORKER_SSH_USER}" \
   WORKER_SSH_USER_MAP="${WORKER_SSH_USER_MAP}" \
+  REMOTE_REPO_ROOT="${REMOTE_REPO_ROOT}" \
+  REMOTE_REPO_ROOT_MAP="${REMOTE_REPO_ROOT_MAP}" \
   WORKER_SSH_PASSWORD="${WORKER_SSH_PASSWORD}" \
   SSH_CONNECT_TIMEOUT_SEC="${SSH_CONNECT_TIMEOUT_SEC}" \
   SWITCH_LOG_ENABLE="${SWITCH_LOG_ENABLE}" \

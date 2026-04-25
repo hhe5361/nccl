@@ -30,6 +30,7 @@ COMPARE_SCRIPT=${COMPARE_SCRIPT:-research/code/phase2/compare_b2_vs_stock.py}
 
 HOST_REPO_ROOT=${HOST_REPO_ROOT:-${REPO_ROOT}}
 REMOTE_REPO_ROOT=${REMOTE_REPO_ROOT:-${HOST_REPO_ROOT}}
+REMOTE_REPO_ROOT_MAP=${REMOTE_REPO_ROOT_MAP:-}
 CONTAINER_REPO_ROOT=${CONTAINER_REPO_ROOT:-/workspace/$(basename "${REPO_ROOT}")}
 CONTAINER_NAME=${CONTAINER_NAME:-nccl-cu121-dev}
 CONTAINER_RESET_AT_START=${CONTAINER_RESET_AT_START:-0}
@@ -139,6 +140,31 @@ resolve_worker_ssh_host() {
     return 1
   fi
   echo "${ssh_host}"
+}
+
+resolve_remote_repo_root() {
+  local worker=$1
+  local ssh_user root mapping entry map_worker map_root path_tail
+  ssh_user=$(resolve_worker_ssh_user "${worker}")
+  if [[ -n "${REMOTE_REPO_ROOT_MAP}" ]]; then
+    IFS=',' read -r -a mapping <<< "${REMOTE_REPO_ROOT_MAP}"
+    for entry in "${mapping[@]}"; do
+      map_worker=${entry%%=*}
+      map_root=${entry#*=}
+      if [[ "${map_worker}" == "${worker}" && -n "${map_root}" ]]; then
+        echo "${map_root}"
+        return 0
+      fi
+    done
+  fi
+  root="${REMOTE_REPO_ROOT}"
+  root="${root//\{worker\}/${worker}}"
+  root="${root//\{user\}/${ssh_user}}"
+  if [[ "${root}" == "${REMOTE_REPO_ROOT}" && "${root}" == /home/*/* ]]; then
+    path_tail=${root#/home/*/}
+    root="/home/${ssh_user}/${path_tail}"
+  fi
+  echo "${root}"
 }
 
 resolve_worker_ssh_port() {
@@ -303,17 +329,23 @@ read_status_field() {
 }
 
 container_bootstrap_cmd() {
+  local worker=$1
+  local remote_repo_root
+  remote_repo_root=$(resolve_remote_repo_root "${worker}")
   cat <<EOF
 docker rm -f $(printf '%q' "${CONTAINER_NAME}") >/dev/null 2>&1 || true
-cd $(printf '%q' "${REMOTE_REPO_ROOT}") && bash ./research/code/deploy/run_dev_container.sh true >/dev/null
+cd $(printf '%q' "${remote_repo_root}") && bash ./research/code/deploy/run_dev_container.sh true >/dev/null
 EOF
 }
 
 ensure_container_ready() {
   local worker=$1
-  local cmd="cd $(printf '%q' "${REMOTE_REPO_ROOT}") && bash ./research/code/deploy/run_dev_container.sh true >/dev/null"
+  local remote_repo_root
+  local cmd
+  remote_repo_root=$(resolve_remote_repo_root "${worker}")
+  cmd="cd $(printf '%q' "${remote_repo_root}") && bash ./research/code/deploy/run_dev_container.sh true >/dev/null"
   if [[ "${CONTAINER_RESET_AT_START}" == "1" ]]; then
-    cmd=$(container_bootstrap_cmd)
+    cmd=$(container_bootstrap_cmd "${worker}")
   fi
   echo "[phase2-master] ensuring container on ${worker}"
   remote_worker_bash "${worker}" "${cmd}"
@@ -321,8 +353,10 @@ ensure_container_ready() {
 
 cleanup_worker_processes() {
   local worker=$1
+  local remote_repo_root
   local cmd
-  cmd="cd $(printf '%q' "${REMOTE_REPO_ROOT}") && bash ./research/code/deploy/run_dev_container.sh bash -lc $(printf '%q' "pkill -f 'torchrun|torch\\.distributed\\.run|collective_b2\\.py' >/dev/null 2>&1 || true; sleep 1; ps -ef | grep -E 'torchrun|torch\\.distributed\\.run|collective_b2\\.py' | grep -v grep || true")"
+  remote_repo_root=$(resolve_remote_repo_root "${worker}")
+  cmd="cd $(printf '%q' "${remote_repo_root}") && bash ./research/code/deploy/run_dev_container.sh bash -lc $(printf '%q' "pkill -f 'torchrun|torch\\.distributed\\.run|collective_b2\\.py' >/dev/null 2>&1 || true; sleep 1; ps -ef | grep -E 'torchrun|torch\\.distributed\\.run|collective_b2\\.py' | grep -v grep || true")"
   remote_worker_bash "${worker}" "${cmd}" >/dev/null 2>&1 || true
 }
 
@@ -334,7 +368,9 @@ build_worker_host_command() {
   local status_file=$5
   local mode_upper_value=$6
   local static_w=$7
+  local remote_repo_root
 
+  remote_repo_root=$(resolve_remote_repo_root "${worker}")
   local inner
   inner=$(cat <<EOF
 cd $(printf '%q' "${CONTAINER_REPO_ROOT}") && \
@@ -370,7 +406,7 @@ EOF
 )
 
   cat <<EOF
-cd $(printf '%q' "${REMOTE_REPO_ROOT}") && bash ./research/code/deploy/run_dev_container.sh bash -lc $(printf '%q' "${inner}")
+cd $(printf '%q' "${remote_repo_root}") && bash ./research/code/deploy/run_dev_container.sh bash -lc $(printf '%q' "${inner}")
 EOF
 }
 
@@ -545,6 +581,8 @@ EOF
   "worker_pool": "${ALL_WORKERS}",
   "network_topology_file": "${NETWORK_TOPOLOGY_FILE}",
   "ssh_host_resolution": "resolve worker internal IP from [Workers] section in network topology file",
+  "remote_repo_root": "${REMOTE_REPO_ROOT}",
+  "remote_repo_root_map": "${REMOTE_REPO_ROOT_MAP}",
   "worker_ssh_port": "${WORKER_SSH_PORT}",
   "worker_ssh_port_map": "${WORKER_SSH_PORT_MAP}",
   "dpu_node_port": "${DPU_NODE_PORT}",

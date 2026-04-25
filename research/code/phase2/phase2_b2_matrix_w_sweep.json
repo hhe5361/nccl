@@ -36,6 +36,15 @@
       "global_override_env": "WORKER_SSH_PORT",
       "per_worker_override_env": "WORKER_SSH_PORT_MAP"
     },
+    "remote_repo_root_resolution": {
+      "default": "if REMOTE_REPO_ROOT starts with /home/<user>/..., rewrite it to the resolved remote ssh user home",
+      "global_override_env": "REMOTE_REPO_ROOT",
+      "per_worker_override_env": "REMOTE_REPO_ROOT_MAP",
+      "template_tokens": [
+        "{worker}",
+        "{user}"
+      ]
+    },
     "container_model": {
       "helper_script": "research/code/deploy/run_dev_container.sh",
       "container_name": "nccl-cu121-dev",
