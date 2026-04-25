@@ -81,6 +81,7 @@ def main() -> None:
     step_metrics_path = output_dir / f"{run_tag}_step_metrics.jsonl" if rank == 0 and output_dir is not None else None
     worker_dir = output_dir / worker_name if output_dir is not None else None
     step_timing_path = worker_dir / f"{run_tag}_worker_step_timing.jsonl" if worker_dir is not None else None
+    lifecycle_path = worker_dir / f"{run_tag}_lifecycle_debug.jsonl" if worker_dir is not None else None
 
     traffic_bytes_est_rank = 0.0
     input_tensor = None
@@ -128,12 +129,33 @@ def main() -> None:
         )
 
     records = []
-    dist.barrier()
     handle = step_metrics_path.open("w", encoding="utf-8") if step_metrics_path is not None else None
     timing_handle = None
+    lifecycle_handle = None
     if worker_dir is not None:
         worker_dir.mkdir(parents=True, exist_ok=True)
         timing_handle = step_timing_path.open("w", encoding="utf-8")
+        lifecycle_handle = lifecycle_path.open("w", encoding="utf-8")
+
+    def emit_lifecycle_event(event: str, **extra: object) -> None:
+        if lifecycle_handle is None:
+            return
+        row = {
+            "event": event,
+            "rank": rank,
+            "worker": worker_name,
+            "phase3_mode": os.environ.get("PHASE3_MODE", "b3"),
+            "collective": args.collective,
+            "mono_ns": time.monotonic_ns(),
+            "ts_unix_ns": time.time_ns(),
+        }
+        row.update(extra)
+        lifecycle_handle.write(json.dumps(row, sort_keys=True) + "\n")
+        lifecycle_handle.flush()
+
+    emit_lifecycle_event("pre_start_barrier_enter")
+    dist.barrier()
+    emit_lifecycle_event("pre_start_barrier_exit")
     try:
         for step in range(args.steps):
             base_value = float(rank + 1 + step * 0.001)
@@ -233,6 +255,7 @@ def main() -> None:
 
             if args.sleep_ms > 0:
                 time.sleep(args.sleep_ms / 1000.0)
+        emit_lifecycle_event("step_loop_exit", last_step=args.steps - 1)
     finally:
         if handle is not None:
             handle.close()
@@ -265,10 +288,28 @@ def main() -> None:
             "collective_gbps_p95": percentile([r["collective_gbps_est"] for r in effective], 0.95),
         }
         summary_path = output_dir / f"{run_tag}_summary.json"
+        emit_lifecycle_event("summary_write_enter", summary_path=str(summary_path))
         summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+        emit_lifecycle_event("summary_write_exit", summary_path=str(summary_path))
 
-    dist.barrier()
-    dist.destroy_process_group()
+    try:
+        emit_lifecycle_event("final_barrier_enter")
+        dist.barrier()
+        emit_lifecycle_event("final_barrier_exit")
+
+        emit_lifecycle_event("destroy_pg_enter")
+        dist.destroy_process_group()
+        emit_lifecycle_event("destroy_pg_exit")
+    except Exception as exc:
+        emit_lifecycle_event(
+            "exception",
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
+        raise
+    finally:
+        if lifecycle_handle is not None:
+            lifecycle_handle.close()
 
 
 if __name__ == "__main__":
