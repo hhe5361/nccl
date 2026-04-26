@@ -37,6 +37,12 @@ EXPERIMENT_RE = re.compile(r"^\d+_.+")
 MODE_ORDER = {"STOCK": 0, "B2": 1, "B3": 2}
 MODE_COLORS = {"STOCK": "#1f77b4", "B2": "#ff7f0e", "B3": "#2ca02c"}
 SWITCH_LABELS = ("rackA", "rackB", "spine")
+COLLECTIVE_TO_COLLAPI = {
+    "allreduce": "AllReduce",
+    "allgather": "AllGather",
+    "reducescatter": "ReduceScatter",
+    "alltoall": "AllToAll",
+}
 
 REPORT_LOG_PATH: Optional[Path] = None
 
@@ -484,6 +490,21 @@ def should_record_window_sample(entry: dict) -> bool:
     return event.startswith("PROXY_RECV_")
 
 
+def target_collapi_from_summary(summary: Optional[dict]) -> Optional[str]:
+    if not summary:
+        return None
+    collective = str(summary.get("collective", "") or "").strip().lower()
+    return COLLECTIVE_TO_COLLAPI.get(collective)
+
+
+def nccl_entry_matches_target(entry: dict, target_collapi: Optional[str]) -> bool:
+    if not target_collapi:
+        return True
+    coll_api = str(entry.get("collApi", "") or "")
+    coll = str(entry.get("coll", "") or "")
+    return coll_api == target_collapi or coll == target_collapi
+
+
 def add_window_sample(worker_info: dict, worker_steps: List[dict], entry: dict) -> None:
     try:
         t_ns = int(entry.get("tNs", 0) or 0)
@@ -509,13 +530,19 @@ def add_window_sample(worker_info: dict, worker_steps: List[dict], entry: dict) 
         worker_info["w_fb_values"].append(float(entry["wFb"]))
 
 
-def summarize_nccl_logs(mode_dir: Path, worker_step_timings: Optional[Dict[str, List[dict]]] = None) -> dict:
+def summarize_nccl_logs(
+    mode_dir: Path,
+    worker_step_timings: Optional[Dict[str, List[dict]]] = None,
+    target_collapi: Optional[str] = None,
+) -> dict:
     worker_step_timings = worker_step_timings or {}
     log_paths = sorted(mode_dir.glob("*/nccl.*.log"))
-    log_progress(f"scan NCCL logs mode={mode_dir.name} files={len(log_paths)}")
+    log_progress(f"scan NCCL logs mode={mode_dir.name} files={len(log_paths)} target_collapi={target_collapi or 'ALL'}")
 
     event_counts: Counter = Counter()
     worker_event_counts: Dict[str, Counter] = defaultdict(Counter)
+    all_event_counts: Counter = Counter()
+    filtered_event_counts: Counter = Counter()
     worker_wstall_counts: Counter = Counter()
     decision_counts: Counter = Counter()
     worker_decision_counts: Dict[str, Counter] = defaultdict(Counter)
@@ -543,6 +570,10 @@ def summarize_nccl_logs(mode_dir: Path, worker_step_timings: Optional[Dict[str, 
                 if entry is None:
                     continue
                 event = str(entry["event"])
+                all_event_counts[event] += 1
+                if not nccl_entry_matches_target(entry, target_collapi):
+                    filtered_event_counts[event] += 1
+                    continue
                 event_counts[event] += 1
                 worker_event_counts[worker][event] += 1
 
@@ -634,6 +665,9 @@ def summarize_nccl_logs(mode_dir: Path, worker_step_timings: Optional[Dict[str, 
     return {
         "total_events": int(sum(event_counts.values())),
         "event_counts": event_counts,
+        "total_events_all_collectives": int(sum(all_event_counts.values())),
+        "filtered_events_non_target": int(sum(filtered_event_counts.values())),
+        "target_collapi": target_collapi or "ALL",
         "worker_event_counts": worker_event_counts,
         "recv_wstall_count": int(recv_wstall_count),
         "send_wstall_count": int(send_wstall_count),
@@ -677,7 +711,8 @@ def load_mode_data(mode_dir: Path) -> dict:
         summary.update(compute_step_tail_metrics(step_rows))
 
     worker_step_timings = load_worker_step_timings(mode_dir)
-    nccl = summarize_nccl_logs(mode_dir, worker_step_timings)
+    target_collapi = target_collapi_from_summary(summary)
+    nccl = summarize_nccl_logs(mode_dir, worker_step_timings, target_collapi)
     mode_name = str(summary.get("run_tag") or summary.get("phase3_mode") or summary.get("phase2_mode") or mode_dir.name).upper()
     return {
         "mode": mode_name,
@@ -753,6 +788,9 @@ def summarize_modes(mode_data: List[dict]) -> List[dict]:
             "collective_gbps_p50": float(summary.get("collective_gbps_p50", 0.0)),
             "collective_gbps_p95": float(summary.get("collective_gbps_p95", 0.0)),
             "total_events": int(nccl["total_events"]),
+            "total_events_all_collectives": int(nccl["total_events_all_collectives"]),
+            "filtered_events_non_target": int(nccl["filtered_events_non_target"]),
+            "target_collapi": str(nccl["target_collapi"]),
             "recv_wstall_count": int(nccl["recv_wstall_count"]),
             "send_wstall_count": int(nccl["send_wstall_count"]),
             "total_wstall_count": int(nccl["total_wstall_count"]),
@@ -1558,7 +1596,7 @@ def build_collection_card(experiment_root: Path, mode_data: List[dict], env_setu
         ["MODE/*_summary.json", "Mode-level latency and throughput summary."],
         ["MODE/*_step_metrics.jsonl", "Per-step latency/throughput timeline."],
         [f"MODE/workerXX/*_worker_step_timing.jsonl ({total_step_timing})", "Worker-local step timing for W trace alignment."],
-        [f"MODE/workerXX/nccl.*.log ({total_logs})", "PHASE0/PHASE1/PHASE3 W, pressure, decision, and WSTALL events."],
+        [f"MODE/workerXX/nccl.*.log ({total_logs})", "PHASE0/PHASE1/PHASE3 W, pressure, decision, and WSTALL events filtered to the target collApi."],
         ["switch aggregate jsonl", str(switch_dir) if switch_dir else "not found"],
     ]
     return '<div class="card"><h2>Collected Data</h2>' + render_table(["source", "meaning"], rows) + "</div>"
@@ -1704,6 +1742,8 @@ def build_single_experiment_report(
     summary_headers = [
         "mode",
         "workload",
+        "target_collapi",
+        "filtered_non_target",
         "step_ms_avg",
         "step_ms_p95",
         "step_ms_p99",
@@ -1732,6 +1772,8 @@ def build_single_experiment_report(
         summary_table.append([
             row["mode"],
             row.get("workload", ""),
+            row["target_collapi"],
+            row["filtered_events_non_target"],
             f'{row["step_ms_avg"]:.3f}',
             f'{row["step_ms_p95"]:.3f}',
             f'{row["step_ms_p99"]:.3f}',
@@ -1881,6 +1923,8 @@ def build_matrix_report(
         "experiment",
         "mode",
         "workload",
+        "target_collapi",
+        "filtered_non_target",
         "step_ms_avg",
         "step_ms_p99",
         "step_ms_max",
@@ -1904,6 +1948,8 @@ def build_matrix_report(
             html.escape(str(row["experiment"])),
             html.escape(str(row["mode"])),
             html.escape(str(row.get("workload", ""))),
+            html.escape(str(row.get("target_collapi", ""))),
+            str(row.get("filtered_events_non_target", 0)),
             f'{row["step_ms_avg"]:.3f}',
             f'{row.get("step_ms_p99", 0.0):.3f}',
             f'{row.get("step_ms_max", 0.0):.3f}',
