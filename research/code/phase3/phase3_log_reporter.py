@@ -27,6 +27,7 @@ except ImportError as exc:
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent.parent.parent
 SWITCH_SHARED_ROOT_DEFAULT = Path("/mnt/nfs/cts_experiments/switch_log")
+SWITCH_SHARED_ROOT_FALLBACK = Path("/mnt/nfs_share/cts_experiments/switch_log")
 SWITCH_DOC_ROOT = REPO_ROOT / "research" / "docs" / "switch"
 SWITCH_BUCKET_NS = 1_000_000_000
 
@@ -102,7 +103,7 @@ def percentile_from_counter(counter: Counter, q: float) -> float:
 
 def rel_change(base: float, candidate: float) -> float:
     if abs(float(base)) < 1e-12:
-        return 0.0
+        return 0.0 if abs(float(candidate)) < 1e-12 else math.nan
     return 100.0 * (float(candidate) - float(base)) / float(base)
 
 
@@ -923,6 +924,7 @@ def resolve_switch_log_dir(
         run_id = env_setup.get("switch_log_run_id")
         if run_id:
             candidates.append(SWITCH_SHARED_ROOT_DEFAULT / str(run_id))
+            candidates.append(SWITCH_SHARED_ROOT_FALLBACK / str(run_id))
             candidates.append(SWITCH_DOC_ROOT / str(run_id))
     matrix_switch_env = experiment_root.parent / "switch_logger.env"
     if matrix_switch_env.exists():
@@ -930,20 +932,31 @@ def resolve_switch_log_dir(
             if line.startswith("SWITCH_LOG_LOCAL_DIR="):
                 candidates.append(Path(line.split("=", 1)[1].strip()))
             if line.startswith("SWITCH_LOG_RUN_ID="):
+                candidates.append(SWITCH_SHARED_ROOT_DEFAULT / line.split("=", 1)[1].strip())
+                candidates.append(SWITCH_SHARED_ROOT_FALLBACK / line.split("=", 1)[1].strip())
                 candidates.append(SWITCH_DOC_ROOT / line.split("=", 1)[1].strip())
-    seen = set()
+    expanded_candidates: List[Path] = []
     for candidate in candidates:
+        expanded_candidates.append(candidate)
+        raw = candidate.as_posix()
+        if raw.startswith("/mnt/nfs/"):
+            expanded_candidates.append(Path("/mnt/nfs_share/" + raw[len("/mnt/nfs/") :]))
+        elif raw.startswith("/mnt/nfs_share/"):
+            expanded_candidates.append(Path("/mnt/nfs/" + raw[len("/mnt/nfs_share/") :]))
+    seen = set()
+    for candidate in expanded_candidates:
         key = candidate.as_posix()
         if key in seen:
             continue
         seen.add(key)
         if candidate.exists():
             return candidate
-    return candidates[0] if candidates else None
+    return expanded_candidates[0] if expanded_candidates else None
 
 
 def load_aggregate_switch_file(path: Path, switch_label: str) -> Dict[str, List[Tuple[int, float]]]:
     fields: Dict[str, List[Tuple[int, float]]] = defaultdict(list)
+    carry_forward: Dict[str, Dict[str, float]] = defaultdict(dict)
     for row in load_jsonl(path):
         ts_ns = extract_record_ts_ns(row)
         if ts_ns is None:
@@ -957,6 +970,24 @@ def load_aggregate_switch_file(path: Path, switch_label: str) -> Dict[str, List[
             }
         else:
             field_names = {"rx": "rx_pause_total", "tx": "tx_pause_total"}
+        ports = row.get("ports")
+        if isinstance(ports, dict):
+            for alias, total_key in field_names.items():
+                if total_key.endswith("_total"):
+                    port_key = total_key[: -len("_total")]
+                else:
+                    port_key = total_key
+                saw_value = False
+                for port_name, port_row in ports.items():
+                    if not isinstance(port_row, dict):
+                        continue
+                    value = port_row.get(port_key)
+                    if isinstance(value, (int, float)) and not isinstance(value, bool):
+                        carry_forward[alias][str(port_name)] = max(0.0, float(value))
+                        saw_value = True
+                if saw_value or carry_forward[alias]:
+                    fields[alias].append((ts_ns, sum(carry_forward[alias].values())))
+            continue
         for alias, key in field_names.items():
             value = row.get(key)
             if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -1011,7 +1042,7 @@ def load_switch_counter_snapshots(path: Path) -> List[Tuple[int, float]]:
         fields = load_aggregate_switch_file(path, "rackA") if "aggregate" in name else load_raw_switch_file(path, "rackA")
     else:
         fields = load_aggregate_switch_file(path, "rackB") if "aggregate" in name else load_raw_switch_file(path, "rackB")
-    return fields.get("rx", [])
+    return choose_primary_switch_series(fields)
 
 
 def compute_switch_delta_series(samples: List[Tuple[int, float]]) -> List[Tuple[int, float]]:
@@ -1022,6 +1053,26 @@ def compute_switch_delta_series(samples: List[Tuple[int, float]]) -> List[Tuple[
             continue
         deltas.append((cur_ts, max(0.0, cur_total - prev_total) / elapsed))
     return deltas
+
+
+def positive_increment_total(samples: List[Tuple[int, float]]) -> float:
+    total = 0.0
+    for (_, prev_total), (_, cur_total) in zip(samples, samples[1:]):
+        total += max(0.0, cur_total - prev_total)
+    return total
+
+
+def choose_primary_switch_series(fields: Dict[str, List[Tuple[int, float]]]) -> List[Tuple[int, float]]:
+    candidates = [(name, rows) for name, rows in fields.items() if rows]
+    if not candidates:
+        return []
+    packet_candidates = [item for item in candidates if item[0] in {"rx", "tx"}]
+    if packet_candidates:
+        candidates = packet_candidates
+    # Prefer the direction that actually moves. This avoids hiding spine TX-only
+    # pause counters behind a flat RX series.
+    candidates.sort(key=lambda item: positive_increment_total(item[1]), reverse=True)
+    return candidates[0][1]
 
 
 def interpolate_switch_snapshot_value(snapshots: List[Tuple[int, float]], ts_ns: int) -> Optional[float]:
@@ -1053,7 +1104,7 @@ def build_phase_aligned_cumulative_series(
     candidate_ts = [start_ns]
     candidate_ts.extend(ts for ts, _ in snapshots if start_ns < ts < end_ns)
     candidate_ts.append(end_ns)
-    points: List[Tuple[float, float]] = []
+    samples: List[Tuple[int, float]] = []
     seen = set()
     for ts_ns in candidate_ts:
         if ts_ns in seen:
@@ -1062,7 +1113,17 @@ def build_phase_aligned_cumulative_series(
         value = interpolate_switch_snapshot_value(snapshots, ts_ns)
         if value is None:
             continue
-        points.append(((ts_ns - start_ns) / 1_000_000_000.0, max(0.0, value - start_value)))
+        samples.append((ts_ns, value))
+    if not samples:
+        return []
+    points: List[Tuple[float, float]] = []
+    cumulative = 0.0
+    prev_value = samples[0][1]
+    points.append(((samples[0][0] - start_ns) / 1_000_000_000.0, 0.0))
+    for ts_ns, value in samples[1:]:
+        cumulative += max(0.0, value - prev_value)
+        points.append(((ts_ns - start_ns) / 1_000_000_000.0, cumulative))
+        prev_value = value
     return points
 
 
@@ -1098,7 +1159,7 @@ def load_switch_bundle(
             fields = {}
         if fields:
             switch_fields[label] = fields
-            primary = fields.get("rx") or fields.get("tx") or []
+            primary = choose_primary_switch_series(fields)
             snapshots[label] = primary
             series[label] = compute_switch_delta_series(primary)
 
@@ -1208,11 +1269,10 @@ def compute_switch_metrics(
         start_ns, end_ns = bounds
         for label in SWITCH_LABELS:
             snapshots = bundle["snapshots"].get(label, [])
-            start_value = interpolate_switch_snapshot_value(snapshots, start_ns)
-            end_value = interpolate_switch_snapshot_value(snapshots, end_ns)
-            if start_value is None or end_value is None:
+            points = build_phase_aligned_cumulative_series(snapshots, start_ns, end_ns)
+            if not points:
                 continue
-            delta = max(0.0, end_value - start_value)
+            delta = points[-1][1]
             row[f"{label}_pfc_delta"] = delta
             row["switch_pfc_total"] += delta
             rates = [rate for ts_ns, rate in compute_switch_delta_series(snapshots) if start_ns <= ts_ns <= end_ns]
@@ -1435,11 +1495,15 @@ def save_delta_vs_stock_plot(path: Path, summary_rows: List[dict]) -> Optional[P
     return save_grouped_bar(path, "Change vs STOCK", categories, series, "percent")
 
 
-def trace_by_step(worker_info: dict, value_key: str = "trace_w") -> Tuple[List[int], List[float]]:
+def trace_by_step(worker_info: dict, value_key: str = "trace_w") -> Tuple[List[float], List[float]]:
     steps = worker_info.get("trace_step", [])
     values = worker_info.get(value_key, [])
-    per_step: Dict[int, float] = {}
-    for step, value in zip(steps, values):
+    xs = worker_info.get("trace_x", [])
+    pairs: List[Tuple[float, float]] = []
+    step_sample_counts: Counter = Counter()
+    last_emitted_value: Optional[float] = None
+    last_emitted_step: Optional[int] = None
+    for sample_index, step, value in zip(xs, steps, values):
         if step is None or int(step) < 0:
             continue
         try:
@@ -1447,11 +1511,20 @@ def trace_by_step(worker_info: dict, value_key: str = "trace_w") -> Tuple[List[i
                 continue
         except (TypeError, ValueError):
             continue
-        per_step[int(step)] = float(value)
-    if per_step:
-        ordered_steps = sorted(per_step.keys())
-        return ordered_steps, [per_step[step] for step in ordered_steps]
-    xs = worker_info.get("trace_x", [])
+        step_int = int(step)
+        value_float = float(value)
+        if last_emitted_step == step_int and last_emitted_value == value_float:
+            continue
+        step_sample_counts[step_int] += 1
+        # Preserve transient shrink/recover events inside one collective step.
+        # The old reporter kept only the last sample per step, which hid short W dips.
+        x_value = float(step_int) + min(0.95, 0.02 * (step_sample_counts[step_int] - 1))
+        pairs.append((x_value, value_float))
+        last_emitted_step = step_int
+        last_emitted_value = value_float
+    if pairs:
+        pairs.sort(key=lambda item: item[0])
+        return [x for x, _ in pairs], [value for _, value in pairs]
     clean_values = []
     clean_x = []
     for x_value, value in zip(xs, values):
@@ -1465,7 +1538,7 @@ def trace_by_step(worker_info: dict, value_key: str = "trace_w") -> Tuple[List[i
     return clean_x, clean_values
 
 
-def trace_by_step_pairs(worker_info: dict, value_key: str = "trace_w") -> Tuple[List[int], List[float]]:
+def trace_by_step_pairs(worker_info: dict, value_key: str = "trace_w") -> Tuple[List[float], List[float]]:
     return trace_by_step(worker_info, value_key)
 
 
