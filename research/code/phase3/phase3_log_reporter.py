@@ -37,11 +37,15 @@ EXPERIMENT_RE = re.compile(r"^\d+_.+")
 MODE_ORDER = {"STOCK": 0, "B2": 1, "B3": 2}
 MODE_COLORS = {"STOCK": "#1f77b4", "B2": "#ff7f0e", "B3": "#2ca02c"}
 SWITCH_LABELS = ("rackA", "rackB", "spine")
-COLLECTIVE_TO_COLLAPI = {
-    "allreduce": "AllReduce",
-    "allgather": "AllGather",
-    "reducescatter": "ReduceScatter",
-    "alltoall": "AllToAll",
+COLLECTIVE_TO_COLLAPIS = {
+    "allreduce": ("AllReduce",),
+    "allgather": ("AllGather",),
+    "reducescatter": ("ReduceScatter",),
+    # torch.distributed all_to_all_single is lowered to NCCL grouped P2P ops in
+    # this experiment, so target logs usually show up as Send/Recv rather than
+    # an AllToAll collApi. Keep AllReduce excluded because the benchmark emits
+    # timing-reduction all_reduce calls after each measured step.
+    "alltoall": ("AllToAll", "Send", "Recv", "SendRecv"),
 }
 
 REPORT_LOG_PATH: Optional[Path] = None
@@ -444,6 +448,17 @@ def lookup_worker_step(step_rows: List[dict], timestamp_ns: int) -> Optional[int
     return None
 
 
+def timestamp_in_worker_step(step_rows: List[dict], timestamp_ns: int) -> bool:
+    if not step_rows or timestamp_ns <= 0:
+        return False
+    for row in step_rows:
+        start_ns = int(row.get("start_ns", 0) or 0)
+        end_ns = int(row.get("end_ns", 0) or 0)
+        if start_ns <= timestamp_ns <= end_ns:
+            return True
+    return False
+
+
 def worker_window_defaults() -> dict:
     return {
         "trace_x": [],
@@ -490,19 +505,40 @@ def should_record_window_sample(entry: dict) -> bool:
     return event.startswith("PROXY_RECV_")
 
 
-def target_collapi_from_summary(summary: Optional[dict]) -> Optional[str]:
+def target_collapis_from_summary(summary: Optional[dict]) -> Tuple[str, ...]:
     if not summary:
-        return None
+        return ()
     collective = str(summary.get("collective", "") or "").strip().lower()
-    return COLLECTIVE_TO_COLLAPI.get(collective)
+    return COLLECTIVE_TO_COLLAPIS.get(collective, ())
 
 
-def nccl_entry_matches_target(entry: dict, target_collapi: Optional[str]) -> bool:
-    if not target_collapi:
+def format_target_collapis(target_collapis: Sequence[str]) -> str:
+    return "|".join(target_collapis) if target_collapis else "ALL"
+
+
+def nccl_entry_matches_target(entry: dict, target_collapis: Sequence[str], worker_steps: Optional[List[dict]] = None) -> bool:
+    if not target_collapis:
         return True
-    coll_api = str(entry.get("collApi", "") or "")
-    coll = str(entry.get("coll", "") or "")
-    return coll_api == target_collapi or coll == target_collapi
+    targets = {str(value).lower() for value in target_collapis}
+    unknown_values = {"", "-", "none", "na", "n/a", "unknown"}
+    coll_values = []
+    for key in ("collApi", "coll"):
+        value = str(entry.get(key, "") or "").strip()
+        if value.lower() not in unknown_values:
+            coll_values.append(value)
+    if coll_values:
+        return any(value.lower() in targets for value in coll_values)
+    try:
+        timestamp_ns = int(entry.get("tNs", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    return timestamp_in_worker_step(worker_steps or [], timestamp_ns)
+
+
+# Backward-compatible alias for older ad-hoc imports/tests.
+def target_collapi_from_summary(summary: Optional[dict]) -> Optional[str]:
+    target_collapis = target_collapis_from_summary(summary)
+    return format_target_collapis(target_collapis) if target_collapis else None
 
 
 def add_window_sample(worker_info: dict, worker_steps: List[dict], entry: dict) -> None:
@@ -533,11 +569,12 @@ def add_window_sample(worker_info: dict, worker_steps: List[dict], entry: dict) 
 def summarize_nccl_logs(
     mode_dir: Path,
     worker_step_timings: Optional[Dict[str, List[dict]]] = None,
-    target_collapi: Optional[str] = None,
+    target_collapis: Sequence[str] = (),
 ) -> dict:
     worker_step_timings = worker_step_timings or {}
     log_paths = sorted(mode_dir.glob("*/nccl.*.log"))
-    log_progress(f"scan NCCL logs mode={mode_dir.name} files={len(log_paths)} target_collapi={target_collapi or 'ALL'}")
+    target_label = format_target_collapis(target_collapis)
+    log_progress(f"scan NCCL logs mode={mode_dir.name} files={len(log_paths)} target_collapi={target_label}")
 
     event_counts: Counter = Counter()
     worker_event_counts: Dict[str, Counter] = defaultdict(Counter)
@@ -571,7 +608,7 @@ def summarize_nccl_logs(
                     continue
                 event = str(entry["event"])
                 all_event_counts[event] += 1
-                if not nccl_entry_matches_target(entry, target_collapi):
+                if not nccl_entry_matches_target(entry, target_collapis, worker_steps):
                     filtered_event_counts[event] += 1
                     continue
                 event_counts[event] += 1
@@ -667,7 +704,7 @@ def summarize_nccl_logs(
         "event_counts": event_counts,
         "total_events_all_collectives": int(sum(all_event_counts.values())),
         "filtered_events_non_target": int(sum(filtered_event_counts.values())),
-        "target_collapi": target_collapi or "ALL",
+        "target_collapi": target_label,
         "worker_event_counts": worker_event_counts,
         "recv_wstall_count": int(recv_wstall_count),
         "send_wstall_count": int(send_wstall_count),
@@ -711,8 +748,8 @@ def load_mode_data(mode_dir: Path) -> dict:
         summary.update(compute_step_tail_metrics(step_rows))
 
     worker_step_timings = load_worker_step_timings(mode_dir)
-    target_collapi = target_collapi_from_summary(summary)
-    nccl = summarize_nccl_logs(mode_dir, worker_step_timings, target_collapi)
+    target_collapis = target_collapis_from_summary(summary)
+    nccl = summarize_nccl_logs(mode_dir, worker_step_timings, target_collapis)
     mode_name = str(summary.get("run_tag") or summary.get("phase3_mode") or summary.get("phase2_mode") or mode_dir.name).upper()
     return {
         "mode": mode_name,
