@@ -11,3 +11,4 @@ research/codex/
 *.log
 **/venv
 *.zip
+pkg/debian/copyright

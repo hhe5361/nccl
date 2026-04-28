@@ -88,6 +88,56 @@ def percentile(values: Sequence[float], q: float) -> float:
     return vals[lo] * (1.0 - frac) + vals[hi] * frac
 
 
+def finite_values(values: Iterable[float]) -> List[float]:
+    return [float(v) for v in values if math.isfinite(float(v))]
+
+
+def trimmed_mean(values: Sequence[float], ratio: float = 0.10) -> float:
+    vals = sorted(finite_values(values))
+    if not vals:
+        return 0.0
+    trim = int(len(vals) * ratio)
+    if trim <= 0 or trim * 2 >= len(vals):
+        return mean(vals)
+    return mean(vals[trim:-trim])
+
+
+def winsorized_mean(values: Sequence[float], ratio: float = 0.10) -> float:
+    vals = finite_values(values)
+    if not vals:
+        return 0.0
+    low = percentile(vals, ratio)
+    high = percentile(vals, 1.0 - ratio)
+    return mean(min(max(v, low), high) for v in vals)
+
+
+def iqr(values: Sequence[float]) -> float:
+    vals = finite_values(values)
+    return percentile(vals, 0.75) - percentile(vals, 0.25) if vals else 0.0
+
+
+def outlier_count_2x_p50(values: Sequence[float]) -> int:
+    vals = finite_values(values)
+    if not vals:
+        return 0
+    p50 = percentile(vals, 0.50)
+    if p50 <= 0:
+        return 0
+    return sum(1 for value in vals if value > 2.0 * p50)
+
+
+def outlier_count_mad3(values: Sequence[float]) -> int:
+    vals = finite_values(values)
+    if not vals:
+        return 0
+    p50 = percentile(vals, 0.50)
+    mad = percentile([abs(value - p50) for value in vals], 0.50)
+    if mad <= 0:
+        return outlier_count_2x_p50(vals)
+    threshold = p50 + 3.0 * 1.4826 * mad
+    return sum(1 for value in vals if value > threshold)
+
+
 def percentile_from_counter(counter: Counter, q: float) -> float:
     total = sum(counter.values())
     if total <= 0:
@@ -215,6 +265,120 @@ def save_line_plot(
     path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(path, dpi=180)
     plt.close()
+    return path
+
+
+def save_stock_b3_step_overlay_plot(path: Path, mode_data: List[dict], experiment_name: str) -> Optional[Path]:
+    selected = [item for item in mode_data if item["mode"] in {"STOCK", "B3"} and item["step_rows"]]
+    selected.sort(key=lambda item: 0 if item["mode"] == "STOCK" else 1)
+    if len(selected) < 2:
+        return None
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8.2), sharex=True)
+    any_points = False
+    for item in selected:
+        rows = item["step_rows"]
+        xs = [int(row.get("step", idx)) for idx, row in enumerate(rows)]
+        latency = [float(row.get("step_ms_max", 0.0)) for row in rows]
+        throughput = [float(row.get("collective_gbps_est", 0.0)) for row in rows]
+        if not xs:
+            continue
+        any_points = True
+        color = MODE_COLORS.get(item["mode"])
+        axes[0].plot(xs, latency, marker="o", linewidth=1.7, markersize=3.0, label=item["mode"], color=color)
+        axes[1].plot(xs, throughput, marker="o", linewidth=1.7, markersize=3.0, label=item["mode"], color=color)
+
+        top = max(zip(xs, latency), key=lambda pair: pair[1], default=None)
+        if top is not None:
+            axes[0].scatter([top[0]], [top[1]], s=58, facecolors="none", edgecolors=color, linewidths=1.5)
+            axes[0].annotate(
+                f"{item['mode']} max s{top[0]}",
+                xy=top,
+                xytext=(6, 8),
+                textcoords="offset points",
+                fontsize=8,
+                color=color,
+            )
+
+    if not any_points:
+        plt.close(fig)
+        return None
+    axes[0].set_title(f"{experiment_name} STOCK vs B3 Step Latency Overlay")
+    axes[0].set_ylabel("latency (ms)")
+    axes[1].set_title("STOCK vs B3 Step Throughput Overlay")
+    axes[1].set_xlabel("collective step")
+    axes[1].set_ylabel("Gbps")
+    for ax in axes:
+        ax.grid(True, alpha=0.25)
+        ax.legend()
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    return path
+
+
+def save_step_pfc_overlay_plot(
+    path: Path,
+    experiment_root: Path,
+    env_setup: Optional[dict],
+    mode_data: List[dict],
+    switch_log_dir_override: Optional[str] = None,
+) -> Optional[Path]:
+    bundle = load_switch_bundle(experiment_root, env_setup, switch_log_dir_override)
+    if not bundle or not bundle.get("snapshots"):
+        return None
+
+    selected = [item for item in mode_data if item["mode"] in {"STOCK", "B3"} and item["step_rows"]]
+    selected.sort(key=lambda item: 0 if item["mode"] == "STOCK" else 1)
+    if len(selected) < 2:
+        return None
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10.5), sharex=True)
+    any_points = False
+    for ax, label in zip(axes, SWITCH_LABELS):
+        snapshots = bundle["snapshots"].get(label, [])
+        if not snapshots:
+            continue
+        for item in selected:
+            xs: List[int] = []
+            ys: List[float] = []
+            for idx, row in enumerate(item["step_rows"]):
+                start_ns = extract_ts_ns(row.get("ts_start_unix_ns"))
+                end_ns = extract_ts_ns(row.get("ts_end_unix_ns"))
+                if start_ns is None or end_ns is None or end_ns <= start_ns:
+                    continue
+                points = build_phase_aligned_cumulative_series(snapshots, start_ns, end_ns)
+                if not points:
+                    continue
+                xs.append(int(row.get("step", idx)))
+                ys.append(float(points[-1][1]))
+            if not xs:
+                continue
+            any_points = True
+            ax.plot(
+                xs,
+                ys,
+                marker="o",
+                linewidth=1.7,
+                markersize=3.0,
+                label=item["mode"],
+                color=MODE_COLORS.get(item["mode"]),
+            )
+        ax.set_title(f"{label} per-step PFC increase")
+        ax.set_ylabel("PFC delta")
+        ax.grid(True, alpha=0.25)
+        ax.legend()
+
+    if not any_points:
+        plt.close(fig)
+        return None
+    axes[-1].set_xlabel("collective step")
+    fig.suptitle(f"{experiment_root.name} STOCK vs B3 Step PFC Count Overlay", y=0.995)
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
     return path
 
 
@@ -388,13 +552,25 @@ def effective_rows(step_rows: List[dict]) -> List[dict]:
 
 def compute_summary_from_steps(step_rows: List[dict]) -> dict:
     rows = effective_rows(step_rows)
+    latencies = [float(row.get("step_ms_max", 0.0)) for row in rows]
+    gbps_values = [float(row.get("collective_gbps_est", 0.0)) for row in rows]
     return {
-        "step_ms_avg": mean(float(row.get("step_ms_max", 0.0)) for row in rows),
-        "step_ms_p50": percentile([float(row.get("step_ms_max", 0.0)) for row in rows], 0.50),
-        "step_ms_p95": percentile([float(row.get("step_ms_max", 0.0)) for row in rows], 0.95),
-        "collective_gbps_avg": mean(float(row.get("collective_gbps_est", 0.0)) for row in rows),
-        "collective_gbps_p50": percentile([float(row.get("collective_gbps_est", 0.0)) for row in rows], 0.50),
-        "collective_gbps_p95": percentile([float(row.get("collective_gbps_est", 0.0)) for row in rows], 0.95),
+        "step_ms_avg": mean(latencies),
+        "step_ms_p50": percentile(latencies, 0.50),
+        "step_ms_p95": percentile(latencies, 0.95),
+        "step_ms_trimmed_mean_10pct": trimmed_mean(latencies, 0.10),
+        "step_ms_winsor_mean_10pct": winsorized_mean(latencies, 0.10),
+        "step_ms_iqr": iqr(latencies),
+        "step_ms_outlier_count_2x_p50": outlier_count_2x_p50(latencies),
+        "step_ms_outlier_count_mad3": outlier_count_mad3(latencies),
+        "collective_gbps_avg": mean(gbps_values),
+        "collective_gbps_p10": percentile(gbps_values, 0.10),
+        "collective_gbps_p50": percentile(gbps_values, 0.50),
+        "collective_gbps_p95": percentile(gbps_values, 0.95),
+        "collective_gbps_trimmed_mean_10pct": trimmed_mean(gbps_values, 0.10),
+        "collective_gbps_winsor_mean_10pct": winsorized_mean(gbps_values, 0.10),
+        "collective_gbps_iqr": iqr(gbps_values),
+        "collective_gbps_min": min(gbps_values) if gbps_values else 0.0,
     }
 
 
@@ -746,6 +922,8 @@ def load_mode_data(mode_dir: Path) -> dict:
     if "step_ms_avg" not in summary and step_rows:
         summary.update(compute_summary_from_steps(step_rows))
     if step_rows:
+        for key, value in compute_summary_from_steps(step_rows).items():
+            summary.setdefault(key, value)
         summary.update(compute_step_tail_metrics(step_rows))
 
     worker_step_timings = load_worker_step_timings(mode_dir)
@@ -819,12 +997,22 @@ def summarize_modes(mode_data: List[dict]) -> List[dict]:
             "step_ms_p95": float(summary.get("step_ms_p95", 0.0)),
             "step_ms_p99": float(summary.get("step_ms_p99", 0.0)),
             "step_ms_max": float(summary.get("step_ms_max", 0.0)),
+            "step_ms_trimmed_mean_10pct": float(summary.get("step_ms_trimmed_mean_10pct", summary.get("step_ms_avg", 0.0))),
+            "step_ms_winsor_mean_10pct": float(summary.get("step_ms_winsor_mean_10pct", summary.get("step_ms_avg", 0.0))),
+            "step_ms_iqr": float(summary.get("step_ms_iqr", 0.0)),
+            "step_ms_outlier_count_2x_p50": int(summary.get("step_ms_outlier_count_2x_p50", 0)),
+            "step_ms_outlier_count_mad3": int(summary.get("step_ms_outlier_count_mad3", 0)),
             "top_outlier_step": int(summary.get("top_outlier_step", -1)),
             "top_outlier_step_ms": float(summary.get("top_outlier_step_ms", 0.0)),
             "top_outlier_warmup": bool(summary.get("top_outlier_warmup", False)),
             "collective_gbps_avg": float(summary.get("collective_gbps_avg", 0.0)),
+            "collective_gbps_p10": float(summary.get("collective_gbps_p10", 0.0)),
             "collective_gbps_p50": float(summary.get("collective_gbps_p50", 0.0)),
             "collective_gbps_p95": float(summary.get("collective_gbps_p95", 0.0)),
+            "collective_gbps_trimmed_mean_10pct": float(summary.get("collective_gbps_trimmed_mean_10pct", summary.get("collective_gbps_avg", 0.0))),
+            "collective_gbps_winsor_mean_10pct": float(summary.get("collective_gbps_winsor_mean_10pct", summary.get("collective_gbps_avg", 0.0))),
+            "collective_gbps_iqr": float(summary.get("collective_gbps_iqr", 0.0)),
+            "collective_gbps_min": float(summary.get("collective_gbps_min", 0.0)),
             "total_events": int(nccl["total_events"]),
             "total_events_all_collectives": int(nccl["total_events_all_collectives"]),
             "filtered_events_non_target": int(nccl["filtered_events_non_target"]),
@@ -847,13 +1035,23 @@ def summarize_modes(mode_data: List[dict]) -> List[dict]:
             "lag_ratio_p95": float(nccl["lag_ratio_p95"]),
             "delay_ratio_p95": float(nccl["delay_ratio_p95"]),
             "delta_step_vs_stock_pct": 0.0,
+            "delta_step_trim10_vs_stock_pct": 0.0,
+            "delta_step_p50_vs_stock_pct": 0.0,
+            "delta_step_p95_vs_stock_pct": 0.0,
             "delta_bw_vs_stock_pct": 0.0,
+            "delta_bw_p50_vs_stock_pct": 0.0,
+            "delta_bw_p10_vs_stock_pct": 0.0,
             "delta_occ_tr_vs_stock_pct": 0.0,
             "delta_wstall_vs_stock_pct": 0.0,
         }
         if stock is not None and item["mode"] != "STOCK":
             row["delta_step_vs_stock_pct"] = rel_change(float(stock["summary"].get("step_ms_avg", 0.0)), row["step_ms_avg"])
+            row["delta_step_trim10_vs_stock_pct"] = rel_change(float(stock["summary"].get("step_ms_trimmed_mean_10pct", 0.0)), row["step_ms_trimmed_mean_10pct"])
+            row["delta_step_p50_vs_stock_pct"] = rel_change(float(stock["summary"].get("step_ms_p50", 0.0)), row["step_ms_p50"])
+            row["delta_step_p95_vs_stock_pct"] = rel_change(float(stock["summary"].get("step_ms_p95", 0.0)), row["step_ms_p95"])
             row["delta_bw_vs_stock_pct"] = rel_change(float(stock["summary"].get("collective_gbps_avg", 0.0)), row["collective_gbps_avg"])
+            row["delta_bw_p50_vs_stock_pct"] = rel_change(float(stock["summary"].get("collective_gbps_p50", 0.0)), row["collective_gbps_p50"])
+            row["delta_bw_p10_vs_stock_pct"] = rel_change(float(stock["summary"].get("collective_gbps_p10", 0.0)), row["collective_gbps_p10"])
             row["delta_occ_tr_vs_stock_pct"] = rel_change(float(stock["nccl"]["p99_occ_tr"]), row["p99_occ_tr"])
             row["delta_wstall_vs_stock_pct"] = rel_change(float(stock["nccl"]["total_wstall_count"]), row["total_wstall_count"])
         rows.append(row)
@@ -1487,10 +1685,10 @@ def save_delta_vs_stock_plot(path: Path, summary_rows: List[dict]) -> Optional[P
         return None
     categories = [row["mode"] for row in rows]
     series = [
-        ("latency_pct", [float(row["delta_step_vs_stock_pct"]) for row in rows]),
-        ("throughput_pct", [float(row["delta_bw_vs_stock_pct"]) for row in rows]),
+        ("lat_trim10_pct", [float(row.get("delta_step_trim10_vs_stock_pct", row["delta_step_vs_stock_pct"])) for row in rows]),
+        ("lat_p95_pct", [float(row.get("delta_step_p95_vs_stock_pct", row["delta_step_vs_stock_pct"])) for row in rows]),
+        ("gbps_p50_pct", [float(row.get("delta_bw_p50_vs_stock_pct", row["delta_bw_vs_stock_pct"])) for row in rows]),
         ("pfc_total_pct", [float(row.get("delta_pfc_total_vs_stock_pct", 0.0)) for row in rows]),
-        ("wstall_pct", [float(row["delta_wstall_vs_stock_pct"]) for row in rows]),
     ]
     return save_grouped_bar(path, "Change vs STOCK", categories, series, "percent")
 
@@ -1720,6 +1918,8 @@ def build_visualization_card() -> str:
         ["b3_effective_decision_<experiment>.png", "B3 effective W changes where oldW != newW."],
         ["pressure_vs_w_<experiment>.png", "B3 pressureScore and pressure components against W_eff."],
         ["step_outliers_<experiment>.png", "Per-step latency timeline with top outlier steps highlighted."],
+        ["stock_b3_step_overlay_<experiment>.png", "STOCK vs B3 step-by-step latency and throughput overlay."],
+        ["step_pfc_overlay_<experiment>.png", "STOCK vs B3 per-step rackA/rackB/spine PFC count increase overlay."],
         ["summary plots", "Latency, throughput, W distribution, WSTALL, and stock-relative deltas."],
     ]
     return '<div class="card"><h2>Visualization Outputs</h2>' + render_table(["plot", "meaning"], rows) + "</div>"
@@ -1794,23 +1994,52 @@ def build_single_experiment_report(
 
     p_step = save_line_plot(plots_dir / "step_timeline.png", f"{experiment_root.name} Step Latency", "collective step", "ms", step_series)
     p_bw = save_line_plot(plots_dir / "throughput_timeline.png", f"{experiment_root.name} Throughput", "collective step", "Gbps", bw_series)
+    p_stock_b3_step = save_stock_b3_step_overlay_plot(plots_dir / f"stock_b3_step_overlay_{experiment_root.name}.png", mode_data, experiment_root.name)
+    p_step_pfc = save_step_pfc_overlay_plot(plots_dir / f"step_pfc_overlay_{experiment_root.name}.png", experiment_root, env_setup, mode_data, switch_log_dir_override)
     p_latency = save_grouped_bar(
         plots_dir / "summary_latency.png",
         "Latency Summary by Mode",
         [row["mode"] for row in summary_rows],
         [
-            ("avg", [row["step_ms_avg"] for row in summary_rows]),
+            ("p50", [row["step_ms_p50"] for row in summary_rows]),
+            ("trim10", [row["step_ms_trimmed_mean_10pct"] for row in summary_rows]),
             ("p95", [row["step_ms_p95"] for row in summary_rows]),
-            ("p99", [row["step_ms_p99"] for row in summary_rows]),
             ("max", [row["step_ms_max"] for row in summary_rows]),
         ],
         "ms",
+    )
+    p_latency_mean = save_grouped_bar(
+        plots_dir / "summary_latency_mean_vs_robust.png",
+        "Latency Mean vs Robust Summary",
+        [row["mode"] for row in summary_rows],
+        [
+            ("avg", [row["step_ms_avg"] for row in summary_rows]),
+            ("trim10", [row["step_ms_trimmed_mean_10pct"] for row in summary_rows]),
+            ("winsor10", [row["step_ms_winsor_mean_10pct"] for row in summary_rows]),
+            ("p50", [row["step_ms_p50"] for row in summary_rows]),
+        ],
+        "ms",
+    )
+    p_outlier_counts = save_grouped_bar(
+        plots_dir / "latency_outlier_counts.png",
+        "Latency Outlier Counts by Mode",
+        [row["mode"] for row in summary_rows],
+        [
+            (">2x_p50", [row["step_ms_outlier_count_2x_p50"] for row in summary_rows]),
+            ("MAD3", [row["step_ms_outlier_count_mad3"] for row in summary_rows]),
+        ],
+        "steps",
     )
     p_throughput = save_grouped_bar(
         plots_dir / "summary_throughput.png",
         "Throughput Summary by Mode",
         [row["mode"] for row in summary_rows],
-        [("avg", [row["collective_gbps_avg"] for row in summary_rows]), ("p95", [row["collective_gbps_p95"] for row in summary_rows])],
+        [
+            ("p10", [row["collective_gbps_p10"] for row in summary_rows]),
+            ("p50", [row["collective_gbps_p50"] for row in summary_rows]),
+            ("trim10", [row["collective_gbps_trimmed_mean_10pct"] for row in summary_rows]),
+            ("avg", [row["collective_gbps_avg"] for row in summary_rows]),
+        ],
         "Gbps",
     )
     p_pfc = save_pfc_overlay_plot(plots_dir / f"pfc_overlay_{experiment_root.name}.png", experiment_root, env_setup, mode_data, switch_log_dir_override)
@@ -1855,12 +2084,21 @@ def build_single_experiment_report(
         "target_collapi",
         "filtered_non_target",
         "step_ms_avg",
+        "step_ms_p50",
         "step_ms_p95",
         "step_ms_p99",
         "step_ms_max",
+        "step_ms_trim10",
+        "step_ms_winsor10",
+        "outliers_2x_p50",
+        "outliers_mad3",
         "top_outlier_step",
         "top_outlier_step_ms",
         "gbps_avg",
+        "gbps_p10",
+        "gbps_p50",
+        "gbps_trim10",
+        "gbps_min",
         "pfc_total",
         "rackA_delta",
         "rackB_delta",
@@ -1885,12 +2123,21 @@ def build_single_experiment_report(
             row["target_collapi"],
             row["filtered_events_non_target"],
             f'{row["step_ms_avg"]:.3f}',
+            f'{row["step_ms_p50"]:.3f}',
             f'{row["step_ms_p95"]:.3f}',
             f'{row["step_ms_p99"]:.3f}',
             f'{row["step_ms_max"]:.3f}',
+            f'{row["step_ms_trimmed_mean_10pct"]:.3f}',
+            f'{row["step_ms_winsor_mean_10pct"]:.3f}',
+            row["step_ms_outlier_count_2x_p50"],
+            row["step_ms_outlier_count_mad3"],
             row["top_outlier_step"],
             f'{row["top_outlier_step_ms"]:.3f}',
             f'{row["collective_gbps_avg"]:.3f}',
+            f'{row["collective_gbps_p10"]:.3f}',
+            f'{row["collective_gbps_p50"]:.3f}',
+            f'{row["collective_gbps_trimmed_mean_10pct"]:.3f}',
+            f'{row["collective_gbps_min"]:.3f}',
             f'{row["switch_pfc_total"]:.0f}',
             f'{row["rackA_pfc_delta"]:.0f}',
             f'{row["rackB_pfc_delta"]:.0f}',
@@ -1925,10 +2172,14 @@ def build_single_experiment_report(
         (p_effective_decision, "B3 effective W changes where oldW != newW"),
         (p_pressure_w, "B3 pressure basis vs W_eff"),
         (p_step_outlier, "step latency outliers with top steps highlighted"),
+        (p_stock_b3_step, "STOCK vs B3 step-by-step latency and throughput overlay"),
+        (p_step_pfc, "STOCK vs B3 per-step PFC count increase overlay"),
         (p_step, "step latency timeline"),
         (p_bw, "throughput timeline"),
-        (p_latency, "latency summary"),
-        (p_throughput, "throughput summary"),
+        (p_latency, "robust latency summary"),
+        (p_latency_mean, "latency mean vs robust summary"),
+        (p_outlier_counts, "latency outlier counts"),
+        (p_throughput, "robust throughput summary"),
         (p_delta, "change vs STOCK"),
         (p_window_dist, "W_eff distribution"),
         (p_occ, "posted/transmitted occupancy summary"),
@@ -1971,14 +2222,14 @@ def save_matrix_tradeoff_plot(path: Path, rows: List[dict]) -> Optional[Path]:
     fig, ax = plt.subplots(figsize=(9, 6.5))
     for row in b3_rows:
         x_val = -float(row.get("delta_pfc_total_vs_stock_pct", 0.0))
-        y_val = -float(row.get("delta_step_vs_stock_pct", 0.0))
+        y_val = -float(row.get("delta_step_trim10_vs_stock_pct", row.get("delta_step_vs_stock_pct", 0.0)))
         ax.scatter([x_val], [y_val], s=70)
         ax.annotate(str(row["experiment"]), (x_val, y_val), fontsize=8, xytext=(5, 4), textcoords="offset points")
     ax.axhline(0.0, color="#6c7f99", linewidth=0.9, linestyle="--")
     ax.axvline(0.0, color="#6c7f99", linewidth=0.9, linestyle="--")
     ax.set_xlabel("PFC total reduction vs STOCK (%)")
-    ax.set_ylabel("latency improvement vs STOCK (%)")
-    ax.set_title("B3 Benefit Tradeoff")
+    ax.set_ylabel("trimmed-mean latency improvement vs STOCK (%)")
+    ax.set_title("B3 Benefit Tradeoff (Robust Latency)")
     ax.grid(True, alpha=0.25)
     fig.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2023,8 +2274,10 @@ def build_matrix_report(
             rows.append(flat)
 
     plots_dir = output_dir / "plots"
-    p_latency = save_matrix_bar(plots_dir / "matrix_latency.png", rows, "step_ms_avg", "Matrix Latency", "step_ms_avg")
-    p_throughput = save_matrix_bar(plots_dir / "matrix_throughput.png", rows, "collective_gbps_avg", "Matrix Throughput", "Gbps")
+    p_latency = save_matrix_bar(plots_dir / "matrix_latency.png", rows, "step_ms_trimmed_mean_10pct", "Matrix Latency Trimmed Mean", "trim10 step_ms")
+    p_latency_tail = save_matrix_bar(plots_dir / "matrix_latency_p95.png", rows, "step_ms_p95", "Matrix Latency P95", "p95 step_ms")
+    p_latency_outliers = save_matrix_bar(plots_dir / "matrix_latency_outliers.png", rows, "step_ms_outlier_count_2x_p50", "Matrix Latency Outlier Count", "steps > 2x p50")
+    p_throughput = save_matrix_bar(plots_dir / "matrix_throughput.png", rows, "collective_gbps_p50", "Matrix Throughput P50", "Gbps p50")
     p_pfc = save_matrix_bar(plots_dir / "matrix_pfc_total.png", rows, "switch_pfc_total", "Matrix Switch PFC Delta", "PFC delta")
     p_pfc_change = save_matrix_bar(plots_dir / "matrix_pfc_delta_vs_stock.png", rows, "delta_pfc_total_vs_stock_pct", "PFC Change vs STOCK", "percent")
     p_tradeoff = save_matrix_tradeoff_plot(plots_dir / "matrix_b3_tradeoff.png", rows)
@@ -2036,10 +2289,15 @@ def build_matrix_report(
         "target_collapi",
         "filtered_non_target",
         "step_ms_avg",
+        "step_ms_p50",
+        "step_ms_trim10",
         "step_ms_p99",
         "step_ms_max",
+        "outliers_2x_p50",
         "top_outlier_step",
         "gbps_avg",
+        "gbps_p50",
+        "gbps_p10",
         "pfc_total",
         "rackA",
         "rackB",
@@ -2061,10 +2319,15 @@ def build_matrix_report(
             html.escape(str(row.get("target_collapi", ""))),
             str(row.get("filtered_events_non_target", 0)),
             f'{row["step_ms_avg"]:.3f}',
+            f'{row.get("step_ms_p50", 0.0):.3f}',
+            f'{row.get("step_ms_trimmed_mean_10pct", row["step_ms_avg"]):.3f}',
             f'{row.get("step_ms_p99", 0.0):.3f}',
             f'{row.get("step_ms_max", 0.0):.3f}',
+            str(row.get("step_ms_outlier_count_2x_p50", 0)),
             str(row.get("top_outlier_step", "")),
             f'{row["collective_gbps_avg"]:.3f}',
+            f'{row.get("collective_gbps_p50", 0.0):.3f}',
+            f'{row.get("collective_gbps_p10", 0.0):.3f}',
             f'{row.get("switch_pfc_total", 0.0):.0f}',
             f'{row.get("rackA_pfc_delta", 0.0):.0f}',
             f'{row.get("rackB_pfc_delta", 0.0):.0f}',
@@ -2082,8 +2345,10 @@ def build_matrix_report(
     ]
     figures = []
     for plot_path, caption in [
-        (p_latency, "experiment/mode latency"),
-        (p_throughput, "experiment/mode throughput"),
+        (p_latency, "experiment/mode trimmed-mean latency"),
+        (p_latency_tail, "experiment/mode p95 latency"),
+        (p_latency_outliers, "experiment/mode latency outlier counts"),
+        (p_throughput, "experiment/mode p50 throughput"),
         (p_pfc, "experiment/mode PFC start-stop delta"),
         (p_pfc_change, "PFC total change vs STOCK"),
         (p_tradeoff, "B3 PFC reduction vs latency improvement tradeoff"),

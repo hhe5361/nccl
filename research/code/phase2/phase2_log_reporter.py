@@ -220,9 +220,25 @@ def summarize_modes(
             "workload": workload_label(str(summary.get("collective", "")), algo),
             "payload_mb": float(summary.get("payload_mb", 0.0)),
             "step_ms_avg": float(summary.get("step_ms_avg", 0.0)),
+            "step_ms_p50": float(summary.get("step_ms_p50", 0.0)),
             "step_ms_p95": float(summary.get("step_ms_p95", 0.0)),
+            "step_ms_p99": float(summary.get("step_ms_p99", 0.0)),
+            "step_ms_max": float(summary.get("step_ms_max", 0.0)),
+            "step_ms_trimmed_mean_10pct": float(summary.get("step_ms_trimmed_mean_10pct", summary.get("step_ms_avg", 0.0))),
+            "step_ms_winsor_mean_10pct": float(summary.get("step_ms_winsor_mean_10pct", summary.get("step_ms_avg", 0.0))),
+            "step_ms_iqr": float(summary.get("step_ms_iqr", 0.0)),
+            "step_ms_outlier_count_2x_p50": int(summary.get("step_ms_outlier_count_2x_p50", 0)),
+            "step_ms_outlier_count_mad3": int(summary.get("step_ms_outlier_count_mad3", 0)),
+            "top_outlier_step": int(summary.get("top_outlier_step", -1)),
+            "top_outlier_step_ms": float(summary.get("top_outlier_step_ms", 0.0)),
             "collective_gbps_avg": float(summary.get("collective_gbps_avg", 0.0)),
+            "collective_gbps_p10": float(summary.get("collective_gbps_p10", 0.0)),
+            "collective_gbps_p50": float(summary.get("collective_gbps_p50", 0.0)),
             "collective_gbps_p95": float(summary.get("collective_gbps_p95", 0.0)),
+            "collective_gbps_trimmed_mean_10pct": float(summary.get("collective_gbps_trimmed_mean_10pct", summary.get("collective_gbps_avg", 0.0))),
+            "collective_gbps_winsor_mean_10pct": float(summary.get("collective_gbps_winsor_mean_10pct", summary.get("collective_gbps_avg", 0.0))),
+            "collective_gbps_iqr": float(summary.get("collective_gbps_iqr", 0.0)),
+            "collective_gbps_min": float(summary.get("collective_gbps_min", 0.0)),
             "total_events": int(nccl["total_events"]),
             "recv_wstall_count": int(nccl["recv_wstall_count"]),
             "send_wstall_count": int(nccl["send_wstall_count"]),
@@ -235,7 +251,12 @@ def summarize_modes(
             "final_output_match_vs_stock": "-",
             "final_output_match_workers": "-",
             "delta_step_vs_stock_pct": 0.0,
+            "delta_step_trim10_vs_stock_pct": 0.0,
+            "delta_step_p50_vs_stock_pct": 0.0,
+            "delta_step_p95_vs_stock_pct": 0.0,
             "delta_bw_vs_stock_pct": 0.0,
+            "delta_bw_p50_vs_stock_pct": 0.0,
+            "delta_bw_p10_vs_stock_pct": 0.0,
             "delta_occ_tr_vs_stock_pct": 0.0,
             "delta_wstall_vs_stock_pct": 0.0,
             "delta_pfc_total_vs_stock_pct": 0.0,
@@ -250,7 +271,12 @@ def summarize_modes(
             stock_nccl = stock["nccl"]
             stock_switch = switch_metrics.get("STOCK", {"switch_pfc_total": 0.0, "switch_pfc_peak_rate": 0.0})
             row["delta_step_vs_stock_pct"] = base.rel_change(float(stock_summary.get("step_ms_avg", 0.0)), row["step_ms_avg"])
+            row["delta_step_trim10_vs_stock_pct"] = base.rel_change(float(stock_summary.get("step_ms_trimmed_mean_10pct", 0.0)), row["step_ms_trimmed_mean_10pct"])
+            row["delta_step_p50_vs_stock_pct"] = base.rel_change(float(stock_summary.get("step_ms_p50", 0.0)), row["step_ms_p50"])
+            row["delta_step_p95_vs_stock_pct"] = base.rel_change(float(stock_summary.get("step_ms_p95", 0.0)), row["step_ms_p95"])
             row["delta_bw_vs_stock_pct"] = base.rel_change(float(stock_summary.get("collective_gbps_avg", 0.0)), row["collective_gbps_avg"])
+            row["delta_bw_p50_vs_stock_pct"] = base.rel_change(float(stock_summary.get("collective_gbps_p50", 0.0)), row["collective_gbps_p50"])
+            row["delta_bw_p10_vs_stock_pct"] = base.rel_change(float(stock_summary.get("collective_gbps_p10", 0.0)), row["collective_gbps_p10"])
             row["delta_occ_tr_vs_stock_pct"] = base.rel_change(float(stock_nccl["p99_occ_tr"]), row["p99_occ_tr"])
             row["delta_wstall_vs_stock_pct"] = base.rel_change(float(stock_nccl["total_wstall_count"]), row["total_wstall_count"])
             row["delta_pfc_total_vs_stock_pct"] = base.rel_change(float(stock_switch["switch_pfc_total"]), row["switch_pfc_total"])
@@ -544,14 +570,37 @@ def save_heatmap(
 
 
 def build_worker_window_table(mode_item: dict) -> str:
+    def format_window_values(values) -> str:
+        if values is None:
+            return "-"
+        if isinstance(values, (int, float, str)):
+            values = [values]
+        rendered = ",".join(str(v) for v in values)
+        return rendered or "-"
+
     rows = []
     worker_windows = mode_item["nccl"]["worker_windows"]
+    worker_summary = mode_item["nccl"].get("worker_summary", {})
     for worker, info in sorted(worker_windows.items(), key=lambda item: base.worker_sort_key(item[0])):
+        w_values = info.get("w_values", [])
+        summary = worker_summary.get(worker, {})
+        initial_values = info.get("initial_w_values")
+        final_values = info.get("final_w_values")
+        if initial_values is None:
+            if w_values:
+                initial_values = [w_values[0]]
+            elif summary:
+                initial_values = [summary.get("initial_w", 0.0)]
+        if final_values is None:
+            if w_values:
+                final_values = [w_values[-1]]
+            elif summary:
+                final_values = [summary.get("final_w", 0.0)]
         rows.append([
             worker,
-            ",".join(str(v) for v in info["initial_w_values"]) or "-",
-            ",".join(str(v) for v in info["final_w_values"]) or "-",
-            len(info["trace_x"]),
+            format_window_values(initial_values),
+            format_window_values(final_values),
+            len(info.get("trace_x", [])) or int(summary.get("samples", 0) or 0),
         ])
     return base.render_table(["worker", "initial_w", "final_w", "samples"], rows)
 
@@ -591,14 +640,46 @@ def build_single_experiment_report(
         plots_dir / "summary_latency.png",
         "Latency Summary by Mode",
         [row["mode"] for row in summary_rows],
-        [("avg", [float(row["step_ms_avg"]) for row in summary_rows]), ("p95", [float(row["step_ms_p95"]) for row in summary_rows])],
+        [
+            ("p50", [float(row["step_ms_p50"]) for row in summary_rows]),
+            ("trim10", [float(row["step_ms_trimmed_mean_10pct"]) for row in summary_rows]),
+            ("p95", [float(row["step_ms_p95"]) for row in summary_rows]),
+            ("max", [float(row["step_ms_max"]) for row in summary_rows]),
+        ],
         "ms",
+    )
+    p_step_robust = base.save_grouped_bar(
+        plots_dir / "summary_latency_mean_vs_robust.png",
+        "Latency Mean vs Robust Summary",
+        [row["mode"] for row in summary_rows],
+        [
+            ("avg", [float(row["step_ms_avg"]) for row in summary_rows]),
+            ("trim10", [float(row["step_ms_trimmed_mean_10pct"]) for row in summary_rows]),
+            ("winsor10", [float(row["step_ms_winsor_mean_10pct"]) for row in summary_rows]),
+            ("p50", [float(row["step_ms_p50"]) for row in summary_rows]),
+        ],
+        "ms",
+    )
+    p_outliers = base.save_grouped_bar(
+        plots_dir / "latency_outlier_counts.png",
+        "Latency Outlier Counts by Mode",
+        [row["mode"] for row in summary_rows],
+        [
+            (">2x_p50", [float(row["step_ms_outlier_count_2x_p50"]) for row in summary_rows]),
+            ("MAD3", [float(row["step_ms_outlier_count_mad3"]) for row in summary_rows]),
+        ],
+        "steps",
     )
     p_bw_summary = base.save_grouped_bar(
         plots_dir / "summary_throughput.png",
         "Throughput Summary by Mode",
         [row["mode"] for row in summary_rows],
-        [("avg", [float(row["collective_gbps_avg"]) for row in summary_rows]), ("p95", [float(row["collective_gbps_p95"]) for row in summary_rows])],
+        [
+            ("p10", [float(row["collective_gbps_p10"]) for row in summary_rows]),
+            ("p50", [float(row["collective_gbps_p50"]) for row in summary_rows]),
+            ("trim10", [float(row["collective_gbps_trimmed_mean_10pct"]) for row in summary_rows]),
+            ("avg", [float(row["collective_gbps_avg"]) for row in summary_rows]),
+        ],
         "Gbps",
     )
     p_window = save_window_trace_by_mode_plot(plots_dir / "step_window_trace.png", mode_data, f"{experiment_root.name} Step-Axis Window Trace")
@@ -631,10 +712,11 @@ def build_single_experiment_report(
         info_rows.append(["switch_log_override", switch_log_dir_override])
 
     summary_headers = [
-        "mode", "static_w_cfg", "workload", "collective", "algo", "payload_mb", "step_ms_avg", "step_ms_p95",
-        "collective_gbps_avg", "switch_pfc_total", "switch_pfc_peak_rate", "p99_occ_tr", "w_eff_values",
+        "mode", "static_w_cfg", "workload", "collective", "algo", "payload_mb", "step_ms_avg", "step_ms_p50",
+        "step_ms_trim10", "step_ms_p95", "step_ms_max", "outliers_2x_p50", "collective_gbps_avg", "gbps_p50",
+        "gbps_p10", "switch_pfc_total", "switch_pfc_peak_rate", "p99_occ_tr", "w_eff_values",
         "final_output_match_vs_stock", "final_output_match_workers",
-        "delta_step_vs_stock_pct", "delta_bw_vs_stock_pct", "delta_pfc_total_vs_stock_pct",
+        "delta_step_trim10_vs_stock_pct", "delta_step_p95_vs_stock_pct", "delta_bw_p50_vs_stock_pct", "delta_pfc_total_vs_stock_pct",
     ]
     summary_table = [
         [
@@ -645,16 +727,23 @@ def build_single_experiment_report(
             row["algo"],
             f'{row["payload_mb"]:.3f}',
             f'{row["step_ms_avg"]:.3f}',
+            f'{row["step_ms_p50"]:.3f}',
+            f'{row["step_ms_trimmed_mean_10pct"]:.3f}',
             f'{row["step_ms_p95"]:.3f}',
+            f'{row["step_ms_max"]:.3f}',
+            row["step_ms_outlier_count_2x_p50"],
             f'{row["collective_gbps_avg"]:.3f}',
+            f'{row["collective_gbps_p50"]:.3f}',
+            f'{row["collective_gbps_p10"]:.3f}',
             f'{row["switch_pfc_total"]:.3f}',
             f'{row["switch_pfc_peak_rate"]:.3f}',
             f'{row["p99_occ_tr"]:.3f}',
             row["w_eff_values"],
             row["final_output_match_vs_stock"],
             row["final_output_match_workers"],
-            f'{row["delta_step_vs_stock_pct"]:.2f}',
-            f'{row["delta_bw_vs_stock_pct"]:.2f}',
+            f'{row["delta_step_trim10_vs_stock_pct"]:.2f}',
+            f'{row["delta_step_p95_vs_stock_pct"]:.2f}',
+            f'{row["delta_bw_p50_vs_stock_pct"]:.2f}',
             f'{row["delta_pfc_total_vs_stock_pct"]:.2f}',
         ]
         for row in summary_rows
@@ -690,8 +779,10 @@ def build_single_experiment_report(
     for path, caption in [
         (p_step, "mode별 collective step latency timeline"),
         (p_bw, "mode별 collective throughput estimate"),
-        (p_step_summary, "mode별 absolute latency"),
-        (p_bw_summary, "mode별 absolute throughput"),
+        (p_step_summary, "mode별 robust latency"),
+        (p_step_robust, "mode별 average vs robust latency"),
+        (p_outliers, "mode별 latency outlier count"),
+        (p_bw_summary, "mode별 robust throughput"),
         (p_window, "mode별 step-axis window trace"),
         (p_pfc, "mode별 PFC total / peak"),
         (p_occ, "mode별 outstanding depth"),
@@ -790,21 +881,23 @@ def build_matrix_report(matrix_root: Path, output_dir: Path, top_events: int, sw
     plots_dir = output_dir / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
-    p_latency = save_stock_vs_b2_grouped_plot(plots_dir / "stock_vs_b2_latency.png", "STOCK vs B2 Latency", experiment_names, matrix_rows, "step_ms_avg", "step_ms_avg")
-    p_bw = save_stock_vs_b2_grouped_plot(plots_dir / "stock_vs_b2_throughput.png", "STOCK vs B2 Throughput", experiment_names, matrix_rows, "collective_gbps_avg", "collective_gbps_avg")
+    p_latency = save_stock_vs_b2_grouped_plot(plots_dir / "stock_vs_b2_latency.png", "STOCK vs B2 Trimmed Latency", experiment_names, matrix_rows, "step_ms_trimmed_mean_10pct", "trim10 step_ms")
+    p_latency_tail = save_stock_vs_b2_grouped_plot(plots_dir / "stock_vs_b2_latency_p95.png", "STOCK vs B2 P95 Latency", experiment_names, matrix_rows, "step_ms_p95", "p95 step_ms")
+    p_latency_outliers = save_stock_vs_b2_grouped_plot(plots_dir / "stock_vs_b2_latency_outliers.png", "STOCK vs B2 Latency Outliers", experiment_names, matrix_rows, "step_ms_outlier_count_2x_p50", "steps > 2x p50")
+    p_bw = save_stock_vs_b2_grouped_plot(plots_dir / "stock_vs_b2_throughput.png", "STOCK vs B2 P50 Throughput", experiment_names, matrix_rows, "collective_gbps_p50", "gbps p50")
     p_pfc = save_stock_vs_b2_grouped_plot(plots_dir / "stock_vs_b2_switch_pfc_counts.png", "STOCK vs B2 PFC Counts", experiment_names, matrix_rows, "switch_pfc_total", "switch_pfc_total")
     p_trace = save_matrix_step_window_trace_plot(plots_dir / "stock_vs_b2_step_window_trace.png", experiment_payloads)
 
-    p_b2_latency = save_b2_only_heatmap(plots_dir / "b2_matrix_latency.png", "B2 Matrix Latency", matrix_rows, "step_ms_avg", "step_ms_avg")
-    p_b2_bw = save_b2_only_heatmap(plots_dir / "b2_matrix_throughput.png", "B2 Matrix Throughput", matrix_rows, "collective_gbps_avg", "collective_gbps_avg")
+    p_b2_latency = save_b2_only_heatmap(plots_dir / "b2_matrix_latency.png", "B2 Matrix Trimmed Latency", matrix_rows, "step_ms_trimmed_mean_10pct", "trim10 step_ms")
+    p_b2_bw = save_b2_only_heatmap(plots_dir / "b2_matrix_throughput.png", "B2 Matrix P50 Throughput", matrix_rows, "collective_gbps_p50", "gbps p50")
     p_b2_pfc_count = save_b2_only_heatmap(plots_dir / "b2_matrix_pfc_count.png", "B2 Matrix PFC Count", matrix_rows, "switch_pfc_total", "switch_pfc_total")
     p_b2_pfc_peak = save_b2_only_heatmap(plots_dir / "b2_matrix_pfc_severity.png", "B2 Matrix PFC Severity", matrix_rows, "switch_pfc_peak_rate", "switch_pfc_peak_rate")
 
     summary_headers = [
-        "experiment", "mode", "static_w_cfg", "workload", "step_ms_avg", "collective_gbps_avg",
+        "experiment", "mode", "static_w_cfg", "workload", "step_ms_avg", "step_ms_p50", "step_ms_trim10", "step_ms_p95", "outliers_2x_p50", "collective_gbps_avg", "gbps_p50", "gbps_p10",
         "switch_pfc_total", "switch_pfc_peak_rate", "p99_occ_tr", "w_eff_values",
         "final_output_match_vs_stock", "final_output_match_workers",
-        "delta_step_vs_stock_pct", "delta_bw_vs_stock_pct", "delta_pfc_total_vs_stock_pct", "report",
+        "delta_step_trim10_vs_stock_pct", "delta_step_p95_vs_stock_pct", "delta_bw_p50_vs_stock_pct", "delta_pfc_total_vs_stock_pct", "report",
     ]
     summary_rows_html = []
     for row in matrix_rows:
@@ -815,15 +908,22 @@ def build_matrix_report(matrix_root: Path, output_dir: Path, top_events: int, sw
             str(row["static_w_cfg"]),
             html.escape(str(row["workload"])),
             f'{row["step_ms_avg"]:.3f}',
+            f'{row["step_ms_p50"]:.3f}',
+            f'{row["step_ms_trimmed_mean_10pct"]:.3f}',
+            f'{row["step_ms_p95"]:.3f}',
+            str(row["step_ms_outlier_count_2x_p50"]),
             f'{row["collective_gbps_avg"]:.3f}',
+            f'{row["collective_gbps_p50"]:.3f}',
+            f'{row["collective_gbps_p10"]:.3f}',
             f'{row["switch_pfc_total"]:.3f}',
             f'{row["switch_pfc_peak_rate"]:.3f}',
             f'{row["p99_occ_tr"]:.3f}',
             html.escape(str(row["w_eff_values"])),
             html.escape(str(row["final_output_match_vs_stock"])),
             html.escape(str(row["final_output_match_workers"])),
-            f'{row["delta_step_vs_stock_pct"]:.2f}',
-            f'{row["delta_bw_vs_stock_pct"]:.2f}',
+            f'{row["delta_step_trim10_vs_stock_pct"]:.2f}',
+            f'{row["delta_step_p95_vs_stock_pct"]:.2f}',
+            f'{row["delta_bw_p50_vs_stock_pct"]:.2f}',
             f'{row["delta_pfc_total_vs_stock_pct"]:.2f}',
             f'<a href="{html.escape(link)}">open</a>',
         ])
@@ -837,8 +937,10 @@ def build_matrix_report(matrix_root: Path, output_dir: Path, top_events: int, sw
 
     figure_fragments = []
     for path, caption in [
-        (p_latency, "stock vs B2 latency"),
-        (p_bw, "stock vs B2 throughput"),
+        (p_latency, "stock vs B2 trimmed latency"),
+        (p_latency_tail, "stock vs B2 p95 latency"),
+        (p_latency_outliers, "stock vs B2 latency outlier count"),
+        (p_bw, "stock vs B2 p50 throughput"),
         (p_pfc, "stock vs B2 PFC count"),
         (p_trace, "stock vs B2 step-axis W trace"),
         (p_b2_latency, "B2 latency heatmap"),
