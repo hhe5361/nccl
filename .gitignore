@@ -2,3 +2,8 @@
 /build
 *.gcov
 /coverage/
+*.html
+*.pdf
+*.xml
+research/docs/
+research/venv/

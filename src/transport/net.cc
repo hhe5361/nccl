@@ -634,6 +634,13 @@ static ncclResult_t recvFree(struct ncclComm* comm, struct ncclConnector* recv) 
 }
 
 #define NCCL_SHARED_STEPS 16
+
+NCCL_PARAM(Phase1InflightW, "PHASE1_INFLIGHT_W", 0);
+
+static inline int phase1InflightW() {
+  int w = ncclParamPhase1InflightW();
+  return w > 0 ? std::min(NCCL_STEPS, std::max(1, w)) : 0;
+}
 static ncclResult_t sharedNetBuffersInit(struct ncclProxyState* proxyState, int cuda, int tpLocalRank, int type, int sameProcess,
     int nChannels, char** gpuPtr, char** cpuPtr, int* size, ncclIpcDesc *ipcDesc) {
   if (cuda == 0 && sameProcess == 0) {
@@ -1448,7 +1455,10 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
         struct ncclProxySubArgs* sub = subGroup + i;
         int postedStepId = sub->posted;
         if (sub->posted < sub->nsteps) {
-          if (sub->posted >= sub->done + maxDepth) { subCount = 0; break; }
+          int inflightW = phase1InflightW();
+          bool stallByDone = sub->posted >= sub->done + maxDepth;
+          bool stallByReceived = inflightW > 0 && ((int)(sub->posted - sub->received) >= inflightW);
+          if (stallByDone || stallByReceived) { subCount = 0; break; }
           ncclProfilerStartRecvProxyStepEvent(s+i, args, postedStepId);
           struct recvNetResources* resources = (struct recvNetResources*) (sub->connection->transportResources);
           int stepSize = resources->buffSizes[p] / NCCL_STEPS;
