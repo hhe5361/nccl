@@ -214,9 +214,10 @@ ensure_container_ready_all() {
   [[ "${CONTAINER_CLEAN_START}" == "1" ]] && reset_flag="--reset"
   deploy_log "INFO" "Ensuring persistent containers across workers reset=${CONTAINER_CLEAN_START}"
   for worker in "${WORKERS[@]}"; do
-    local host_ip
+    local host_ip remote_repo_root
     host_ip="$(deploy_lookup_worker_ip "${TOPOLOGY_FILE}" "${worker}")" || deploy_die "Cannot resolve IP for ${worker}"
-    local remote_cmd="cd '${REMOTE_REPO_ROOT}' && CONTAINER_NAME='${CONTAINER_NAME}' bash research/code/deploy/run_dev_container.sh ${reset_flag} --start-only"
+    remote_repo_root="$(deploy_worker_repo_root "${worker}" "${REMOTE_REPO_ROOT}")"
+    local remote_cmd="cd '${remote_repo_root}' && CONTAINER_NAME='${CONTAINER_NAME}' bash research/code/deploy/run_dev_container.sh ${reset_flag} --start-only"
     if [[ "${worker}" == "${MASTER_WORKER}" ]]; then
       bash -lc "${remote_cmd}"
     else
@@ -265,11 +266,12 @@ launch_worker_once() {
   local run_output_dir="$7"
   local status_dir="$8"
 
-  local host_ip status_file worker_output_dir runner_cmd runner_cmd_b64 remote_cmd
+  local host_ip status_file worker_output_dir runner_cmd runner_cmd_b64 remote_cmd remote_repo_root
   host_ip="$(deploy_lookup_worker_ip "${TOPOLOGY_FILE}" "${worker}")" || deploy_die "Cannot resolve IP for ${worker}"
   status_file="${status_dir}/${worker}.status"
   worker_output_dir="${run_output_dir}/${worker}"
   ensure_local_dir "${worker_output_dir}"
+  remote_repo_root="$(deploy_worker_repo_root "${worker}" "${REMOTE_REPO_ROOT}")"
 
   runner_cmd="$(deploy_replace_tokens "${RUNNER_TEMPLATE}" \
     WORKER "${worker}" \
@@ -285,7 +287,7 @@ launch_worker_once() {
     WORKER_OUTPUT_DIR "${worker_output_dir}")"
   runner_cmd_b64="$(deploy_encode_b64 "${runner_cmd}")"
 
-  remote_cmd="cd '${REMOTE_REPO_ROOT}' && bash research/code/deploy/run_dev_worker_once.sh \
+  remote_cmd="cd '${remote_repo_root}' && bash research/code/deploy/run_dev_worker_once.sh \
     --status-file '${status_file}' \
     --worker '${worker}' \
     --experiment '${experiment}' \

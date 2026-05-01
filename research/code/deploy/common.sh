@@ -50,6 +50,16 @@ deploy_worker_port() {
   deploy_parse_map_value "${WORKER_SSH_PORT_MAP:-}" "${worker}" "${default_port}"
 }
 
+deploy_worker_repo_root() {
+  local worker="$1"
+  local template="$2"
+  local worker_user
+  worker_user="$(deploy_worker_user "${worker}")"
+  template="${template//\{WORKER\}/${worker}}"
+  template="${template//\{WORKER_USER\}/${worker_user}}"
+  printf '%s' "${template}"
+}
+
 deploy_lookup_worker_ip() {
   local topology_file="$1"
   local worker="$2"
