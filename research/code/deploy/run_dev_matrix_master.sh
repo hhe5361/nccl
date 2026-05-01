@@ -218,10 +218,15 @@ ensure_container_ready_all() {
     host_ip="$(deploy_lookup_worker_ip "${TOPOLOGY_FILE}" "${worker}")" || deploy_die "Cannot resolve IP for ${worker}"
     remote_repo_root="$(deploy_worker_repo_root "${worker}" "${REMOTE_REPO_ROOT}")"
     local remote_cmd="cd '${remote_repo_root}' && CONTAINER_NAME='${CONTAINER_NAME}' bash research/code/deploy/run_dev_container.sh ${reset_flag} --start-only"
+    deploy_log "INFO" "container-prepare worker=${worker} host_ip=${host_ip} repo_root=${remote_repo_root}"
     if [[ "${worker}" == "${MASTER_WORKER}" ]]; then
-      bash -lc "${remote_cmd}"
+      if ! bash -lc "${remote_cmd}"; then
+        deploy_die "container-prepare failed worker=${worker} host_ip=${host_ip} repo_root=${remote_repo_root}"
+      fi
     else
-      deploy_ssh_cmd "${worker}" "${host_ip}" "${remote_cmd}"
+      if ! deploy_ssh_cmd "${worker}" "${host_ip}" "${remote_cmd}"; then
+        deploy_die "container-prepare failed worker=${worker} host_ip=${host_ip} repo_root=${remote_repo_root}"
+      fi
     fi
   done
 }
@@ -266,12 +271,13 @@ launch_worker_once() {
   local run_output_dir="$7"
   local status_dir="$8"
 
-  local host_ip status_file worker_output_dir runner_cmd runner_cmd_b64 remote_cmd remote_repo_root
+  local host_ip status_file worker_output_dir runner_cmd runner_cmd_b64 remote_cmd remote_repo_root worker_log_file
   host_ip="$(deploy_lookup_worker_ip "${TOPOLOGY_FILE}" "${worker}")" || deploy_die "Cannot resolve IP for ${worker}"
   status_file="${status_dir}/${worker}.status"
   worker_output_dir="${run_output_dir}/${worker}"
   ensure_local_dir "${worker_output_dir}"
   remote_repo_root="$(deploy_worker_repo_root "${worker}" "${REMOTE_REPO_ROOT}")"
+  worker_log_file="${worker_output_dir}/worker_launcher.log"
 
   runner_cmd="$(deploy_replace_tokens "${RUNNER_TEMPLATE}" \
     WORKER "${worker}" \
@@ -298,10 +304,11 @@ launch_worker_once() {
     --use-container '${USE_CONTAINER}' \
     --container-name '${CONTAINER_NAME}'"
 
+  deploy_log "INFO" "launch worker=${worker} host_ip=${host_ip} repo_root=${remote_repo_root} log_file=${worker_log_file}"
   if [[ "${worker}" == "${MASTER_WORKER}" ]]; then
-    bash -lc "${remote_cmd}" &
+    bash -lc "${remote_cmd}" >"${worker_log_file}" 2>&1 &
   else
-    deploy_ssh_cmd "${worker}" "${host_ip}" "${remote_cmd}" >/dev/null 2>&1 &
+    deploy_ssh_cmd "${worker}" "${host_ip}" "${remote_cmd}" >"${worker_log_file}" 2>&1 &
   fi
 }
 
