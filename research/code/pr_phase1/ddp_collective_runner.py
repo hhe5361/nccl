@@ -63,6 +63,19 @@ def verify_alltoall(tensor: torch.Tensor, rank: int, world_size: int) -> dict:
     return {"ok": max_abs == 0.0, "max_abs_err": max_abs}
 
 
+def build_probe(tensor: torch.Tensor) -> dict:
+    sample_len = min(8, tensor.numel())
+    flat = tensor.reshape(-1)
+    sample = flat[:sample_len].detach().cpu().tolist()
+    return {
+        "sum": float(tensor.sum().item()),
+        "mean": float(tensor.mean().item()),
+        "min": float(tensor.min().item()),
+        "max": float(tensor.max().item()),
+        "sample": [float(v) for v in sample],
+    }
+
+
 def run_step(collective: str, rank: int, world_size: int, numel: int, device: torch.device):
     if collective == "allreduce":
         tensor = make_allreduce_tensor(numel, rank, device)
@@ -118,6 +131,7 @@ def main():
             else:
                 verify = verify_alltoall(tensor, rank, world_size)
             verification.append(verify["ok"])
+            probe = build_probe(tensor)
 
             record = {
                 "rank": rank,
@@ -134,6 +148,7 @@ def main():
                 "numel": numel,
                 "verification_ok": verify["ok"],
                 "verification_detail": verify,
+                "probe": probe,
             }
             trace_fp.write(json.dumps(record) + "\n")
             step_records.append(record)

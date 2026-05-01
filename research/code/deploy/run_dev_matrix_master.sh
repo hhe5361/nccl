@@ -38,6 +38,8 @@ SWITCH_PID_FILE=""
 SWITCH_MARKERS_JSONL=""
 SWITCH_STARTED=0
 SWITCH_STOPPED=0
+TOTAL_RUNS=0
+CURRENT_RUN_INDEX=0
 
 usage() {
   cat <<'EOF'
@@ -107,6 +109,7 @@ IFS=',' read -r -a WORKERS <<< "${WORKERS_CSV}"
 IFS=',' read -r -a MODES <<< "${MODES_CSV}"
 IFS=',' read -r -a EXPERIMENTS <<< "${EXPERIMENTS_CSV}"
 WORLD_SIZE="${#WORKERS[@]}"
+TOTAL_RUNS=$(( ${#EXPERIMENTS[@]} * ${#MODES[@]} * REPEATS ))
 
 master_addr="$(deploy_lookup_worker_ip "${TOPOLOGY_FILE}" "${MASTER_WORKER}")" || deploy_die "Cannot resolve master worker IP for ${MASTER_WORKER}"
 
@@ -302,41 +305,52 @@ launch_worker_once() {
 
 wait_for_status_barrier() {
   local status_dir="$1"
-  local experiment="$2"
-  local mode="$3"
-  local repeat="$4"
+  local run_id="$2"
+  local experiment="$3"
+  local mode="$4"
+  local repeat="$5"
   local start_ts now_ts elapsed
   start_ts="$(date +%s)"
 
   while true; do
     local all_done=1
+    local done_count=0
+    local pending_count=0
+    local status_parts=()
     for worker in "${WORKERS[@]}"; do
       local status_file="${status_dir}/${worker}.status"
       if [[ ! -f "${status_file}" ]]; then
         all_done=0
+        pending_count=$(( pending_count + 1 ))
+        status_parts+=("${worker}:missing")
         continue
       fi
       local state stage
       state="$(deploy_read_status_field "${status_file}" state)"
       stage="$(deploy_read_status_field "${status_file}" stage)"
       if [[ "${state}" == "-1" ]]; then
-        deploy_log "ERROR" "experiment=${experiment} mode=${mode} repeat=${repeat} worker=${worker} failed stage=${stage}"
+        deploy_log "ERROR" "run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} worker=${worker} failed stage=${stage}"
         return 1
       fi
-      if [[ "${state}" != "0" ]]; then
+      if [[ "${state}" == "0" ]]; then
+        done_count=$(( done_count + 1 ))
+      else
         all_done=0
+        pending_count=$(( pending_count + 1 ))
       fi
+      status_parts+=("${worker}:${state}/${stage}")
     done
 
     if [[ "${all_done}" == "1" ]]; then
-      deploy_log "INFO" "experiment=${experiment} mode=${mode} repeat=${repeat} all workers reached STATUS_DDP=0"
+      deploy_log "INFO" "run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} all workers reached STATUS_DDP=0"
       return 0
     fi
 
     now_ts="$(date +%s)"
     elapsed=$(( now_ts - start_ts ))
+    deploy_log "INFO" "waiting run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} done=${done_count}/${WORLD_SIZE} pending=${pending_count} states=$(IFS=,; echo "${status_parts[*]}")"
     if (( elapsed > TIMEOUT_SEC )); then
-      deploy_log "ERROR" "experiment=${experiment} mode=${mode} repeat=${repeat} timeout after ${TIMEOUT_SEC}s"
+      deploy_log "ERROR" "run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} timeout after ${TIMEOUT_SEC}s"
       return 1
     fi
 
@@ -394,13 +408,14 @@ run_one() {
   local run_id="${RUN_ID}"
   local run_output_dir="${OUTPUT_ROOT}/${RUN_ID}/${mode}/${experiment}/repeat_$(printf '%02d' "${repeat}")"
   local status_dir="${STATUS_ROOT}/${RUN_ID}/${mode}/${experiment}/repeat_$(printf '%02d' "${repeat}")"
+  CURRENT_RUN_INDEX=$(( CURRENT_RUN_INDEX + 1 ))
 
   ensure_local_dir "${run_output_dir}"
   ensure_local_dir "${status_dir}"
   find "${status_dir}" -type f -name '*.status' -delete 2>/dev/null || true
   switch_logger_write_run_meta "$(run_level_meta_file "${run_output_dir}")"
 
-  deploy_log "INFO" "start run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} master=${MASTER_WORKER} world_size=${WORLD_SIZE} port=${MASTER_PORT}"
+  deploy_log "INFO" "progress=${CURRENT_RUN_INDEX}/${TOTAL_RUNS} start run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} master=${MASTER_WORKER} world_size=${WORLD_SIZE} port=${MASTER_PORT} output_dir=${run_output_dir}"
   switch_logger_marker "mode_start" "run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} output_dir=${run_output_dir}"
   run_hook_if_set "${SWITCH_START_TEMPLATE}" "${run_id}" "${experiment}" "${mode}" "${repeat}" "${run_output_dir}"
 
@@ -412,7 +427,7 @@ run_one() {
     rank=$(( rank + 1 ))
   done
 
-  if ! wait_for_status_barrier "${status_dir}" "${experiment}" "${mode}" "${repeat}"; then
+  if ! wait_for_status_barrier "${status_dir}" "${run_id}" "${experiment}" "${mode}" "${repeat}"; then
     switch_logger_marker "ddp_end" "run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} failed barrier"
     switch_logger_marker "mode_end" "run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} failed"
     run_hook_if_set "${SWITCH_STOP_TEMPLATE}" "${run_id}" "${experiment}" "${mode}" "${repeat}" "${run_output_dir}" || true

@@ -54,6 +54,7 @@ done
 [[ -n "${OUTPUT_ROOT}" ]] || { echo "--output-root is required" >&2; exit 1; }
 
 mode_labels=()
+mode_labels+=("STOCK")
 for whole in 1 2 3 4 5 6 7 8; do
   mode_labels+=("W${whole}_0")
   if [[ "${whole}" != "8" ]]; then
@@ -94,6 +95,14 @@ master_args=(
 if [[ -n "${SWITCH_LOGGER_DIR}" ]]; then
   master_args+=(--switch-logger-dir "${SWITCH_LOGGER_DIR}")
 fi
+
+validation_template="python3 research/code/pr_phase1/validate_against_stock.py \
+  --run-root '${OUTPUT_ROOT}/{RUN_ID}' \
+  --mode '{MODE}' \
+  --experiment '{EXPERIMENT}' \
+  --repeat-index {REPEAT}"
+
+master_args+=(--validation-template "${validation_template}")
 
 env \
   SWITCH_ENABLE="${SWITCH_ENABLE}" \
