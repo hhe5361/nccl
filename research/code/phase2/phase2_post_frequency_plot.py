@@ -3,6 +3,7 @@ import argparse
 import importlib.util
 import json
 import math
+import re
 import shutil
 import subprocess
 from collections import defaultdict
@@ -108,6 +109,13 @@ def load_mode_summary(mode_dir: Path) -> dict:
     if not summary_files:
         raise FileNotFoundError(f"no *_summary.json found in {mode_dir}")
     return base.load_json(summary_files[0])
+
+
+def first_existing(mapping: dict, keys: Sequence[str]):
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return None
 
 
 def load_worker_step_rows(mode_dir: Path, include_warmup: bool) -> Dict[str, List[dict]]:
@@ -361,6 +369,68 @@ def load_step_metric_rows(mode_dir: Path) -> List[dict]:
     return rows
 
 
+def detect_slice_steps(mode_dir: Path, summary: dict, step_rows: Sequence[dict]) -> Optional[object]:
+    direct = first_existing(
+        summary,
+        (
+            "sliceSteps",
+            "slice_steps",
+            "slice_step",
+            "slice_steps_by_channel",
+            "sliceStepsByChannel",
+        ),
+    )
+    if direct is not None:
+        return direct
+    for row in step_rows:
+        direct = first_existing(
+            row,
+            (
+                "sliceSteps",
+                "slice_steps",
+                "slice_step",
+                "slice_steps_by_channel",
+                "sliceStepsByChannel",
+            ),
+        )
+        if direct is not None:
+            return direct
+
+    rg_path = shutil.which("rg")
+    pattern = re.compile(r"sliceSteps(?:=|:|\s+)(\d+)")
+    log_paths = sorted(mode_dir.glob("*/nccl.*.log"))
+    for log_path in log_paths:
+        if rg_path:
+            proc = subprocess.Popen(
+                [rg_path, "--text", "-m", "1", "sliceSteps", str(log_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            assert proc.stdout is not None
+            try:
+                line = proc.stdout.readline()
+            finally:
+                proc.stdout.close()
+                proc.wait()
+            if line:
+                matched = pattern.search(line)
+                if matched:
+                    return int(matched.group(1))
+        else:
+            with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+                for raw_line in handle:
+                    if "sliceSteps" not in raw_line:
+                        continue
+                    matched = pattern.search(raw_line)
+                    if matched:
+                        return int(matched.group(1))
+                    break
+    return None
+
+
 def save_mode_step_latency_bar_plot(
     path: Path,
     experiment_name: str,
@@ -418,7 +488,10 @@ def save_step_latency_by_w_grouped_bar_plot(
     path: Path,
     experiment_name: str,
     mode_dirs: Sequence[Path],
-    y_max: float,
+    metric_key: str,
+    metric_label: str,
+    title_suffix: str,
+    y_max: Optional[float],
 ) -> Optional[Path]:
     series: List[Tuple[str, Dict[int, float]]] = []
     all_steps = set()
@@ -429,7 +502,10 @@ def save_step_latency_by_w_grouped_bar_plot(
         step_map: Dict[int, float] = {}
         for idx, row in enumerate(rows):
             step = int(row.get("step", idx))
-            value = float(row.get("step_ms_max", 0.0))
+            raw_value = row.get(metric_key, None)
+            if raw_value is None:
+                continue
+            value = float(raw_value)
             step_map[step] = value
             all_steps.add(step)
         if step_map:
@@ -449,11 +525,12 @@ def save_step_latency_by_w_grouped_bar_plot(
         ys = [float(step_map.get(step, 0.0)) for step in steps]
         base.plt.bar(xs, ys, width=bar_w * 0.95, label=mode_name)
 
-    base.plt.title(f"{experiment_name} Step Latency by W (0-{int(y_max)} ms)")
+    base.plt.title(f"{experiment_name} {title_suffix}")
     base.plt.xlabel("collective step")
-    base.plt.ylabel("step_ms_max")
+    base.plt.ylabel(metric_label)
     base.plt.xticks(centers, [str(step) for step in steps])
-    base.plt.ylim(0, y_max)
+    if y_max is not None:
+        base.plt.ylim(0, y_max)
     base.plt.grid(True, axis="y", alpha=0.25)
     base.plt.legend(ncol=2)
     base.plt.tight_layout()
@@ -461,6 +538,31 @@ def save_step_latency_by_w_grouped_bar_plot(
     base.plt.savefig(path, dpi=180)
     base.plt.close()
     return path
+
+
+def save_step_throughput_selected_modes_bar_plot(
+    path: Path,
+    experiment_name: str,
+    mode_dirs: Sequence[Path],
+    selected_modes: Sequence[str],
+) -> Optional[Path]:
+    selected_upper = {mode.upper() for mode in selected_modes}
+    filtered_mode_dirs = [
+        mode_dir
+        for mode_dir in sorted(mode_dirs, key=lambda item: mode_sort_key(item.name))
+        if mode_dir.name.upper() in selected_upper
+    ]
+    if not filtered_mode_dirs:
+        return None
+    return save_step_latency_by_w_grouped_bar_plot(
+        path,
+        experiment_name,
+        filtered_mode_dirs,
+        "collective_gbps_est",
+        "collective_gbps_est",
+        "Step Throughput by W (STOCK, W2, W8)",
+        None,
+    )
 
 
 def iter_relevant_recv_lines(log_path: Path):
@@ -586,49 +688,8 @@ def process_mode(
     generated = 0
     observed_w = observed_w_label(observed_w_values)
     for step in sampled_steps:
-        worker_series = histograms.get(step, {})
-        if not worker_series:
+        if not histograms.get(step, {}):
             continue
-        for info in worker_series.values():
-            info["bin_width_ns"] = bin_width_ns
-        filename = (
-            f"cts_post_frequency_{sanitize_label(mode_dir.name)}"
-            f"_step_{step}"
-            f"_cfgW_{sanitize_label(configured_w)}"
-            f"_obsW_{sanitize_label(observed_w)}.png"
-        )
-        title = (
-            f"{experiment_name} {mode_dir.name} step={step} CTS/POST Frequency "
-            f"(cfgW={configured_w}, observedW={observed_w}, bin={bin_ms:g}ms)"
-        )
-        base.log_progress(f"save plot mode={mode_dir.name} step={step}")
-        saved = save_step_post_frequency_plot(
-            output_dir / filename,
-            title,
-            bin_ms,
-            worker_series,
-        )
-        if saved is not None:
-            generated += 1
-            base.log_progress(f"wrote plot mode={mode_dir.name} step={step} path={saved.as_posix()}")
-        stream_post_path = output_dir / (
-            f"cts_post_frequency_by_stream_{sanitize_label(mode_dir.name)}"
-            f"_step_{step}_cfgW_{sanitize_label(configured_w)}"
-            f"_obsW_{sanitize_label(observed_w)}.png"
-        )
-        stream_post_title = (
-            f"{experiment_name} {mode_dir.name} step={step} Stream CTS/POST Frequency "
-            f"(cfgW={configured_w}, observedW={observed_w}, bin={bin_ms:g}ms)"
-        )
-        saved_stream = save_step_stream_post_frequency_plot(
-            stream_post_path,
-            stream_post_title,
-            bin_ms,
-            stream_histograms.get(step, {}),
-        )
-        if saved_stream is not None:
-            generated += 1
-            base.log_progress(f"wrote stream plot mode={mode_dir.name} step={step} path={saved_stream.as_posix()}")
         outstanding_path = output_dir / (
             f"recv_outstanding_trace_by_stream_{sanitize_label(mode_dir.name)}"
             f"_step_{step}_cfgW_{sanitize_label(configured_w)}"
@@ -676,6 +737,7 @@ def main() -> None:
     for mode_dir in mode_dirs:
         summary = load_mode_summary(mode_dir)
         mode_step_rows = load_step_metric_rows(mode_dir)
+        slice_steps = detect_slice_steps(mode_dir, summary, mode_step_rows)
         generated, total_counts_by_worker, observed_w = process_mode(
             mode_dir,
             summary,
@@ -698,6 +760,8 @@ def main() -> None:
                 "post_count_by_worker": total_counts_by_worker,
             }
         )
+        if slice_steps is not None:
+            summary_rows[-1]["slice_steps"] = slice_steps
         mode_latency_plot = save_mode_step_latency_bar_plot(
             output_dir / f"step_latency_bar_{sanitize_label(mode_dir.name)}.png",
             experiment_root.name,
@@ -728,19 +792,73 @@ def main() -> None:
         output_dir / "step_latency_by_w_bar_y500.png",
         experiment_root.name,
         mode_dirs,
+        "step_ms_max",
+        "step_ms_max",
+        "Step Latency by W (0-500 ms)",
         500.0,
     )
     if latency_bar_plot_500 is not None:
         base.log_progress(f"wrote latency bar plot path={latency_bar_plot_500.as_posix()}")
 
+    latency_bar_plot_300 = save_step_latency_by_w_grouped_bar_plot(
+        output_dir / "step_latency_by_w_bar_y300.png",
+        experiment_root.name,
+        mode_dirs,
+        "step_ms_max",
+        "step_ms_max",
+        "Step Latency by W (0-300 ms)",
+        300.0,
+    )
+    if latency_bar_plot_300 is not None:
+        base.log_progress(f"wrote latency bar plot path={latency_bar_plot_300.as_posix()}")
+
     latency_bar_plot_700 = save_step_latency_by_w_grouped_bar_plot(
         output_dir / "step_latency_by_w_bar_y700.png",
         experiment_root.name,
         mode_dirs,
+        "step_ms_max",
+        "step_ms_max",
+        "Step Latency by W (0-700 ms)",
         700.0,
     )
     if latency_bar_plot_700 is not None:
         base.log_progress(f"wrote latency bar plot path={latency_bar_plot_700.as_posix()}")
+
+    throughput_bar_plot = save_step_latency_by_w_grouped_bar_plot(
+        output_dir / "step_throughput_by_w_bar.png",
+        experiment_root.name,
+        mode_dirs,
+        "collective_gbps_est",
+        "collective_gbps_est",
+        "Step Throughput by W",
+        None,
+    )
+    if throughput_bar_plot is not None:
+        base.log_progress(f"wrote throughput bar plot path={throughput_bar_plot.as_posix()}")
+
+    throughput_selected_plot = save_step_throughput_selected_modes_bar_plot(
+        output_dir / "step_throughput_by_w_bar_stock_w2_w8.png",
+        experiment_root.name,
+        mode_dirs,
+        ("STOCK", "B2_W2", "B2_W8"),
+    )
+    if throughput_selected_plot is not None:
+        base.log_progress(f"wrote throughput bar plot path={throughput_selected_plot.as_posix()}")
+
+    summary_json_path = output_dir / "post_frequency_summary.json"
+    with summary_json_path.open("w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "experiment": experiment_root.name,
+                "sampled_steps": sampled_steps,
+                "bin_ms": args.bin_ms,
+                "modes": summary_rows,
+            },
+            handle,
+            ensure_ascii=False,
+            indent=2,
+        )
+    base.log_progress(f"wrote summary json path={summary_json_path.as_posix()}")
 
     base.log_progress(
         f"phase2 post-frequency complete experiment={experiment_root.name} generated={generated_total} skipped={len(skipped)}"
