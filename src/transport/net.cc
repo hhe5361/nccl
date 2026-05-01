@@ -18,6 +18,8 @@
 #include "shm.h"
 #include "compiler.h"
 #include <assert.h>
+#include <cmath>
+#include <cstdlib>
 #include "register_inline.h"
 
 static_assert(sizeof(ncclNetHandle_t) <= CONNECT_SIZE, "NET Connect info is too large");
@@ -635,11 +637,85 @@ static ncclResult_t recvFree(struct ncclComm* comm, struct ncclConnector* recv) 
 
 #define NCCL_SHARED_STEPS 16
 
-NCCL_PARAM(Phase1InflightW, "PHASE1_INFLIGHT_W", 0);
+static double phase1ParseDoubleEnv(const char* primary, const char* fallback) {
+  const char* value = getenv(primary);
+  if ((value == nullptr || value[0] == '\0') && fallback) value = getenv(fallback);
+  if (value == nullptr || value[0] == '\0') return 0.0;
+  char* endPtr = nullptr;
+  double parsed = strtod(value, &endPtr);
+  if (endPtr == value) return 0.0;
+  return parsed;
+}
 
-static inline int phase1InflightW() {
-  int w = ncclParamPhase1InflightW();
-  return w > 0 ? std::min(NCCL_STEPS, std::max(1, w)) : 0;
+static int phase1ParseIntEnv(const char* primary, const char* fallback, int defaultValue) {
+  const char* value = getenv(primary);
+  if ((value == nullptr || value[0] == '\0') && fallback) value = getenv(fallback);
+  if (value == nullptr || value[0] == '\0') return defaultValue;
+  char* endPtr = nullptr;
+  long parsed = strtol(value, &endPtr, 10);
+  if (endPtr == value) return defaultValue;
+  return (int)parsed;
+}
+
+static inline double phase1InflightWConfigured() {
+  static int initialized = 0;
+  static double configured = 0.0;
+  if (initialized == 0) {
+    configured = phase1ParseDoubleEnv("NCCL_PHASE1_INFLIGHT_W", "PHASE1_INFLIGHT_W");
+    initialized = 1;
+  }
+  return configured;
+}
+
+static inline int phase1InflightLogEnabled() {
+  static int initialized = 0;
+  static int enabled = 0;
+  if (initialized == 0) {
+    enabled = phase1ParseIntEnv("NCCL_PHASE1_INFLIGHT_LOG", "PHASE1_INFLIGHT_LOG", 0);
+    initialized = 1;
+  }
+  return enabled;
+}
+
+static inline int phase1InflightWarmupReceives(int maxDepth) {
+  int configured = phase1ParseIntEnv("NCCL_PHASE1_INFLIGHT_WARMUP_RECEIVES", "PHASE1_INFLIGHT_WARMUP_RECEIVES", maxDepth);
+  return std::max(0, configured);
+}
+
+static inline const char* phase1InflightPhase(const struct ncclProxySubArgs* sub, int maxDepth) {
+  return sub->received < (uint64_t)phase1InflightWarmupReceives(maxDepth) ? "warmup" : "steady";
+}
+
+static inline uint64_t phase1InflightHash(uint64_t value) {
+  value ^= value >> 33;
+  value *= 0xff51afd7ed558ccdULL;
+  value ^= value >> 33;
+  value *= 0xc4ceb9fe1a85ec53ULL;
+  value ^= value >> 33;
+  return value;
+}
+
+static inline bool phase1InflightProbAllow(const struct ncclProxySubArgs* sub, double fraction) {
+  if (fraction <= 0.0) return false;
+  if (fraction >= 1.0) return true;
+  uint64_t seed = sub->base ^ (sub->posted << 1) ^ (sub->received << 7) ^ (sub->done << 13) ^ ((uint64_t)sub->channelId << 17) ^ ((uint64_t)sub->peer << 29);
+  uint64_t hashed = phase1InflightHash(seed);
+  double sample = (double)(hashed >> 11) * (1.0 / 9007199254740992.0);
+  return sample < fraction;
+}
+
+static inline void phase1InflightLogEvent(struct ncclProxyState* proxyState, struct ncclProxyArgs* args, struct ncclProxySubArgs* sub,
+    const char* eventName, const char* phase, const char* stallReason, int slot, int maxDepth, double configuredW,
+    int inflightNow, int allowProbabilisticBoundary) {
+  if (phase1InflightLogEnabled() == 0) return;
+  INFO(NCCL_NET,
+      "PHASE1 event=%s phase=%s rank=%d peer=%d channel=%d slot=%d coll=%u algo=%u proto=%u "
+      "posted=%llu received=%llu transmitted=%llu done=%llu occPd=%d occPr=%d occTr=%d maxDepth=%d "
+      "wCfg=%.3f allowBoundary=%d stallReason=%s sliceSteps=%d chunkSteps=%d nsubs=%d",
+      eventName, phase, proxyState->tpRank, sub->peer, sub->channelId, slot, args->collAPI, args->algorithm, args->protocol,
+      (unsigned long long)sub->posted, (unsigned long long)sub->received, (unsigned long long)sub->transmitted, (unsigned long long)sub->done,
+      (int)(sub->posted - sub->done), inflightNow, (int)(sub->transmitted - sub->received), maxDepth, configuredW,
+      allowProbabilisticBoundary, stallReason ? stallReason : "-", args->sliceSteps, args->chunkSteps, args->nsubs);
 }
 static ncclResult_t sharedNetBuffersInit(struct ncclProxyState* proxyState, int cuda, int tpLocalRank, int type, int sameProcess,
     int nChannels, char** gpuPtr, char** cpuPtr, int* size, ncclIpcDesc *ipcDesc) {
@@ -1443,6 +1519,12 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
   if (args->state == ncclProxyOpProgress) {
     int p = args->protocol;
     int maxDepth = std::min(NCCL_STEPS, NCCL_SHARED_STEPS/args->nsubs);
+    double configuredInflightW = phase1InflightWConfigured();
+    if (configuredInflightW > 0.0 && configuredInflightW > (double)maxDepth + 1e-9) {
+      WARN("PHASE1 invalid inflight W %.3f exceeds baseline maxDepth %d (coll=%u algo=%u proto=%u nsubs=%d sliceSteps=%d). Aborting experiment.",
+          configuredInflightW, maxDepth, args->collAPI, args->algorithm, args->protocol, args->nsubs, args->sliceSteps);
+      return ncclInvalidUsage;
+    }
     for (int s=0; s<args->nsubs; s+=args->subs[s].groupSize) {
       struct ncclProxySubArgs* subGroup = args->subs+s;
       int subCount = 0;
@@ -1455,10 +1537,31 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
         struct ncclProxySubArgs* sub = subGroup + i;
         int postedStepId = sub->posted;
         if (sub->posted < sub->nsteps) {
-          int inflightW = phase1InflightW();
+          double inflightW = configuredInflightW > 0.0 ? std::max(1.0, configuredInflightW) : 0.0;
+          int inflightFloor = (int)std::floor(inflightW);
+          double inflightFraction = inflightW - inflightFloor;
+          int inflightNow = (int)(sub->posted - sub->received);
           bool stallByDone = sub->posted >= sub->done + maxDepth;
-          bool stallByReceived = inflightW > 0 && ((int)(sub->posted - sub->received) >= inflightW);
-          if (stallByDone || stallByReceived) { subCount = 0; break; }
+          bool allowBoundary = true;
+          bool stallByReceived = false;
+          if (inflightW > 0.0) {
+            if (inflightNow < inflightFloor) {
+              allowBoundary = true;
+            } else if (inflightNow > inflightFloor) {
+              allowBoundary = false;
+            } else if (inflightFraction <= 1e-9) {
+              allowBoundary = false;
+            } else {
+              allowBoundary = phase1InflightProbAllow(sub, inflightFraction);
+            }
+            stallByReceived = !allowBoundary && inflightNow >= inflightFloor;
+          }
+          if (stallByDone || stallByReceived) {
+            phase1InflightLogEvent(proxyState, args, sub, "PROXY_RECV_WSTALL", phase1InflightPhase(sub, maxDepth),
+                stallByDone ? "doneDepth" : "inflight", (sub->base + sub->posted) % NCCL_STEPS, maxDepth, inflightW, inflightNow, allowBoundary ? 1 : 0);
+            subCount = 0;
+            break;
+          }
           ncclProfilerStartRecvProxyStepEvent(s+i, args, postedStepId);
           struct recvNetResources* resources = (struct recvNetResources*) (sub->connection->transportResources);
           int stepSize = resources->buffSizes[p] / NCCL_STEPS;
@@ -1516,7 +1619,10 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
           for (int i=0; i<subGroup->groupSize; i++) {
             struct ncclProxySubArgs* sub = subGroup+i;
             int postedStepId = sub->posted;
+            int inflightNow = (int)(sub->posted - sub->received);
             TRACE(NCCL_NET, "recvProxy [%ld/%ld/%d] Irecv posted, buff %p, size %ld, myRank %d, channelId %d, mhandle %p", sub->posted, (sub->base + sub->posted) % NCCL_STEPS, sub->nsteps, ptrs[i], sizes[i], proxyState->tpRank, sub->channelId, mhandles[i]);
+            phase1InflightLogEvent(proxyState, args, sub, "PROXY_RECV_POST", phase1InflightPhase(sub, maxDepth),
+                NULL, (sub->base + sub->posted) % NCCL_STEPS, maxDepth, configuredInflightW, inflightNow, 1);
             sub->posted += args->sliceSteps;
             ncclProfilerRecordProxyStepEventState(s+i, args, postedStepId, ncclProfilerProxyStepRecvWait);
           }
@@ -1548,6 +1654,8 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             volatile struct ncclConnFifo* connFifo = (volatile struct ncclConnFifo*)resources->recvMem->connFifo;
             connFifo[buffSlot].size = -1;
             sub->transSize = sizes[i];
+            phase1InflightLogEvent(proxyState, args, sub, "PROXY_RECV_NET_DONE", phase1InflightPhase(sub, maxDepth),
+                NULL, buffSlot, maxDepth, configuredInflightW, (int)(sub->posted - sub->received), 1);
             sub->received += args->sliceSteps;
             ncclProfilerRecordProxyStepEventState(s+i, args, receivedStepId, ncclProfilerProxyStepRecvFlushWait);
             if (step < sub->nsteps) {
@@ -1610,6 +1718,8 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
           for (int i=0; i<subGroup->groupSize; i++) {
             struct ncclProxySubArgs* sub = subGroup + i;
             int transmittedStepId = sub->transmitted;
+            phase1InflightLogEvent(proxyState, args, sub, "PROXY_RECV_VISIBLE", phase1InflightPhase(sub, maxDepth),
+                NULL, (sub->base + transmittedStepId) % NCCL_STEPS, maxDepth, configuredInflightW, (int)(sub->posted - sub->received), 1);
 
             sub->transmitted += args->sliceSteps;
             ncclProfilerRecordProxyStepEventState(s+i, args, transmittedStepId, ncclProfilerProxyStepRecvGPUWait);
@@ -1646,6 +1756,8 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
               subGroup->recvRequestsCache[sub->done%NCCL_STEPS] = NULL;
             }
             int doneStepId = sub->done;
+            phase1InflightLogEvent(proxyState, args, sub, "PROXY_RECV_CONSUMED", phase1InflightPhase(sub, maxDepth),
+                NULL, (sub->base + sub->done) % NCCL_STEPS, maxDepth, configuredInflightW, (int)(sub->posted - sub->received), 1);
             sub->done += args->sliceSteps;
             ncclProfilerStopProxyStepEvent(s+i, args, doneStepId);
             args->idle = 0;
