@@ -14,6 +14,11 @@ VALIDATION_TEMPLATE="${VALIDATION_TEMPLATE:-}"
 SWITCH_START_TEMPLATE="${SWITCH_START_TEMPLATE:-}"
 SWITCH_STOP_TEMPLATE="${SWITCH_STOP_TEMPLATE:-}"
 PORT_CLEANUP_CHECK_TEMPLATE="${PORT_CLEANUP_CHECK_TEMPLATE:-}"
+SWITCH_ENABLE="${SWITCH_ENABLE:-0}"
+SWITCH_LOGGER_DIR="${SWITCH_LOGGER_DIR:-}"
+SWITCH_INTERVAL_SEC="${SWITCH_INTERVAL_SEC:-1}"
+NETWORK_NODE_PASSWORD="${NETWORK_NODE_PASSWORD:-}"
+SWITCH_PASSWORD="${SWITCH_PASSWORD:-}"
 WORKERS_CSV="${WORKERS_CSV:-worker01,worker02,worker03,worker04,worker05,worker06,worker07,worker08}"
 MASTER_WORKER="${MASTER_WORKER:-worker01}"
 MASTER_PORT="${MASTER_PORT:-29500}"
@@ -26,6 +31,13 @@ REPEATS="${REPEATS:-1}"
 MODES_CSV="${MODES_CSV:-STOCK}"
 EXPERIMENTS_CSV="${EXPERIMENTS_CSV:-allreduce_ring,allreduce_tree,alltoall}"
 WORLD_SIZE=0
+RUN_ID="${RUN_ID:-$(date +%m%d%H%M)}"
+SWITCH_RUN_ID=""
+SWITCH_LOG_DIR=""
+SWITCH_PID_FILE=""
+SWITCH_MARKERS_JSONL=""
+SWITCH_STARTED=0
+SWITCH_STOPPED=0
 
 usage() {
   cat <<'EOF'
@@ -46,14 +58,18 @@ Optional:
   --container-name NAME
   --remote-repo-root PATH
   --status-root PATH
+  --run-id ID
   --validation-template TEMPLATE
   --switch-start-template TEMPLATE
   --switch-stop-template TEMPLATE
   --port-cleanup-check-template TEMPLATE
+  --switch-enable 0|1
+  --switch-logger-dir PATH
+  --switch-interval-sec SEC
 
 Runner template placeholders:
   {WORKER} {WORKER_RANK} {WORLD_SIZE} {MASTER_ADDR} {MASTER_PORT}
-  {MODE} {EXPERIMENT} {REPEAT} {OUTPUT_DIR} {WORKER_OUTPUT_DIR}
+  {MODE} {EXPERIMENT} {REPEAT} {RUN_ID} {OUTPUT_DIR} {WORKER_OUTPUT_DIR}
 EOF
 }
 
@@ -70,10 +86,14 @@ while [[ $# -gt 0 ]]; do
     --container-name) CONTAINER_NAME="${2:-}"; shift 2 ;;
     --remote-repo-root) REMOTE_REPO_ROOT="${2:-}"; shift 2 ;;
     --status-root) STATUS_ROOT="${2:-}"; shift 2 ;;
+    --run-id) RUN_ID="${2:-}"; shift 2 ;;
     --validation-template) VALIDATION_TEMPLATE="${2:-}"; shift 2 ;;
     --switch-start-template) SWITCH_START_TEMPLATE="${2:-}"; shift 2 ;;
     --switch-stop-template) SWITCH_STOP_TEMPLATE="${2:-}"; shift 2 ;;
     --port-cleanup-check-template) PORT_CLEANUP_CHECK_TEMPLATE="${2:-}"; shift 2 ;;
+    --switch-enable) SWITCH_ENABLE="${2:-}"; shift 2 ;;
+    --switch-logger-dir) SWITCH_LOGGER_DIR="${2:-}"; shift 2 ;;
+    --switch-interval-sec) SWITCH_INTERVAL_SEC="${2:-}"; shift 2 ;;
     --help|-h) usage; exit 0 ;;
     *) deploy_die "Unknown argument: $1" ;;
   esac
@@ -93,6 +113,97 @@ master_addr="$(deploy_lookup_worker_ip "${TOPOLOGY_FILE}" "${MASTER_WORKER}")" |
 ensure_local_dir() {
   mkdir -p "$1"
 }
+
+switch_logger_enabled() {
+  [[ "${SWITCH_ENABLE}" == "1" ]]
+}
+
+switch_logger_meta_file() {
+  printf '%s' "${OUTPUT_ROOT}/${RUN_ID}/switch_logger_meta.env"
+}
+
+run_level_meta_file() {
+  local run_output_dir="$1"
+  printf '%s' "${run_output_dir}/switch_logger_meta.env"
+}
+
+switch_logger_write_run_meta() {
+  local output_file="$1"
+  [[ -n "${RUN_ID}" ]] || return 0
+  deploy_write_kv_file "${output_file}" \
+    RUN_ID "${RUN_ID}" \
+    SWITCH_RUN_ID "${SWITCH_RUN_ID}" \
+    SWITCH_LOG_DIR "${SWITCH_LOG_DIR}" \
+    PID_FILE "${SWITCH_PID_FILE}" \
+    MARKERS_JSONL "${SWITCH_MARKERS_JSONL}"
+}
+
+switch_logger_start() {
+  switch_logger_enabled || return 0
+  [[ -n "${SWITCH_LOGGER_DIR}" ]] || deploy_die "SWITCH_ENABLE=1 requires SWITCH_LOGGER_DIR"
+  [[ -n "${NETWORK_NODE_PASSWORD}" ]] || deploy_die "SWITCH_ENABLE=1 requires NETWORK_NODE_PASSWORD"
+  [[ -n "${SWITCH_PASSWORD}" ]] || deploy_die "SWITCH_ENABLE=1 requires SWITCH_PASSWORD"
+  [[ -x "${SWITCH_LOGGER_DIR}/start_switch_congestion_loggers.sh" || -f "${SWITCH_LOGGER_DIR}/start_switch_congestion_loggers.sh" ]] || deploy_die "start_switch_congestion_loggers.sh not found under ${SWITCH_LOGGER_DIR}"
+
+  deploy_log "INFO" "Starting switch logger interval_sec=${SWITCH_INTERVAL_SEC}"
+  local output key value
+  output="$(
+    bash "${SWITCH_LOGGER_DIR}/start_switch_congestion_loggers.sh" \
+      --network-node-password "${NETWORK_NODE_PASSWORD}" \
+      --switch-password "${SWITCH_PASSWORD}" \
+      --interval-sec "${SWITCH_INTERVAL_SEC}"
+  )"
+
+  while IFS='=' read -r key value; do
+    [[ -n "${key}" ]] || continue
+    case "${key}" in
+      RUN_ID) SWITCH_RUN_ID="${value}" ;;
+      LOG_DIR) SWITCH_LOG_DIR="${value}" ;;
+      PID_FILE) SWITCH_PID_FILE="${value}" ;;
+      MARKERS_JSONL) SWITCH_MARKERS_JSONL="${value}" ;;
+    esac
+  done <<< "${output}"
+
+  [[ -n "${SWITCH_RUN_ID}" ]] || deploy_die "Switch logger start did not return RUN_ID"
+  [[ -n "${SWITCH_PID_FILE}" || -n "${SWITCH_LOG_DIR}" ]] || deploy_die "Switch logger start did not return PID_FILE or LOG_DIR"
+
+  SWITCH_STARTED=1
+  SWITCH_STOPPED=0
+  switch_logger_write_run_meta "$(switch_logger_meta_file)"
+  deploy_log "INFO" "Switch logger started run_id=${SWITCH_RUN_ID} log_dir=${SWITCH_LOG_DIR}"
+}
+
+switch_logger_stop() {
+  switch_logger_enabled || return 0
+  [[ "${SWITCH_STARTED}" == "1" ]] || return 0
+  [[ "${SWITCH_STOPPED}" == "0" ]] || return 0
+  [[ -n "${SWITCH_LOGGER_DIR}" ]] || return 0
+
+  if [[ -n "${SWITCH_PID_FILE}" ]]; then
+    deploy_log "INFO" "Stopping switch logger pid_file=${SWITCH_PID_FILE}"
+    bash "${SWITCH_LOGGER_DIR}/stop_switch_congestion_loggers.sh" --pid-file "${SWITCH_PID_FILE}"
+  elif [[ -n "${SWITCH_LOG_DIR}" ]]; then
+    deploy_log "INFO" "Stopping switch logger log_dir=${SWITCH_LOG_DIR}"
+    bash "${SWITCH_LOGGER_DIR}/stop_switch_congestion_loggers.sh" --log-dir "${SWITCH_LOG_DIR}"
+  fi
+
+  SWITCH_STOPPED=1
+}
+
+switch_logger_marker() {
+  local marker="$1"
+  local message="$2"
+  switch_logger_enabled || return 0
+  [[ "${SWITCH_STARTED}" == "1" ]] || return 0
+  [[ -n "${SWITCH_RUN_ID}" ]] || return 0
+  bash "${SWITCH_LOGGER_DIR}/log_run_marker.sh" \
+    --run-id "${SWITCH_RUN_ID}" \
+    --marker "${marker}" \
+    --source "run_dev_matrix_master.sh" \
+    --message "${message}"
+}
+
+trap 'switch_logger_stop' EXIT
 
 ensure_container_ready_all() {
   [[ "${USE_CONTAINER}" == "1" ]] || return 0
@@ -119,19 +230,24 @@ maybe_restart_containers_after_failure() {
 
 run_hook_if_set() {
   local hook_template="$1"
-  local experiment="$2"
-  local mode="$3"
-  local repeat="$4"
-  local run_output_dir="$5"
+  local run_id="$2"
+  local experiment="$3"
+  local mode="$4"
+  local repeat="$5"
+  local run_output_dir="$6"
   [[ -n "${hook_template}" ]] || return 0
   local cmd
   cmd="$(deploy_replace_tokens "${hook_template}" \
+    RUN_ID "${run_id}" \
     EXPERIMENT "${experiment}" \
     MODE "${mode}" \
     REPEAT "${repeat}" \
     OUTPUT_DIR "${run_output_dir}" \
     MASTER_ADDR "${master_addr}" \
-    MASTER_PORT "${MASTER_PORT}")"
+    MASTER_PORT "${MASTER_PORT}" \
+    SWITCH_RUN_ID "${SWITCH_RUN_ID}" \
+    SWITCH_LOG_DIR "${SWITCH_LOG_DIR}" \
+    SWITCH_PID_FILE "${SWITCH_PID_FILE}")"
   deploy_log "INFO" "Running hook: ${cmd}"
   bash -lc "${cmd}"
 }
@@ -142,8 +258,9 @@ launch_worker_once() {
   local experiment="$3"
   local mode="$4"
   local repeat="$5"
-  local run_output_dir="$6"
-  local status_dir="$7"
+  local run_id="$6"
+  local run_output_dir="$7"
+  local status_dir="$8"
 
   local host_ip status_file worker_output_dir runner_cmd runner_cmd_b64 remote_cmd
   host_ip="$(deploy_lookup_worker_ip "${TOPOLOGY_FILE}" "${worker}")" || deploy_die "Cannot resolve IP for ${worker}"
@@ -160,6 +277,7 @@ launch_worker_once() {
     MODE "${mode}" \
     EXPERIMENT "${experiment}" \
     REPEAT "${repeat}" \
+    RUN_ID "${run_id}" \
     OUTPUT_DIR "${run_output_dir}" \
     WORKER_OUTPUT_DIR "${worker_output_dir}")"
   runner_cmd_b64="$(deploy_encode_b64 "${runner_cmd}")"
@@ -227,34 +345,44 @@ wait_for_status_barrier() {
 }
 
 run_validation_if_set() {
-  local experiment="$1"
-  local mode="$2"
-  local repeat="$3"
-  local run_output_dir="$4"
+  local run_id="$1"
+  local experiment="$2"
+  local mode="$3"
+  local repeat="$4"
+  local run_output_dir="$5"
   [[ -n "${VALIDATION_TEMPLATE}" ]] || return 0
   local cmd
   cmd="$(deploy_replace_tokens "${VALIDATION_TEMPLATE}" \
+    RUN_ID "${run_id}" \
     EXPERIMENT "${experiment}" \
     MODE "${mode}" \
     REPEAT "${repeat}" \
-    OUTPUT_DIR "${run_output_dir}")"
+    OUTPUT_DIR "${run_output_dir}" \
+    SWITCH_RUN_ID "${SWITCH_RUN_ID}" \
+    SWITCH_LOG_DIR "${SWITCH_LOG_DIR}" \
+    SWITCH_PID_FILE "${SWITCH_PID_FILE}")"
   deploy_log "INFO" "Running correctness validation: ${cmd}"
   bash -lc "${cmd}"
 }
 
 run_cleanup_check_if_set() {
-  local experiment="$1"
-  local mode="$2"
-  local repeat="$3"
-  local run_output_dir="$4"
+  local run_id="$1"
+  local experiment="$2"
+  local mode="$3"
+  local repeat="$4"
+  local run_output_dir="$5"
   [[ -n "${PORT_CLEANUP_CHECK_TEMPLATE}" ]] || return 0
   local cmd
   cmd="$(deploy_replace_tokens "${PORT_CLEANUP_CHECK_TEMPLATE}" \
+    RUN_ID "${run_id}" \
     EXPERIMENT "${experiment}" \
     MODE "${mode}" \
     REPEAT "${repeat}" \
     OUTPUT_DIR "${run_output_dir}" \
-    MASTER_PORT "${MASTER_PORT}")"
+    MASTER_PORT "${MASTER_PORT}" \
+    SWITCH_RUN_ID "${SWITCH_RUN_ID}" \
+    SWITCH_LOG_DIR "${SWITCH_LOG_DIR}" \
+    SWITCH_PID_FILE "${SWITCH_PID_FILE}")"
   deploy_log "INFO" "Running port cleanup check: ${cmd}"
   bash -lc "${cmd}"
 }
@@ -263,42 +391,52 @@ run_one() {
   local experiment="$1"
   local mode="$2"
   local repeat="$3"
-  local run_id="${experiment}/${mode}/repeat_$(printf '%02d' "${repeat}")"
-  local run_output_dir="${OUTPUT_ROOT}/${run_id}"
-  local status_dir="${STATUS_ROOT}/${experiment}/${mode}/repeat_$(printf '%02d' "${repeat}")"
+  local run_id="${RUN_ID}"
+  local run_output_dir="${OUTPUT_ROOT}/${RUN_ID}/${mode}/${experiment}/repeat_$(printf '%02d' "${repeat}")"
+  local status_dir="${STATUS_ROOT}/${RUN_ID}/${mode}/${experiment}/repeat_$(printf '%02d' "${repeat}")"
 
   ensure_local_dir "${run_output_dir}"
   ensure_local_dir "${status_dir}"
   find "${status_dir}" -type f -name '*.status' -delete 2>/dev/null || true
+  switch_logger_write_run_meta "$(run_level_meta_file "${run_output_dir}")"
 
-  deploy_log "INFO" "start experiment=${experiment} mode=${mode} repeat=${repeat} master=${MASTER_WORKER} world_size=${WORLD_SIZE} port=${MASTER_PORT}"
-  run_hook_if_set "${SWITCH_START_TEMPLATE}" "${experiment}" "${mode}" "${repeat}" "${run_output_dir}"
+  deploy_log "INFO" "start run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} master=${MASTER_WORKER} world_size=${WORLD_SIZE} port=${MASTER_PORT}"
+  switch_logger_marker "mode_start" "run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} output_dir=${run_output_dir}"
+  run_hook_if_set "${SWITCH_START_TEMPLATE}" "${run_id}" "${experiment}" "${mode}" "${repeat}" "${run_output_dir}"
 
   local rank=0
+  switch_logger_marker "ddp_start" "run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} before dispatch"
   for worker in "${WORKERS[@]}"; do
-    deploy_log "INFO" "dispatch experiment=${experiment} mode=${mode} repeat=${repeat} worker=${worker} rank=${rank}"
-    launch_worker_once "${worker}" "${rank}" "${experiment}" "${mode}" "${repeat}" "${run_output_dir}" "${status_dir}"
+    deploy_log "INFO" "dispatch run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} worker=${worker} rank=${rank}"
+    launch_worker_once "${worker}" "${rank}" "${experiment}" "${mode}" "${repeat}" "${run_id}" "${run_output_dir}" "${status_dir}"
     rank=$(( rank + 1 ))
   done
 
   if ! wait_for_status_barrier "${status_dir}" "${experiment}" "${mode}" "${repeat}"; then
-    run_hook_if_set "${SWITCH_STOP_TEMPLATE}" "${experiment}" "${mode}" "${repeat}" "${run_output_dir}" || true
+    switch_logger_marker "ddp_end" "run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} failed barrier"
+    switch_logger_marker "mode_end" "run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} failed"
+    run_hook_if_set "${SWITCH_STOP_TEMPLATE}" "${run_id}" "${experiment}" "${mode}" "${repeat}" "${run_output_dir}" || true
     maybe_restart_containers_after_failure
     return 1
   fi
 
-  run_hook_if_set "${SWITCH_STOP_TEMPLATE}" "${experiment}" "${mode}" "${repeat}" "${run_output_dir}"
-  run_validation_if_set "${experiment}" "${mode}" "${repeat}" "${run_output_dir}"
-  run_cleanup_check_if_set "${experiment}" "${mode}" "${repeat}" "${run_output_dir}"
+  switch_logger_marker "ddp_end" "run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} barrier complete"
+  run_hook_if_set "${SWITCH_STOP_TEMPLATE}" "${run_id}" "${experiment}" "${mode}" "${repeat}" "${run_output_dir}"
+  run_validation_if_set "${run_id}" "${experiment}" "${mode}" "${repeat}" "${run_output_dir}"
+  run_cleanup_check_if_set "${run_id}" "${experiment}" "${mode}" "${repeat}" "${run_output_dir}"
+  switch_logger_marker "mode_end" "run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} done"
 
-  deploy_log "INFO" "done experiment=${experiment} mode=${mode} repeat=${repeat}"
+  deploy_log "INFO" "done run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat}"
 }
 
-ensure_local_dir "${OUTPUT_ROOT}"
+ensure_local_dir "${OUTPUT_ROOT}/${RUN_ID}"
 ensure_local_dir "${STATUS_ROOT}"
 ensure_container_ready_all
+switch_logger_start
+switch_logger_marker "matrix_start" "run_id=${RUN_ID} output_root=${OUTPUT_ROOT}/${RUN_ID} world_size=${WORLD_SIZE} modes=${MODES_CSV} experiments=${EXPERIMENTS_CSV} repeats=${REPEATS}"
 
 for experiment in "${EXPERIMENTS[@]}"; do
+  switch_logger_marker "exp_start" "experiment=${experiment}"
   for mode in "${MODES[@]}"; do
     for ((repeat=1; repeat<=REPEATS; repeat++)); do
       if ! run_one "${experiment}" "${mode}" "${repeat}"; then
@@ -306,6 +444,9 @@ for experiment in "${EXPERIMENTS[@]}"; do
       fi
     done
   done
+  switch_logger_marker "exp_end" "experiment=${experiment}"
 done
 
-deploy_log "INFO" "All experiments completed output_root=${OUTPUT_ROOT}"
+switch_logger_marker "matrix_end" "run_id=${RUN_ID} output_root=${OUTPUT_ROOT}/${RUN_ID}"
+switch_logger_stop
+deploy_log "INFO" "All experiments completed run_id=${RUN_ID} output_root=${OUTPUT_ROOT}/${RUN_ID}"

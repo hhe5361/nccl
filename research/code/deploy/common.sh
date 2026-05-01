@@ -5,6 +5,10 @@ deploy_now_utc() {
   date -u +"%Y-%m-%dT%H:%M:%SZ"
 }
 
+deploy_now_utc_compact() {
+  date -u +"%Y%m%dT%H%M%SZ"
+}
+
 deploy_log() {
   local level="$1"
   shift
@@ -64,6 +68,19 @@ deploy_lookup_worker_ip() {
 
 deploy_encode_b64() {
   python3 -c 'import base64,sys; print(base64.b64encode(sys.argv[1].encode()).decode())' "$1"
+}
+
+deploy_write_kv_file() {
+  local output_file="$1"
+  shift
+  mkdir -p "$(dirname "${output_file}")"
+  : > "${output_file}"
+  while [[ $# -gt 1 ]]; do
+    local key="$1"
+    local value="$2"
+    shift 2
+    printf '%s=%s\n' "${key}" "${value}" >> "${output_file}"
+  done
 }
 
 deploy_replace_tokens() {
