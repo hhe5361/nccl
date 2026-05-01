@@ -17,6 +17,10 @@ PORT_CLEANUP_CHECK_TEMPLATE="${PORT_CLEANUP_CHECK_TEMPLATE:-}"
 SWITCH_ENABLE="${SWITCH_ENABLE:-0}"
 SWITCH_LOGGER_DIR="${SWITCH_LOGGER_DIR:-}"
 SWITCH_INTERVAL_SEC="${SWITCH_INTERVAL_SEC:-1}"
+SWITCH_DPU_HOST="${SWITCH_DPU_HOST:-172.16.0.100}"
+SWITCH_DPU_USER="${SWITCH_DPU_USER:-ubuntu}"
+SWITCH_DPU_PORT="${SWITCH_DPU_PORT:-22}"
+SWITCH_DPU_PASSWORD="${SWITCH_DPU_PASSWORD:-}"
 NETWORK_NODE_PASSWORD="${NETWORK_NODE_PASSWORD:-}"
 SWITCH_PASSWORD="${SWITCH_PASSWORD:-}"
 WORKERS_CSV="${WORKERS_CSV:-worker01,worker02,worker03,worker04,worker05,worker06,worker07,worker08}"
@@ -144,17 +148,19 @@ switch_logger_write_run_meta() {
 switch_logger_start() {
   switch_logger_enabled || return 0
   [[ -n "${SWITCH_LOGGER_DIR}" ]] || deploy_die "SWITCH_ENABLE=1 requires SWITCH_LOGGER_DIR"
+  [[ -n "${SWITCH_DPU_PASSWORD}" ]] || deploy_die "SWITCH_ENABLE=1 requires SWITCH_DPU_PASSWORD"
   [[ -n "${NETWORK_NODE_PASSWORD}" ]] || deploy_die "SWITCH_ENABLE=1 requires NETWORK_NODE_PASSWORD"
   [[ -n "${SWITCH_PASSWORD}" ]] || deploy_die "SWITCH_ENABLE=1 requires SWITCH_PASSWORD"
-  [[ -x "${SWITCH_LOGGER_DIR}/start_switch_congestion_loggers.sh" || -f "${SWITCH_LOGGER_DIR}/start_switch_congestion_loggers.sh" ]] || deploy_die "start_switch_congestion_loggers.sh not found under ${SWITCH_LOGGER_DIR}"
 
-  deploy_log "INFO" "Starting switch logger interval_sec=${SWITCH_INTERVAL_SEC}"
+  deploy_log "INFO" "Starting switch logger on dpu_host=${SWITCH_DPU_HOST} interval_sec=${SWITCH_INTERVAL_SEC}"
   local output key value
   output="$(
-    bash "${SWITCH_LOGGER_DIR}/start_switch_congestion_loggers.sh" \
-      --network-node-password "${NETWORK_NODE_PASSWORD}" \
-      --switch-password "${SWITCH_PASSWORD}" \
-      --interval-sec "${SWITCH_INTERVAL_SEC}"
+    deploy_ssh_target_cmd \
+      "${SWITCH_DPU_HOST}" \
+      "${SWITCH_DPU_USER}" \
+      "${SWITCH_DPU_PORT}" \
+      "${SWITCH_DPU_PASSWORD}" \
+      "cd '${SWITCH_LOGGER_DIR}' && bash ./start_switch_congestion_loggers.sh --network-node-password '${NETWORK_NODE_PASSWORD}' --switch-password '${SWITCH_PASSWORD}' --interval-sec '${SWITCH_INTERVAL_SEC}'"
   )"
 
   while IFS='=' read -r key value; do
@@ -180,14 +186,24 @@ switch_logger_stop() {
   switch_logger_enabled || return 0
   [[ "${SWITCH_STARTED}" == "1" ]] || return 0
   [[ "${SWITCH_STOPPED}" == "0" ]] || return 0
-  [[ -n "${SWITCH_LOGGER_DIR}" ]] || return 0
+  [[ -n "${SWITCH_LOGGER_DIR}" && -n "${SWITCH_DPU_HOST}" ]] || return 0
 
   if [[ -n "${SWITCH_PID_FILE}" ]]; then
-    deploy_log "INFO" "Stopping switch logger pid_file=${SWITCH_PID_FILE}"
-    bash "${SWITCH_LOGGER_DIR}/stop_switch_congestion_loggers.sh" --pid-file "${SWITCH_PID_FILE}"
+    deploy_log "INFO" "Stopping switch logger on dpu_host=${SWITCH_DPU_HOST} pid_file=${SWITCH_PID_FILE}"
+    deploy_ssh_target_cmd \
+      "${SWITCH_DPU_HOST}" \
+      "${SWITCH_DPU_USER}" \
+      "${SWITCH_DPU_PORT}" \
+      "${SWITCH_DPU_PASSWORD}" \
+      "cd '${SWITCH_LOGGER_DIR}' && bash ./stop_switch_congestion_loggers.sh --pid-file '${SWITCH_PID_FILE}'"
   elif [[ -n "${SWITCH_LOG_DIR}" ]]; then
-    deploy_log "INFO" "Stopping switch logger log_dir=${SWITCH_LOG_DIR}"
-    bash "${SWITCH_LOGGER_DIR}/stop_switch_congestion_loggers.sh" --log-dir "${SWITCH_LOG_DIR}"
+    deploy_log "INFO" "Stopping switch logger on dpu_host=${SWITCH_DPU_HOST} log_dir=${SWITCH_LOG_DIR}"
+    deploy_ssh_target_cmd \
+      "${SWITCH_DPU_HOST}" \
+      "${SWITCH_DPU_USER}" \
+      "${SWITCH_DPU_PORT}" \
+      "${SWITCH_DPU_PASSWORD}" \
+      "cd '${SWITCH_LOGGER_DIR}' && bash ./stop_switch_congestion_loggers.sh --log-dir '${SWITCH_LOG_DIR}'"
   fi
 
   SWITCH_STOPPED=1
@@ -199,11 +215,12 @@ switch_logger_marker() {
   switch_logger_enabled || return 0
   [[ "${SWITCH_STARTED}" == "1" ]] || return 0
   [[ -n "${SWITCH_RUN_ID}" ]] || return 0
-  bash "${SWITCH_LOGGER_DIR}/log_run_marker.sh" \
-    --run-id "${SWITCH_RUN_ID}" \
-    --marker "${marker}" \
-    --source "run_dev_matrix_master.sh" \
-    --message "${message}"
+  deploy_ssh_target_cmd \
+    "${SWITCH_DPU_HOST}" \
+    "${SWITCH_DPU_USER}" \
+    "${SWITCH_DPU_PORT}" \
+    "${SWITCH_DPU_PASSWORD}" \
+    "cd '${SWITCH_LOGGER_DIR}' && bash ./log_run_marker.sh --run-id '${SWITCH_RUN_ID}' --marker '${marker}' --source 'run_dev_matrix_master.sh' --message '${message}'"
 }
 
 trap 'switch_logger_stop' EXIT

@@ -149,3 +149,18 @@ deploy_ssh_cmd() {
     "${ssh_base[@]}" "${user}@${host_ip}" "${remote_cmd}"
   fi
 }
+
+deploy_ssh_target_cmd() {
+  local host="$1"
+  local user="$2"
+  local port="$3"
+  local password="$4"
+  local remote_cmd="$5"
+
+  local ssh_base=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p "${port}")
+  if [[ -n "${password}" ]]; then
+    sshpass -p "${password}" "${ssh_base[@]}" "${user}@${host}" "${remote_cmd}"
+  else
+    "${ssh_base[@]}" "${user}@${host}" "${remote_cmd}"
+  fi
+}
