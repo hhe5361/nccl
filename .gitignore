@@ -5,6 +5,5 @@
 *.html
 *.pdf
 *.xml
-*.txt
 research/docs/
 research/venv/

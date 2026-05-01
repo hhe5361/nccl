@@ -1,0 +1,19 @@
+[Workers]
+worker01: 172.16.0.101
+worker02: 172.16.0.102
+worker03: 172.16.0.103
+worker04: 172.16.0.104
+worker05: 172.16.0.105
+worker06: 172.16.0.106
+worker07: 172.16.0.107
+worker08: 172.16.0.108
+
+[EnvKeys]
+WORKER_SSH_PASSWORD: worker SSH password
+WORKER_SSH_USER: optional common SSH user override
+WORKER_SSH_USER_MAP: optional per-worker SSH user override
+WORKER_SSH_PORT: optional common SSH port override
+WORKER_SSH_PORT_MAP: optional per-worker SSH port override
+DPU_NODE_PWD: DPU node SSH password
+NETWORK_NODE_PASSWORD: network node SSH password
+SWITCH_PASSWORD: switch SSH password
