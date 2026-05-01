@@ -171,9 +171,12 @@ def main():
         "trace_file": str(trace_path),
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-
-    dist.barrier()
-    dist.destroy_process_group()
+    # Do not add a final global barrier here. Some runs completed all steps and
+    # wrote summaries, then stalled during process-group teardown.
+    try:
+        dist.destroy_process_group()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

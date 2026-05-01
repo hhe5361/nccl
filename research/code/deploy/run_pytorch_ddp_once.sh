@@ -155,6 +155,8 @@ nccl_phase1_inflight_w=${NCCL_PHASE1_INFLIGHT_W:-}
 nccl_algo=${NCCL_ALGO:-auto}
 EOF
 
+echo "[ddp-runner] start experiment=${EXPERIMENT_NAME} mode=${MODE_NAME} node_rank=${NODE_RANK} world_size=${WORLD_SIZE} master=${MASTER_ADDR}:${MASTER_PORT}"
+
 torchrun \
   --nnodes "${WORLD_SIZE}" \
   --nproc-per-node "${NPROC_PER_NODE}" \
@@ -168,3 +170,5 @@ torchrun \
   --warmup-steps "${WARMUP_STEPS}" \
   --payload-mb "${PAYLOAD_MB}" \
   --output-dir "${OUTPUT_DIR}"
+
+echo "[ddp-runner] finished experiment=${EXPERIMENT_NAME} mode=${MODE_NAME} node_rank=${NODE_RANK}"
