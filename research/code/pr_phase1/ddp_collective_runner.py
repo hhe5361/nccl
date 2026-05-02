@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -174,12 +175,16 @@ def main():
         "trace_file": str(trace_path),
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    # Do not add a final global barrier here. Some runs completed all steps and
-    # wrote summaries, then stalled during process-group teardown.
+    # Keep teardown minimal. Some runs completed all steps and wrote summaries,
+    # then stalled during process-group teardown or launcher shutdown.
     try:
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
     except Exception:
         pass
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

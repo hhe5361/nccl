@@ -55,7 +55,8 @@ done
 
 mode_labels=()
 mode_labels+=("STOCK")
-for whole in 1 2 3 4 5 6 7 8; do
+mode_labels+=("W1_5")
+for whole in 2 3 4 5 6 7 8; do
   mode_labels+=("W${whole}_0")
   if [[ "${whole}" != "8" ]]; then
     mode_labels+=("W${whole}_5")
