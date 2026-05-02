@@ -47,14 +47,22 @@ class RepeatData:
 class Phase1Event:
     event: str
     phase: str
+    ts_unix_ns: Optional[int]
+    ts_mono_ns: Optional[int]
     rank: int
     peer: int
     channel: int
     slot: int
+    base: int
+    nsteps: int
     posted: int
     received: int
     transmitted: int
     done: int
+    logical_posted: int
+    logical_received: int
+    logical_transmitted: int
+    logical_done: int
     occ_pd: int
     occ_pr: int
     occ_tr: int
@@ -87,6 +95,13 @@ class RepeatCtsMetrics:
     progress_post_counts: List[int]
     progress_occ_pr: List[Optional[float]]
     progress_channel_counts: Dict[int, Dict[int, int]]
+    exact_step_post_counts: Dict[int, int]
+    exact_step_wstall_counts: Dict[int, int]
+    exact_step_channel_counts: Dict[int, Dict[int, int]]
+    exact_step_occ_pr_post: Dict[int, Optional[float]]
+    exact_step_latency_ms: Dict[int, Optional[float]]
+    exact_step_throughput_gbps: Dict[int, Optional[float]]
+    exact_ts_available: bool
     configured_w: Optional[float]
     observed_max_occ_pr: Optional[float]
 
@@ -259,14 +274,22 @@ def load_phase1_events(path_str: str) -> List[Phase1Event]:
                     Phase1Event(
                         event=m.group("event"),
                         phase=kv.get("phase", "-"),
+                        ts_unix_ns=int(kv["ts_unix_ns"]) if "ts_unix_ns" in kv else None,
+                        ts_mono_ns=int(kv["ts_mono_ns"]) if "ts_mono_ns" in kv else None,
                         rank=int(kv.get("rank", "0")),
                         peer=int(kv.get("peer", "0")),
                         channel=int(kv.get("channel", "0")),
                         slot=int(kv.get("slot", "0")),
+                        base=int(kv.get("base", "0")),
+                        nsteps=int(kv.get("nsteps", "0")),
                         posted=int(kv.get("posted", "0")),
                         received=int(kv.get("received", "0")),
                         transmitted=int(kv.get("transmitted", "0")),
                         done=int(kv.get("done", "0")),
+                        logical_posted=int(kv.get("logicalPosted", "0")),
+                        logical_received=int(kv.get("logicalReceived", "0")),
+                        logical_transmitted=int(kv.get("logicalTransmitted", "0")),
+                        logical_done=int(kv.get("logicalDone", "0")),
                         occ_pd=int(kv.get("occPd", "0")),
                         occ_pr=int(kv.get("occPr", "0")),
                         occ_tr=int(kv.get("occTr", "0")),
@@ -509,6 +532,62 @@ def build_progress_bins(events: List[Phase1Event], bins: int = PROGRESS_BINS) ->
     return counts, occ_pr, {idx: dict(counter) for idx, counter in channel_counts.items()}
 
 
+def build_exact_step_metrics(trace_rows: List[dict], events: List[Phase1Event]) -> Tuple[Dict[int, int], Dict[int, int], Dict[int, Dict[int, int]], Dict[int, Optional[float]], Dict[int, Optional[float]], Dict[int, Optional[float]], bool]:
+    steady_rows = [row for row in trace_rows if row.get("phase") == "steady"]
+    if not steady_rows:
+        return {}, {}, {}, {}, {}, {}, False
+    if any(event.ts_unix_ns is None for event in events if event.phase == "steady"):
+        return {}, {}, {}, {}, {}, {}, False
+
+    step_post_counts: Dict[int, int] = Counter()
+    step_wstall_counts: Dict[int, int] = Counter()
+    step_channel_counts: Dict[int, Counter[int]] = defaultdict(Counter)
+    step_occ_pr_values: Dict[int, List[float]] = defaultdict(list)
+    step_latency_ms: Dict[int, float] = {}
+    step_throughput_gbps: Dict[int, float] = {}
+
+    sorted_rows = sorted(steady_rows, key=lambda row: int(row.get("step_index", 0)))
+    payload_mb = float(sorted_rows[0].get("payload_mb", 0))
+    intervals = []
+    for row in sorted_rows:
+        step_idx = int(row["step_index"])
+        start_ns = int(row["ts_start_unix_ns"])
+        end_ns = int(row["ts_end_unix_ns"])
+        intervals.append((step_idx, start_ns, end_ns))
+        latency_ms = float(row["duration_ms"])
+        step_latency_ms[step_idx] = latency_ms
+        step_throughput_gbps[step_idx] = throughput_gbps(payload_mb, latency_ms)
+
+    for event in events:
+        if event.phase != "steady" or event.ts_unix_ns is None:
+            continue
+        event_ts = event.ts_unix_ns
+        matched_step = None
+        for step_idx, start_ns, end_ns in intervals:
+            if start_ns <= event_ts <= end_ns:
+                matched_step = step_idx
+                break
+        if matched_step is None:
+            continue
+        if event.event == "PROXY_RECV_POST":
+            step_post_counts[matched_step] += 1
+            step_channel_counts[matched_step][event.channel] += 1
+            step_occ_pr_values[matched_step].append(float(event.occ_pr))
+        elif event.event == "PROXY_RECV_WSTALL":
+            step_wstall_counts[matched_step] += 1
+
+    step_occ_pr = {step: safe_median(vals) for step, vals in step_occ_pr_values.items()}
+    return (
+        dict(step_post_counts),
+        dict(step_wstall_counts),
+        {step: dict(counter) for step, counter in step_channel_counts.items()},
+        step_occ_pr,
+        step_latency_ms,
+        step_throughput_gbps,
+        True,
+    )
+
+
 @lru_cache(maxsize=None)
 def load_repeat_cts_metrics(repeat_dir_str: str, experiment: str, mode: str, repeat_name: str) -> RepeatCtsMetrics:
     repeat_dir = Path(repeat_dir_str)
@@ -517,6 +596,13 @@ def load_repeat_cts_metrics(repeat_dir_str: str, experiment: str, mode: str, rep
     progress_post_counts = [0] * PROGRESS_BINS
     progress_occ_pr_lists: List[List[float]] = [[] for _ in range(PROGRESS_BINS)]
     progress_channel_counts: Dict[int, Counter[int]] = {idx: Counter() for idx in range(PROGRESS_BINS)}
+    exact_step_post_counts: Counter[int] = Counter()
+    exact_step_wstall_counts: Counter[int] = Counter()
+    exact_step_channel_counts: Dict[int, Counter[int]] = defaultdict(Counter)
+    exact_step_occ_pr_lists: Dict[int, List[float]] = defaultdict(list)
+    exact_step_latency_values: Dict[int, List[float]] = defaultdict(list)
+    exact_step_throughput_values: Dict[int, List[float]] = defaultdict(list)
+    exact_ts_available = True
     total_posts = 0
     total_wstalls = 0
     wstall_by_reason: Counter[str] = Counter()
@@ -527,6 +613,7 @@ def load_repeat_cts_metrics(repeat_dir_str: str, experiment: str, mode: str, rep
 
     for worker_dir in sorted(p for p in repeat_dir.iterdir() if p.is_dir() and p.name.startswith("worker")):
         log_path = worker_dir / "worker_launcher.log"
+        trace_files = sorted(worker_dir.glob("rank*_step_trace.jsonl"))
         events = load_phase1_events(str(log_path))
         post_events = [event for event in events if event.event == "PROXY_RECV_POST" and event.phase == "steady"]
         wstall_events = [event for event in events if event.event == "PROXY_RECV_WSTALL" and event.phase == "steady"]
@@ -553,6 +640,29 @@ def load_repeat_cts_metrics(repeat_dir_str: str, experiment: str, mode: str, rep
             for channel, count in channel_bins[idx].items():
                 progress_channel_counts[idx][channel] += count
 
+        if trace_files:
+            step_posts, step_wstalls, step_channels, step_occ_pr, step_latency_ms, step_throughput_gbps, has_exact_ts = build_exact_step_metrics(
+                load_trace(str(trace_files[0])),
+                events,
+            )
+            exact_ts_available = exact_ts_available and has_exact_ts
+            for step_idx, value in step_posts.items():
+                exact_step_post_counts[step_idx] += value
+            for step_idx, value in step_wstalls.items():
+                exact_step_wstall_counts[step_idx] += value
+            for step_idx, channels in step_channels.items():
+                for channel, count in channels.items():
+                    exact_step_channel_counts[step_idx][channel] += count
+            for step_idx, value in step_occ_pr.items():
+                if value is not None:
+                    exact_step_occ_pr_lists[step_idx].append(float(value))
+            for step_idx, value in step_latency_ms.items():
+                exact_step_latency_values[step_idx].append(float(value))
+            for step_idx, value in step_throughput_gbps.items():
+                exact_step_throughput_values[step_idx].append(float(value))
+        else:
+            exact_ts_available = False
+
     progress_occ_pr = [safe_median(values) for values in progress_occ_pr_lists]
     return RepeatCtsMetrics(
         total_posts=total_posts,
@@ -565,6 +675,13 @@ def load_repeat_cts_metrics(repeat_dir_str: str, experiment: str, mode: str, rep
         progress_post_counts=progress_post_counts,
         progress_occ_pr=progress_occ_pr,
         progress_channel_counts={idx: dict(counter) for idx, counter in progress_channel_counts.items()},
+        exact_step_post_counts=dict(exact_step_post_counts),
+        exact_step_wstall_counts=dict(exact_step_wstall_counts),
+        exact_step_channel_counts={step: dict(counter) for step, counter in exact_step_channel_counts.items()},
+        exact_step_occ_pr_post={step: safe_median(vals) for step, vals in exact_step_occ_pr_lists.items()},
+        exact_step_latency_ms={step: safe_median(vals) for step, vals in exact_step_latency_values.items()},
+        exact_step_throughput_gbps={step: safe_median(vals) for step, vals in exact_step_throughput_values.items()},
+        exact_ts_available=exact_ts_available,
         configured_w=safe_median(configured_ws),
         observed_max_occ_pr=observed_max_occ_pr,
     )
@@ -913,6 +1030,115 @@ def plot_cts_progress_by_w(experiment: str, mode_repeats: Dict[str, Dict[str, Li
     return filename
 
 
+def plot_exact_step_cts_vs_w(experiment: str, mode_repeats: Dict[str, Dict[str, List[RepeatData]]], output_dir: Path) -> List[str]:
+    filenames: List[str] = []
+    modes = sorted(mode_repeats.keys(), key=mode_sort_key)
+    numeric_modes = [mode for mode in modes if mode == "STOCK" or mode.startswith("W")]
+    palette = make_mode_palette(numeric_modes)
+    for step_idx in SAMPLED_PROGRESS_BINS:
+        labels = []
+        posts = []
+        stalls = []
+        latencies = []
+        throughputs = []
+        exact_available = False
+        for mode in numeric_modes:
+            per_repeat_posts = []
+            per_repeat_stalls = []
+            per_repeat_lat = []
+            per_repeat_thr = []
+            for repeat_name, items in sorted(mode_repeats[mode].items()):
+                sample = items[0]
+                metrics = load_repeat_cts_metrics(str(sample.repeat_dir), experiment, mode, repeat_name)
+                exact_available = exact_available or metrics.exact_ts_available
+                per_repeat_posts.append(float(metrics.exact_step_post_counts.get(step_idx, 0)))
+                per_repeat_stalls.append(float(metrics.exact_step_wstall_counts.get(step_idx, 0)))
+                if step_idx in metrics.exact_step_latency_ms and metrics.exact_step_latency_ms[step_idx] is not None:
+                    per_repeat_lat.append(float(metrics.exact_step_latency_ms[step_idx]))
+                if step_idx in metrics.exact_step_throughput_gbps and metrics.exact_step_throughput_gbps[step_idx] is not None:
+                    per_repeat_thr.append(float(metrics.exact_step_throughput_gbps[step_idx]))
+            labels.append(mode)
+            posts.append(safe_median(per_repeat_posts) or 0.0)
+            stalls.append(safe_median(per_repeat_stalls) or 0.0)
+            latencies.append(safe_median(per_repeat_lat) or 0.0)
+            throughputs.append(safe_median(per_repeat_thr) or 0.0)
+        if not exact_available:
+            continue
+        xs = list(range(len(labels)))
+        fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+        axes[0].bar(xs, posts, color=[palette[label] for label in labels], alpha=0.8, label="CTS/POST")
+        axes[0].bar(xs, stalls, bottom=posts, color="#d62728", alpha=0.7, label="WSTALL")
+        axes[0].set_ylabel("Event Count")
+        axes[0].set_title(f"{experiment} Exact Step {step_idx}: CTS/WSTALL by W")
+        axes[0].legend()
+        axes[0].grid(True, axis="y", alpha=0.25)
+
+        axes[1].plot(xs, latencies, marker="o", color="#1f77b4")
+        axes[1].set_ylabel("Latency (ms)")
+        axes[1].grid(True, alpha=0.25)
+
+        axes[2].plot(xs, throughputs, marker="o", color="#2ca02c")
+        axes[2].set_ylabel("Throughput (GB/s)")
+        axes[2].set_xticks(xs)
+        axes[2].set_xticklabels(labels, rotation=45, ha="right")
+        axes[2].grid(True, alpha=0.25)
+
+        fig.tight_layout()
+        filename = f"{experiment}_exact_step_{step_idx}_cts_vs_w.png"
+        fig.savefig(output_dir / filename, dpi=160)
+        plt.close(fig)
+        filenames.append(filename)
+    return filenames
+
+
+def plot_exact_step_channel_volume(experiment: str, mode_repeats: Dict[str, Dict[str, List[RepeatData]]], output_dir: Path) -> List[str]:
+    filenames: List[str] = []
+    modes = sorted(mode_repeats.keys(), key=mode_sort_key)
+    for step_idx in SAMPLED_PROGRESS_BINS:
+        channels = sorted(
+            {
+                channel
+                for mode in modes
+                for repeat_name, items in sorted(mode_repeats[mode].items())
+                for channel in load_repeat_cts_metrics(str(items[0].repeat_dir), experiment, mode, repeat_name).exact_step_channel_counts.get(step_idx, {})
+            }
+        )
+        if not channels:
+            continue
+        palette = make_mode_palette(modes)
+        fig, ax = plt.subplots(figsize=(13, 6))
+        width = 0.8 / max(1, len(modes))
+        exact_available = False
+        for mode_idx, mode in enumerate(modes):
+            vals = []
+            for channel in channels:
+                per_repeat_vals = []
+                for repeat_name, items in sorted(mode_repeats[mode].items()):
+                    sample = items[0]
+                    metrics = load_repeat_cts_metrics(str(sample.repeat_dir), experiment, mode, repeat_name)
+                    exact_available = exact_available or metrics.exact_ts_available
+                    per_repeat_vals.append(float(metrics.exact_step_channel_counts.get(step_idx, {}).get(channel, 0)))
+                vals.append(safe_median(per_repeat_vals) or 0.0)
+            xs = [idx + (mode_idx - (len(modes) - 1) / 2.0) * width for idx in range(len(channels))]
+            ax.bar(xs, vals, width=width, color=palette[mode], label=mode, alpha=0.85)
+        if not exact_available:
+            plt.close(fig)
+            continue
+        ax.set_xticks(list(range(len(channels))))
+        ax.set_xticklabels([f"ch{channel}" for channel in channels])
+        ax.set_title(f"{experiment} Exact Step {step_idx}: CTS Channel Volume by W")
+        ax.set_xlabel("Channel")
+        ax.set_ylabel("CTS/POST Count")
+        ax.grid(True, axis="y", alpha=0.25)
+        ax.legend(ncol=2, fontsize=9)
+        fig.tight_layout()
+        filename = f"{experiment}_exact_step_{step_idx}_cts_channel_volume.png"
+        fig.savefig(output_dir / filename, dpi=160)
+        plt.close(fig)
+        filenames.append(filename)
+    return filenames
+
+
 def plot_cts_channel_volume_for_bins(experiment: str, mode_repeats: Dict[str, Dict[str, List[RepeatData]]], output_dir: Path) -> List[str]:
     modes = sorted(mode_repeats.keys(), key=mode_sort_key)
     filenames: List[str] = []
@@ -1234,8 +1460,11 @@ def generate_html(run_root: Path, output_dir: Path, root_plots: List[Tuple[str, 
       {root_meta_html}
       <div class="note">
         <strong>CTS diagnostics note.</strong>
-        Step-level CTS plots are derived from <code>PROXY_RECV_POST</code> event order. Because the current launcher log does not record per-event timestamps, sampled points 10/20/30 are rendered as
-        <em>normalized progress bins</em> across the 50 steady steps, not exact DDP-step timestamps.
+        Exact step CTS plots use <code>PHASE1 ts_unix_ns</code> from NCCL proxy logs and
+        map <code>PROXY_RECV_POST</code>/<code>PROXY_RECV_WSTALL</code> events into each DDP
+        step window using the step trace <code>ts_start_unix_ns</code> and
+        <code>ts_end_unix_ns</code>. If a run root does not contain the new timestamp fields,
+        the reporter falls back to normalized progress-bin plots only.
       </div>
     </div>
     <section class="card">
@@ -1300,10 +1529,20 @@ def build_report(run_root: Path, output_dir: Path) -> None:
         cts_worker_volume = plot_cts_post_volume_by_worker_vs_w(experiment, mode_repeats, output_dir)
         gate_effect = plot_post_receive_gate_effect_vs_w(experiment, mode_repeats, output_dir)
         cts_progress = plot_cts_progress_by_w(experiment, mode_repeats, output_dir)
+        exact_step_cts = plot_exact_step_cts_vs_w(experiment, mode_repeats, output_dir)
+        exact_step_channels = plot_exact_step_channel_volume(experiment, mode_repeats, output_dir)
         throughput_bar_all, throughput_bar_selected = plot_step_throughput_selected_modes(experiment, mode_repeats, output_dir)
         channel_files = plot_cts_channel_volume_for_bins(experiment, mode_repeats, output_dir)
         summary_table = build_experiment_table(experiment, mode_repeats)
 
+        exact_step_html = "".join(
+            f'<div><h3>{escape(filename.replace(".png", "").replace("_", " "))}</h3><img src="{escape(filename)}" alt="{escape(experiment)} {escape(filename)}"></div>'
+            for filename in exact_step_cts
+        )
+        exact_channel_html = "".join(
+            f'<div><h3>{escape(filename.replace(".png", "").replace("_", " "))}</h3><img src="{escape(filename)}" alt="{escape(experiment)} {escape(filename)}"></div>'
+            for filename in exact_step_channels
+        )
         channel_html = "".join(
             f'<div><h3>CTS Channel Volume Bin {escape(filename.rsplit("_", 1)[-1].replace(".png", ""))}</h3><img src="{escape(filename)}" alt="{escape(experiment)} {escape(filename)}"></div>'
             for filename in channel_files
@@ -1325,6 +1564,8 @@ def build_report(run_root: Path, output_dir: Path) -> None:
                 <div><h3>CTS/POST Volume by Worker vs W</h3><img src="{escape(cts_worker_volume)}" alt="{escape(experiment)} CTS volume by worker"></div>
                 <div><h3>Post-Receive Gate Effect vs W</h3><img src="{escape(gate_effect)}" alt="{escape(experiment)} gate effect"></div>
                 <div><h3>CTS Progress by W</h3><img src="{escape(cts_progress)}" alt="{escape(experiment)} CTS progress by W"></div>
+                {exact_step_html}
+                {exact_channel_html}
                 <div><h3>Step Throughput by W</h3><img src="{escape(throughput_bar_all)}" alt="{escape(experiment)} step throughput by W"></div>
                 <div><h3>Step Throughput: STOCK vs W2 vs W4</h3><img src="{escape(throughput_bar_selected)}" alt="{escape(experiment)} throughput stock w2 w4"></div>
                 {channel_html}
