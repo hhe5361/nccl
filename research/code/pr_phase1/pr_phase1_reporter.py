@@ -750,11 +750,11 @@ def plot_step_throughput_selected_modes(experiment: str, mode_repeats: Dict[str,
     selected = [mode for mode in ("STOCK", "W2_0", "W4_0") if mode in mode_repeats]
     if len(selected) < 2:
         selected = modes_all[: min(3, len(modes_all))]
-    palette = make_mode_palette(selected)
 
     def _make_plot(modes: List[str], filename: str, title: str) -> str:
         fig, ax = plt.subplots(figsize=(12, 6))
         width = 0.26
+        palette = make_mode_palette(modes)
         base_steps = None
         for idx, mode in enumerate(modes):
             repeat_series = [per_repeat_step_series(items) for _, items in sorted(mode_repeats[mode].items())]
