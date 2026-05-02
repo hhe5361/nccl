@@ -709,6 +709,7 @@ static inline void phase1InflightLogEvent(struct ncclProxyState* proxyState, str
     const char* eventName, const char* phase, const char* stallReason, int slot, int maxDepth, double configuredW,
     int inflightNow, int allowProbabilisticBoundary) {
   if (phase1InflightLogEnabled() == 0) return;
+  if (eventName && strcmp(eventName, "PROXY_RECV_WSTALL") == 0) return;
   struct timespec tsReal;
   clockRealtime(&tsReal);
   uint64_t tsUnixNs = (uint64_t)tsReal.tv_sec * 1000000000ull + (uint64_t)tsReal.tv_nsec;
