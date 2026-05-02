@@ -485,19 +485,26 @@ NCCL_DEVICE_INLINE EltPack<float, 1> castPack(EltPack<__nv_bfloat16, 1> x) {
 
 template<>
 NCCL_DEVICE_INLINE EltPack<float, 2> castPack(EltPack<__nv_bfloat16, 2> x) {
-  union Bf162PackAccess {
-    EltPack<__nv_bfloat16, 2> pack;
-    __nv_bfloat162 pair;
-  };
-  union Float2PackAccess {
-    EltPack<float, 2> pack;
-    float2 pair;
-  };
-  Bf162PackAccess in;
-  Float2PackAccess out;
-  in.pack = x;
-  out.pair = __bfloat1622float2(in.pair);
-  return out.pack;
+  #if __CUDA_ARCH__ >= 800
+    union Bf162PackAccess {
+      EltPack<__nv_bfloat16, 2> pack;
+      __nv_bfloat162 pair;
+    };
+    union Float2PackAccess {
+      EltPack<float, 2> pack;
+      float2 pair;
+    };
+    Bf162PackAccess in;
+    Float2PackAccess out;
+    in.pack = x;
+    out.pair = __bfloat1622float2(in.pair);
+    return out.pack;
+  #else
+    EltPack<float, 2> out{};
+    out.elts()[0] = __bfloat162float(x.elts()[0]);
+    out.elts()[1] = __bfloat162float(x.elts()[1]);
+    return out;
+  #endif
 }
 
 // Specialization for float -> __nv_bfloat16 conversion (downcast from accumulation type)
@@ -510,19 +517,26 @@ NCCL_DEVICE_INLINE EltPack<__nv_bfloat16, 1> castPack(EltPack<float, 1> x) {
 
 template<>
 NCCL_DEVICE_INLINE EltPack<__nv_bfloat16, 2> castPack(EltPack<float, 2> x) {
-  union Bf162PackAccess {
-    EltPack<__nv_bfloat16, 2> pack;
-    __nv_bfloat162 pair;
-  };
-  union Float2PackAccess {
-    EltPack<float, 2> pack;
-    float2 pair;
-  };
-  Float2PackAccess in;
-  Bf162PackAccess out;
-  in.pack = x;
-  out.pair = __float22bfloat162_rn(in.pair);
-  return out.pack;
+  #if __CUDA_ARCH__ >= 800
+    union Bf162PackAccess {
+      EltPack<__nv_bfloat16, 2> pack;
+      __nv_bfloat162 pair;
+    };
+    union Float2PackAccess {
+      EltPack<float, 2> pack;
+      float2 pair;
+    };
+    Float2PackAccess in;
+    Bf162PackAccess out;
+    in.pack = x;
+    out.pair = __float22bfloat162_rn(in.pair);
+    return out.pack;
+  #else
+    EltPack<__nv_bfloat16, 2> out{};
+    out.elts()[0] = __float2bfloat16_rn(x.elts()[0]);
+    out.elts()[1] = __float2bfloat16_rn(x.elts()[1]);
+    return out;
+  #endif
 }
 #endif
 
@@ -864,4 +878,3 @@ NCCL_DEVICE_INLINE EltPack<__nv_bfloat16, 2> reducePack(OpSum<__nv_bfloat16> con
 #endif // NCCL_CHECK_CUDACC
 
 #endif // _NCCL_DEVICE_VECTOR__FUNCS_H_
-
