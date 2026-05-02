@@ -26,6 +26,10 @@ PROGRESS_BINS = 50
 SAMPLED_PROGRESS_BINS = (10, 20, 30)
 
 
+def reporter_log(message: str) -> None:
+    print(f"[phase1-reporter] {message}", flush=True)
+
+
 @dataclass
 class RepeatData:
     mode: str
@@ -1500,6 +1504,10 @@ def build_report(run_root: Path, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     experiment_sections: List[str] = []
 
+    reporter_log(f"load run root={run_root}")
+    reporter_log(f"discovered experiments={len(discovered)} output_dir={output_dir}")
+
+    reporter_log("build root summary plots")
     root_plots = [
         (
             "STOCK vs W Latency",
@@ -1519,20 +1527,39 @@ def build_report(run_root: Path, output_dir: Path) -> None:
 
     for experiment in sorted(discovered.keys(), key=experiment_sort_key):
         mode_repeats = discovered[experiment]
+        reporter_log(f"build experiment start experiment={experiment} modes={len(mode_repeats)}")
         latency_box = plot_summary_box(experiment, mode_repeats, output_dir, "latency_median_ms")
+        reporter_log(f"plot done experiment={experiment} file={latency_box}")
         throughput_box = plot_summary_box(experiment, mode_repeats, output_dir, "throughput_median_gbps")
+        reporter_log(f"plot done experiment={experiment} file={throughput_box}")
         step_latency = plot_step_overlay(experiment, mode_repeats, output_dir, "latency_ms")
+        reporter_log(f"plot done experiment={experiment} file={step_latency}")
         step_throughput = plot_step_overlay(experiment, mode_repeats, output_dir, "throughput_gbps")
+        reporter_log(f"plot done experiment={experiment} file={step_throughput}")
         delta_vs_stock = plot_delta_vs_stock(experiment, mode_repeats, output_dir)
+        reporter_log(f"plot done experiment={experiment} file={delta_vs_stock}")
         latency_vs_w = plot_vs_w_lines(experiment, mode_repeats, output_dir, "latency_median_ms")
+        reporter_log(f"plot done experiment={experiment} file={latency_vs_w}")
         throughput_vs_w = plot_vs_w_lines(experiment, mode_repeats, output_dir, "throughput_median_gbps")
+        reporter_log(f"plot done experiment={experiment} file={throughput_vs_w}")
         cts_worker_volume = plot_cts_post_volume_by_worker_vs_w(experiment, mode_repeats, output_dir)
+        reporter_log(f"plot done experiment={experiment} file={cts_worker_volume}")
         gate_effect = plot_post_receive_gate_effect_vs_w(experiment, mode_repeats, output_dir)
+        reporter_log(f"plot done experiment={experiment} file={gate_effect}")
         cts_progress = plot_cts_progress_by_w(experiment, mode_repeats, output_dir)
+        reporter_log(f"plot done experiment={experiment} file={cts_progress}")
         exact_step_cts = plot_exact_step_cts_vs_w(experiment, mode_repeats, output_dir)
+        for filename in exact_step_cts:
+            reporter_log(f"plot done experiment={experiment} file={filename}")
         exact_step_channels = plot_exact_step_channel_volume(experiment, mode_repeats, output_dir)
+        for filename in exact_step_channels:
+            reporter_log(f"plot done experiment={experiment} file={filename}")
         throughput_bar_all, throughput_bar_selected = plot_step_throughput_selected_modes(experiment, mode_repeats, output_dir)
+        reporter_log(f"plot done experiment={experiment} file={throughput_bar_all}")
+        reporter_log(f"plot done experiment={experiment} file={throughput_bar_selected}")
         channel_files = plot_cts_channel_volume_for_bins(experiment, mode_repeats, output_dir)
+        for filename in channel_files:
+            reporter_log(f"plot done experiment={experiment} file={filename}")
         summary_table = build_experiment_table(experiment, mode_repeats)
 
         exact_step_html = "".join(
@@ -1577,8 +1604,11 @@ def build_report(run_root: Path, output_dir: Path) -> None:
             </section>
             """
         )
+        reporter_log(f"build experiment end experiment={experiment}")
 
+    reporter_log("write html report")
     generate_html(run_root, output_dir, root_plots, experiment_sections, build_root_meta_html(run_root))
+    reporter_log(f"done html={output_dir / 'phase1_report.html'}")
 
 
 def main() -> None:
