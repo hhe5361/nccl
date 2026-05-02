@@ -17,6 +17,7 @@
 #include "transport.h"
 #include "shm.h"
 #include "compiler.h"
+#include "utils.h"
 #include <assert.h>
 #include <cmath>
 #include <cstdlib>
@@ -708,12 +709,26 @@ static inline void phase1InflightLogEvent(struct ncclProxyState* proxyState, str
     const char* eventName, const char* phase, const char* stallReason, int slot, int maxDepth, double configuredW,
     int inflightNow, int allowProbabilisticBoundary) {
   if (phase1InflightLogEnabled() == 0) return;
+  struct timespec tsReal;
+  clockRealtime(&tsReal);
+  uint64_t tsUnixNs = (uint64_t)tsReal.tv_sec * 1000000000ull + (uint64_t)tsReal.tv_nsec;
+  uint64_t tsMonoNs = clockNano();
+  int sliceSteps = std::max(1, args->sliceSteps);
+  int logicalPosted = (int)(sub->posted / sliceSteps);
+  int logicalReceived = (int)(sub->received / sliceSteps);
+  int logicalTransmitted = (int)(sub->transmitted / sliceSteps);
+  int logicalDone = (int)(sub->done / sliceSteps);
   INFO(NCCL_NET,
-      "PHASE1 event=%s phase=%s rank=%d peer=%d channel=%d slot=%d coll=%u algo=%u proto=%u "
-      "posted=%llu received=%llu transmitted=%llu done=%llu occPd=%d occPr=%d occTr=%d maxDepth=%d "
-      "wCfg=%.3f allowBoundary=%d stallReason=%s sliceSteps=%d chunkSteps=%d nsubs=%d",
-      eventName, phase, proxyState->tpRank, sub->peer, sub->channelId, slot, args->collAPI, args->algorithm, args->protocol,
+      "PHASE1 event=%s phase=%s ts_unix_ns=%llu ts_mono_ns=%llu rank=%d peer=%d channel=%d slot=%d "
+      "coll=%u algo=%u proto=%u base=%llu nsteps=%llu posted=%llu received=%llu transmitted=%llu done=%llu "
+      "logicalPosted=%d logicalReceived=%d logicalTransmitted=%d logicalDone=%d occPd=%d occPr=%d occTr=%d "
+      "maxDepth=%d wCfg=%.3f allowBoundary=%d stallReason=%s sliceSteps=%d chunkSteps=%d nsubs=%d",
+      eventName, phase, (unsigned long long)tsUnixNs, (unsigned long long)tsMonoNs,
+      proxyState->tpRank, sub->peer, sub->channelId, slot,
+      args->collAPI, args->algorithm, args->protocol,
+      (unsigned long long)sub->base, (unsigned long long)sub->nsteps,
       (unsigned long long)sub->posted, (unsigned long long)sub->received, (unsigned long long)sub->transmitted, (unsigned long long)sub->done,
+      logicalPosted, logicalReceived, logicalTransmitted, logicalDone,
       (int)(sub->posted - sub->done), inflightNow, (int)(sub->transmitted - sub->received), maxDepth, configuredW,
       allowProbabilisticBoundary, stallReason ? stallReason : "-", args->sliceSteps, args->chunkSteps, args->nsubs);
 }

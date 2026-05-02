@@ -4,8 +4,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import statistics
+from collections import Counter, defaultdict
 from dataclasses import dataclass
+from functools import lru_cache
 from html import escape
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -13,17 +16,79 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import matplotlib.pyplot as plt
 
 
+PHASE1_EVENT_RE = re.compile(r"PHASE1 event=(?P<event>\S+) (?P<body>.*)")
+LOG_TS_PATTERNS = (
+    re.compile(r"(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)"),
+    re.compile(r"(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)"),
+)
+KV_RE = re.compile(r"([A-Za-z0-9_]+)=([^ ]+)")
+PROGRESS_BINS = 50
+SAMPLED_PROGRESS_BINS = (10, 20, 30)
+
+
 @dataclass
 class RepeatData:
     mode: str
     experiment: str
     repeat_name: str
+    repeat_index: int
     worker: str
     rank: int
     payload_mb: float
+    worker_dir: Path
+    repeat_dir: Path
     summary_path: Path
     trace_path: Path
+    launcher_log_path: Path
     validation_path: Optional[Path]
+
+
+@dataclass
+class Phase1Event:
+    event: str
+    phase: str
+    rank: int
+    peer: int
+    channel: int
+    slot: int
+    posted: int
+    received: int
+    transmitted: int
+    done: int
+    occ_pd: int
+    occ_pr: int
+    occ_tr: int
+    max_depth: int
+    w_cfg: float
+    allow_boundary: int
+    stall_reason: str
+    slice_steps: int
+    chunk_steps: int
+    nsubs: int
+    log_ts: Optional[str]
+
+
+@dataclass
+class RepeatSwitchMetrics:
+    total_delta: Optional[float]
+    severity: Optional[float]
+    per_switch_delta: Dict[str, float]
+
+
+@dataclass
+class RepeatCtsMetrics:
+    total_posts: int
+    total_wstalls: int
+    wstall_by_reason: Dict[str, int]
+    mean_occ_pr_at_post: Optional[float]
+    mean_occ_pr_at_wstall: Optional[float]
+    posts_by_worker: Dict[str, int]
+    posts_by_channel: Dict[int, int]
+    progress_post_counts: List[int]
+    progress_occ_pr: List[Optional[float]]
+    progress_channel_counts: Dict[int, Dict[int, int]]
+    configured_w: Optional[float]
+    observed_max_occ_pr: Optional[float]
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,13 +109,24 @@ def mode_sort_key(mode: str) -> Tuple[int, float, str]:
     return (2, math.inf, mode)
 
 
+def experiment_sort_key(experiment: str) -> Tuple[int, str]:
+    order = {
+        "allreduce_ring": 0,
+        "allreduce_tree": 1,
+        "treeallreduce": 1,
+        "alltoall": 2,
+        "alltoall_auto": 2,
+    }
+    return (order.get(experiment, 99), experiment)
+
+
 def safe_median(values: Iterable[float]) -> Optional[float]:
-    vals = list(values)
+    vals = [float(v) for v in values if v is not None]
     return statistics.median(vals) if vals else None
 
 
 def safe_mean(values: Iterable[float]) -> Optional[float]:
-    vals = list(values)
+    vals = [float(v) for v in values if v is not None]
     return statistics.mean(vals) if vals else None
 
 
@@ -69,7 +145,7 @@ def percentile(sorted_values: List[float], p: float) -> Optional[float]:
 
 
 def iqr_bounds(values: Iterable[float]) -> Tuple[Optional[float], Optional[float]]:
-    vals = sorted(values)
+    vals = sorted(float(v) for v in values if v is not None)
     return percentile(vals, 0.25), percentile(vals, 0.75)
 
 
@@ -80,41 +156,73 @@ def throughput_gbps(payload_mb: float, duration_ms: float) -> float:
     return payload_bytes / (duration_ms / 1000.0) / 1e9
 
 
+def parse_repeat_index(repeat_name: str) -> int:
+    m = re.search(r"(\d+)$", repeat_name)
+    return int(m.group(1)) if m else 0
+
+
+def parse_mode_w(mode: str) -> Optional[float]:
+    if mode.startswith("W"):
+        try:
+            return float(mode[1:].replace("_", "."))
+        except ValueError:
+            return None
+    return None
+
+
+def fmt_float(value: Optional[float], digits: int = 3) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.{digits}f}"
+
+
+def read_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def discover_runs(run_root: Path) -> Dict[str, Dict[str, Dict[str, List[RepeatData]]]]:
     discovered: Dict[str, Dict[str, Dict[str, List[RepeatData]]]] = {}
-    for mode_dir in sorted(p for p in run_root.iterdir() if p.is_dir()):
+    for mode_dir in sorted((p for p in run_root.iterdir() if p.is_dir()), key=lambda p: mode_sort_key(p.name)):
         mode = mode_dir.name
-        for experiment_dir in sorted(p for p in mode_dir.iterdir() if p.is_dir()):
+        for experiment_dir in sorted((p for p in mode_dir.iterdir() if p.is_dir()), key=lambda p: experiment_sort_key(p.name)):
             experiment = experiment_dir.name
-            for repeat_dir in sorted(p for p in experiment_dir.iterdir() if p.is_dir()):
+            for repeat_dir in sorted((p for p in experiment_dir.iterdir() if p.is_dir())):
                 validation_path = repeat_dir / "stock_probe_validation.json"
+                repeat_index = parse_repeat_index(repeat_dir.name)
                 for worker_dir in sorted(p for p in repeat_dir.iterdir() if p.is_dir() and p.name.startswith("worker")):
                     summary_files = sorted(worker_dir.glob("rank*_summary.json"))
                     trace_files = sorted(worker_dir.glob("rank*_step_trace.jsonl"))
+                    launcher_log_path = worker_dir / "worker_launcher.log"
                     if not summary_files or not trace_files:
                         continue
                     summary_path = summary_files[0]
                     trace_path = trace_files[0]
                     rank_str = summary_path.stem.split("_", 1)[0].replace("rank", "")
                     rank = int(rank_str)
-                    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                    summary = read_json(summary_path)
                     payload_mb = float(summary.get("payload_mb", 0))
                     repeat_data = RepeatData(
                         mode=mode,
                         experiment=experiment,
                         repeat_name=repeat_dir.name,
+                        repeat_index=repeat_index,
                         worker=worker_dir.name,
                         rank=rank,
                         payload_mb=payload_mb,
+                        worker_dir=worker_dir,
+                        repeat_dir=repeat_dir,
                         summary_path=summary_path,
                         trace_path=trace_path,
+                        launcher_log_path=launcher_log_path,
                         validation_path=validation_path if validation_path.exists() else None,
                     )
                     discovered.setdefault(experiment, {}).setdefault(mode, {}).setdefault(repeat_dir.name, []).append(repeat_data)
     return discovered
 
 
-def load_trace(path: Path) -> List[dict]:
+@lru_cache(maxsize=None)
+def load_trace(path_str: str) -> List[dict]:
+    path = Path(path_str)
     rows: List[dict] = []
     with path.open("r", encoding="utf-8") as fp:
         for line in fp:
@@ -124,11 +232,64 @@ def load_trace(path: Path) -> List[dict]:
     return rows
 
 
+def extract_log_ts(line: str) -> Optional[str]:
+    for pattern in LOG_TS_PATTERNS:
+        m = pattern.search(line)
+        if m:
+            return m.group("ts")
+    return None
+
+
+@lru_cache(maxsize=None)
+def load_phase1_events(path_str: str) -> List[Phase1Event]:
+    path = Path(path_str)
+    if not path.exists():
+        return []
+    events: List[Phase1Event] = []
+    with path.open("r", encoding="utf-8", errors="replace") as fp:
+        for raw_line in fp:
+            line = raw_line.strip()
+            m = PHASE1_EVENT_RE.search(line)
+            if not m:
+                continue
+            body = m.group("body")
+            kv = {match.group(1): match.group(2) for match in KV_RE.finditer(body)}
+            try:
+                events.append(
+                    Phase1Event(
+                        event=m.group("event"),
+                        phase=kv.get("phase", "-"),
+                        rank=int(kv.get("rank", "0")),
+                        peer=int(kv.get("peer", "0")),
+                        channel=int(kv.get("channel", "0")),
+                        slot=int(kv.get("slot", "0")),
+                        posted=int(kv.get("posted", "0")),
+                        received=int(kv.get("received", "0")),
+                        transmitted=int(kv.get("transmitted", "0")),
+                        done=int(kv.get("done", "0")),
+                        occ_pd=int(kv.get("occPd", "0")),
+                        occ_pr=int(kv.get("occPr", "0")),
+                        occ_tr=int(kv.get("occTr", "0")),
+                        max_depth=int(kv.get("maxDepth", "0")),
+                        w_cfg=float(kv.get("wCfg", "0")),
+                        allow_boundary=int(kv.get("allowBoundary", "0")),
+                        stall_reason=kv.get("stallReason", "-"),
+                        slice_steps=int(kv.get("sliceSteps", "0")),
+                        chunk_steps=int(kv.get("chunkSteps", "0")),
+                        nsubs=int(kv.get("nsubs", "0")),
+                        log_ts=extract_log_ts(line),
+                    )
+                )
+            except ValueError:
+                continue
+    return events
+
+
 def per_repeat_step_series(repeat_items: List[RepeatData]) -> Dict[int, Dict[str, float]]:
     by_step: Dict[int, Dict[str, List[float]]] = {}
     payload_mb = repeat_items[0].payload_mb if repeat_items else 0.0
     for item in repeat_items:
-        for row in load_trace(item.trace_path):
+        for row in load_trace(str(item.trace_path)):
             if row.get("phase") != "steady":
                 continue
             step_idx = int(row["step_index"])
@@ -151,7 +312,7 @@ def per_repeat_overall(repeat_items: List[RepeatData]) -> Dict[str, float]:
     throughputs: List[float] = []
     payload_mb = repeat_items[0].payload_mb if repeat_items else 0.0
     for item in repeat_items:
-        for row in load_trace(item.trace_path):
+        for row in load_trace(str(item.trace_path)):
             if row.get("phase") != "steady":
                 continue
             latency_ms = float(row["duration_ms"])
@@ -170,7 +331,7 @@ def per_repeat_overall(repeat_items: List[RepeatData]) -> Dict[str, float]:
 def summarize_validation(validation_path: Optional[Path]) -> Tuple[str, str]:
     if validation_path is None or not validation_path.exists():
         return ("-", "no validation file")
-    payload = json.loads(validation_path.read_text(encoding="utf-8"))
+    payload = read_json(validation_path)
     ok = bool(payload.get("ok", False))
     workers = payload.get("workers", [])
     failed = [w.get("worker", "?") for w in workers if not w.get("ok", False)]
@@ -178,14 +339,254 @@ def summarize_validation(validation_path: Optional[Path]) -> Tuple[str, str]:
 
 
 def make_mode_palette(modes: List[str]) -> Dict[str, str]:
-    base = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+    base = [
+        "#1f77b4",
+        "#ff7f0e",
+        "#2ca02c",
+        "#d62728",
+        "#9467bd",
+        "#8c564b",
+        "#e377c2",
+        "#7f7f7f",
+        "#bcbd22",
+        "#17becf",
+    ]
     palette: Dict[str, str] = {}
-    for idx, mode in enumerate(modes):
+    offset = 0
+    for mode in modes:
         if mode == "STOCK":
             palette[mode] = "#222222"
         else:
-            palette[mode] = base[idx % len(base)]
+            palette[mode] = base[offset % len(base)]
+            offset += 1
     return palette
+
+
+def parse_env_file(path: Path) -> Dict[str, str]:
+    data: Dict[str, str] = {}
+    if not path.exists():
+        return data
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        data[key.strip()] = value.strip().strip("'").strip('"')
+    return data
+
+
+def parse_marker_message(message: str) -> Dict[str, str]:
+    return {match.group(1): match.group(2) for match in KV_RE.finditer(message)}
+
+
+@lru_cache(maxsize=None)
+def load_switch_windows(switch_log_dir_str: str) -> Dict[Tuple[str, str, int], Tuple[Optional[int], Optional[int]]]:
+    switch_log_dir = Path(switch_log_dir_str)
+    markers_path = switch_log_dir / "markers.jsonl"
+    windows: Dict[Tuple[str, str, int], Dict[str, Optional[int]]] = defaultdict(lambda: {"start": None, "end": None})
+    if not markers_path.exists():
+        return {}
+    with markers_path.open("r", encoding="utf-8") as fp:
+        for line in fp:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            marker = row.get("marker")
+            if marker not in {"mode_start", "mode_end"}:
+                continue
+            fields = parse_marker_message(str(row.get("message", "")))
+            experiment = fields.get("experiment")
+            mode = fields.get("mode")
+            repeat = fields.get("repeat")
+            if not experiment or not mode or not repeat:
+                continue
+            try:
+                repeat_index = int(repeat)
+            except ValueError:
+                continue
+            key = (experiment, mode, repeat_index)
+            if marker == "mode_start":
+                windows[key]["start"] = int(row.get("ts_unix_ns", 0))
+            else:
+                windows[key]["end"] = int(row.get("ts_unix_ns", 0))
+    return {key: (value["start"], value["end"]) for key, value in windows.items()}
+
+
+@lru_cache(maxsize=None)
+def load_switch_aggregates(switch_log_dir_str: str) -> Dict[str, List[dict]]:
+    switch_log_dir = Path(switch_log_dir_str)
+    samples_by_switch: Dict[str, List[dict]] = defaultdict(list)
+    for path in sorted(switch_log_dir.glob("*_pfc_aggregate.jsonl")):
+        with path.open("r", encoding="utf-8") as fp:
+            for line in fp:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                switch_name = str(row.get("switch", path.stem))
+                samples_by_switch[switch_name].append(row)
+    for switch_name in samples_by_switch:
+        samples_by_switch[switch_name].sort(key=lambda row: int(row.get("ts_mid_unix_ns", 0)))
+    return dict(samples_by_switch)
+
+
+def switch_metrics_for_interval(samples_by_switch: Dict[str, List[dict]], start_ns: int, end_ns: int) -> RepeatSwitchMetrics:
+    per_switch_delta: Dict[str, float] = {}
+    severities: List[float] = []
+    for switch_name, samples in samples_by_switch.items():
+        if not samples:
+            continue
+        before = None
+        inside = []
+        prev = None
+        max_burst = 0.0
+        for row in samples:
+            ts = int(row.get("ts_mid_unix_ns", 0))
+            value = row.get("rx_pause_total")
+            if value is None:
+                prev = row
+                continue
+            value = float(value)
+            if ts < start_ns:
+                before = row
+            if start_ns <= ts <= end_ns:
+                inside.append(row)
+                if prev is not None:
+                    prev_val = prev.get("rx_pause_total")
+                    if prev_val is not None:
+                        max_burst = max(max_burst, value - float(prev_val))
+            prev = row
+        if not inside:
+            continue
+        start_row = before or inside[0]
+        end_row = inside[-1]
+        start_val = start_row.get("rx_pause_total")
+        end_val = end_row.get("rx_pause_total")
+        if start_val is None or end_val is None:
+            continue
+        delta = max(0.0, float(end_val) - float(start_val))
+        per_switch_delta[switch_name] = delta
+        severities.append(max(0.0, max_burst))
+    if not per_switch_delta:
+        return RepeatSwitchMetrics(total_delta=None, severity=None, per_switch_delta={})
+    return RepeatSwitchMetrics(
+        total_delta=sum(per_switch_delta.values()),
+        severity=sum(severities) if severities else None,
+        per_switch_delta=per_switch_delta,
+    )
+
+
+@lru_cache(maxsize=None)
+def load_repeat_switch_metrics(repeat_dir_str: str, experiment: str, mode: str, repeat_index: int) -> RepeatSwitchMetrics:
+    repeat_dir = Path(repeat_dir_str)
+    meta = parse_env_file(repeat_dir / "switch_logger_meta.env")
+    switch_log_dir = meta.get("SWITCH_LOG_DIR")
+    if not switch_log_dir:
+        return RepeatSwitchMetrics(total_delta=None, severity=None, per_switch_delta={})
+    windows = load_switch_windows(switch_log_dir)
+    window = windows.get((experiment, mode, repeat_index))
+    if not window or window[0] is None or window[1] is None:
+        return RepeatSwitchMetrics(total_delta=None, severity=None, per_switch_delta={})
+    samples_by_switch = load_switch_aggregates(switch_log_dir)
+    return switch_metrics_for_interval(samples_by_switch, int(window[0]), int(window[1]))
+
+
+def build_progress_bins(events: List[Phase1Event], bins: int = PROGRESS_BINS) -> Tuple[List[int], List[Optional[float]], Dict[int, Dict[int, int]]]:
+    posts = [event for event in events if event.event == "PROXY_RECV_POST" and event.phase == "steady"]
+    if not posts:
+        return [0] * bins, [None] * bins, {idx: {} for idx in range(bins)}
+    counts = [0] * bins
+    occ_pr_by_bin: List[List[float]] = [[] for _ in range(bins)]
+    channel_counts: Dict[int, Dict[int, int]] = {idx: defaultdict(int) for idx in range(bins)}
+    total = len(posts)
+    for idx, event in enumerate(posts):
+        bin_idx = min(bins - 1, int(idx * bins / total))
+        counts[bin_idx] += 1
+        occ_pr_by_bin[bin_idx].append(float(event.occ_pr))
+        channel_counts[bin_idx][event.channel] += 1
+    occ_pr = [safe_median(values) for values in occ_pr_by_bin]
+    return counts, occ_pr, {idx: dict(counter) for idx, counter in channel_counts.items()}
+
+
+@lru_cache(maxsize=None)
+def load_repeat_cts_metrics(repeat_dir_str: str, experiment: str, mode: str, repeat_name: str) -> RepeatCtsMetrics:
+    repeat_dir = Path(repeat_dir_str)
+    posts_by_worker: Dict[str, int] = {}
+    posts_by_channel: Counter[int] = Counter()
+    progress_post_counts = [0] * PROGRESS_BINS
+    progress_occ_pr_lists: List[List[float]] = [[] for _ in range(PROGRESS_BINS)]
+    progress_channel_counts: Dict[int, Counter[int]] = {idx: Counter() for idx in range(PROGRESS_BINS)}
+    total_posts = 0
+    total_wstalls = 0
+    wstall_by_reason: Counter[str] = Counter()
+    occ_pr_at_post: List[float] = []
+    occ_pr_at_wstall: List[float] = []
+    configured_ws: List[float] = []
+    observed_max_occ_pr: Optional[float] = None
+
+    for worker_dir in sorted(p for p in repeat_dir.iterdir() if p.is_dir() and p.name.startswith("worker")):
+        log_path = worker_dir / "worker_launcher.log"
+        events = load_phase1_events(str(log_path))
+        post_events = [event for event in events if event.event == "PROXY_RECV_POST" and event.phase == "steady"]
+        wstall_events = [event for event in events if event.event == "PROXY_RECV_WSTALL" and event.phase == "steady"]
+        posts_by_worker[worker_dir.name] = len(post_events)
+        total_posts += len(post_events)
+        total_wstalls += len(wstall_events)
+        for event in post_events:
+            posts_by_channel[event.channel] += 1
+            occ_pr_at_post.append(float(event.occ_pr))
+            observed_max_occ_pr = max(observed_max_occ_pr or float(event.occ_pr), float(event.occ_pr))
+            if event.w_cfg > 0:
+                configured_ws.append(event.w_cfg)
+        for event in wstall_events:
+            occ_pr_at_wstall.append(float(event.occ_pr))
+            wstall_by_reason[event.stall_reason] += 1
+            if event.w_cfg > 0:
+                configured_ws.append(event.w_cfg)
+
+        counts, occ_pr_bins, channel_bins = build_progress_bins(events)
+        for idx in range(PROGRESS_BINS):
+            progress_post_counts[idx] += counts[idx]
+            if occ_pr_bins[idx] is not None:
+                progress_occ_pr_lists[idx].append(float(occ_pr_bins[idx]))
+            for channel, count in channel_bins[idx].items():
+                progress_channel_counts[idx][channel] += count
+
+    progress_occ_pr = [safe_median(values) for values in progress_occ_pr_lists]
+    return RepeatCtsMetrics(
+        total_posts=total_posts,
+        total_wstalls=total_wstalls,
+        wstall_by_reason=dict(wstall_by_reason),
+        mean_occ_pr_at_post=safe_mean(occ_pr_at_post),
+        mean_occ_pr_at_wstall=safe_mean(occ_pr_at_wstall),
+        posts_by_worker=posts_by_worker,
+        posts_by_channel=dict(posts_by_channel),
+        progress_post_counts=progress_post_counts,
+        progress_occ_pr=progress_occ_pr,
+        progress_channel_counts={idx: dict(counter) for idx, counter in progress_channel_counts.items()},
+        configured_w=safe_median(configured_ws),
+        observed_max_occ_pr=observed_max_occ_pr,
+    )
+
+
+def mode_metrics_for_experiment(mode_repeats: Dict[str, Dict[str, List[RepeatData]]], metric: str) -> Dict[str, List[float]]:
+    values: Dict[str, List[float]] = {}
+    for mode, repeats in mode_repeats.items():
+        values[mode] = [per_repeat_overall(items)[metric] for _, items in sorted(repeats.items())]
+    return values
+
+
+def mode_switch_metrics_for_experiment(experiment: str, mode_repeats: Dict[str, Dict[str, List[RepeatData]]], metric: str) -> Dict[str, List[float]]:
+    values: Dict[str, List[float]] = defaultdict(list)
+    for mode, repeats in mode_repeats.items():
+        for repeat_name, items in sorted(repeats.items()):
+            sample = items[0]
+            switch_metrics = load_repeat_switch_metrics(str(sample.repeat_dir), experiment, mode, sample.repeat_index)
+            value = switch_metrics.total_delta if metric == "total_delta" else switch_metrics.severity
+            if value is not None:
+                values[mode].append(value)
+    return dict(values)
 
 
 def plot_step_overlay(experiment: str, mode_repeats: Dict[str, Dict[str, List[RepeatData]]], output_dir: Path, metric: str) -> str:
@@ -241,7 +642,7 @@ def plot_summary_box(experiment: str, mode_repeats: Dict[str, Dict[str, List[Rep
         labels.append(mode)
         colors.append(palette[mode])
 
-    box = ax.boxplot(series, patch_artist=True, labels=labels, showmeans=True)
+    box = ax.boxplot(series, patch_artist=True, tick_labels=labels, showmeans=True)
     for patch, color in zip(box["boxes"], colors):
         patch.set_facecolor(color)
         patch.set_alpha(0.45)
@@ -344,6 +745,218 @@ def plot_vs_w_lines(experiment: str, mode_repeats: Dict[str, Dict[str, List[Repe
     return filename
 
 
+def plot_step_throughput_selected_modes(experiment: str, mode_repeats: Dict[str, Dict[str, List[RepeatData]]], output_dir: Path) -> Tuple[str, str]:
+    modes_all = sorted(mode_repeats.keys(), key=mode_sort_key)
+    selected = [mode for mode in ("STOCK", "W2_0", "W4_0") if mode in mode_repeats]
+    if len(selected) < 2:
+        selected = modes_all[: min(3, len(modes_all))]
+    palette = make_mode_palette(selected)
+
+    def _make_plot(modes: List[str], filename: str, title: str) -> str:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        width = 0.26
+        base_steps = None
+        for idx, mode in enumerate(modes):
+            repeat_series = [per_repeat_step_series(items) for _, items in sorted(mode_repeats[mode].items())]
+            steps = sorted({step for series in repeat_series for step in series.keys()})
+            if base_steps is None:
+                base_steps = steps
+            vals = []
+            for step_idx in steps:
+                per_repeat_vals = [series[step_idx]["throughput_gbps"] for series in repeat_series if step_idx in series]
+                vals.append(safe_median(per_repeat_vals) or 0.0)
+            xs = [step + (idx - (len(modes) - 1) / 2.0) * width for step in steps]
+            ax.bar(xs, vals, width=width, label=mode, color=palette[mode], alpha=0.8)
+        ax.set_title(title)
+        ax.set_xlabel("Step Index")
+        ax.set_ylabel("Throughput (GB/s)")
+        ax.grid(True, axis="y", alpha=0.25)
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(output_dir / filename, dpi=160)
+        plt.close(fig)
+        return filename
+
+    all_modes_plot = _make_plot(
+        [mode for mode in modes_all if mode.startswith("W")] or modes_all,
+        f"{experiment}_step_throughput_by_w_bar.png",
+        f"{experiment} Step Throughput by W",
+    )
+    selected_plot = _make_plot(
+        selected,
+        f"{experiment}_step_throughput_by_w_bar_stock_w2_w4.png",
+        f"{experiment} Step Throughput Comparison (STOCK, W2, W4)",
+    )
+    return all_modes_plot, selected_plot
+
+
+def plot_cts_post_volume_by_worker_vs_w(experiment: str, mode_repeats: Dict[str, Dict[str, List[RepeatData]]], output_dir: Path) -> str:
+    modes = sorted([mode for mode in mode_repeats if mode.startswith("W")], key=mode_sort_key)
+    worker_names = sorted({item.worker for repeats in mode_repeats.values() for items in repeats.values() for item in items})
+    fig, ax = plt.subplots(figsize=(14, 7))
+    width = 0.8 / max(1, len(worker_names))
+    palette = plt.cm.tab20.colors
+
+    xs = [parse_mode_w(mode) or 0.0 for mode in modes]
+    index_positions = list(range(len(xs)))
+    for worker_idx, worker_name in enumerate(worker_names):
+        vals = []
+        for mode in modes:
+            per_repeat_counts = []
+            for repeat_name, items in sorted(mode_repeats[mode].items()):
+                sample = items[0]
+                metrics = load_repeat_cts_metrics(str(sample.repeat_dir), experiment, mode, repeat_name)
+                per_repeat_counts.append(metrics.posts_by_worker.get(worker_name, 0))
+            vals.append(safe_median(per_repeat_counts) or 0.0)
+        offsets = [x + (worker_idx - (len(worker_names) - 1) / 2.0) * width for x in index_positions]
+        ax.bar(offsets, vals, width=width, label=worker_name, color=palette[worker_idx % len(palette)], alpha=0.85)
+    ax.set_xticks(index_positions)
+    ax.set_xticklabels([f"{x:g}" for x in xs], rotation=45, ha="right")
+    ax.set_xlabel("Configured W")
+    ax.set_ylabel("Median CTS/POST Count")
+    ax.set_title(f"{experiment} CTS/POST Volume by Worker vs W")
+    ax.grid(True, axis="y", alpha=0.25)
+    ax.legend(ncol=4, fontsize=8)
+    fig.tight_layout()
+    filename = f"{experiment}_cts_post_volume_by_worker_vs_w.png"
+    fig.savefig(output_dir / filename, dpi=160)
+    plt.close(fig)
+    return filename
+
+
+def plot_post_receive_gate_effect_vs_w(experiment: str, mode_repeats: Dict[str, Dict[str, List[RepeatData]]], output_dir: Path) -> str:
+    modes = sorted(mode_repeats.keys(), key=mode_sort_key)
+    palette = make_mode_palette(modes)
+    xs = list(range(len(modes)))
+    posts = []
+    stalls = []
+    stall_ratios = []
+    occ_post = []
+    occ_wstall = []
+    for mode in modes:
+        per_repeat_posts = []
+        per_repeat_stalls = []
+        per_repeat_occ_post = []
+        per_repeat_occ_wstall = []
+        for repeat_name, items in sorted(mode_repeats[mode].items()):
+            sample = items[0]
+            metrics = load_repeat_cts_metrics(str(sample.repeat_dir), experiment, mode, repeat_name)
+            per_repeat_posts.append(metrics.total_posts)
+            per_repeat_stalls.append(metrics.total_wstalls)
+            if metrics.mean_occ_pr_at_post is not None:
+                per_repeat_occ_post.append(metrics.mean_occ_pr_at_post)
+            if metrics.mean_occ_pr_at_wstall is not None:
+                per_repeat_occ_wstall.append(metrics.mean_occ_pr_at_wstall)
+        post_med = safe_median(per_repeat_posts) or 0.0
+        stall_med = safe_median(per_repeat_stalls) or 0.0
+        posts.append(post_med)
+        stalls.append(stall_med)
+        stall_ratios.append(stall_med / max(1.0, post_med + stall_med))
+        occ_post.append(safe_median(per_repeat_occ_post) or 0.0)
+        occ_wstall.append(safe_median(per_repeat_occ_wstall) or 0.0)
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    axes[0].bar(xs, posts, color="#1f77b4", alpha=0.75, label="POST")
+    axes[0].bar(xs, stalls, bottom=posts, color="#d62728", alpha=0.75, label="WSTALL")
+    axes[0].set_ylabel("Median Event Count")
+    axes[0].set_title(f"{experiment} Post-Receive Gate Effect vs W")
+    axes[0].grid(True, axis="y", alpha=0.25)
+    axes[0].legend()
+
+    axes[1].plot(xs, stall_ratios, marker="o", color="#d62728", label="WSTALL ratio")
+    axes[1].plot(xs, occ_post, marker="o", color="#1f77b4", label="occPr at POST")
+    axes[1].plot(xs, occ_wstall, marker="o", color="#9467bd", label="occPr at WSTALL")
+    axes[1].set_ylabel("Ratio / Occupancy")
+    axes[1].set_xticks(xs)
+    axes[1].set_xticklabels(modes, rotation=45, ha="right")
+    axes[1].grid(True, alpha=0.25)
+    axes[1].legend()
+
+    fig.tight_layout()
+    filename = f"{experiment}_post_receive_gate_effect_vs_w.png"
+    fig.savefig(output_dir / filename, dpi=160)
+    plt.close(fig)
+    return filename
+
+
+def plot_cts_progress_by_w(experiment: str, mode_repeats: Dict[str, Dict[str, List[RepeatData]]], output_dir: Path) -> str:
+    modes = sorted(mode_repeats.keys(), key=mode_sort_key)
+    palette = make_mode_palette(modes)
+    fig, ax = plt.subplots(figsize=(12, 6))
+    xs = list(range(PROGRESS_BINS))
+    for mode in modes:
+        per_repeat_bins: List[List[int]] = []
+        for repeat_name, items in sorted(mode_repeats[mode].items()):
+            sample = items[0]
+            metrics = load_repeat_cts_metrics(str(sample.repeat_dir), experiment, mode, repeat_name)
+            per_repeat_bins.append(metrics.progress_post_counts)
+        medians = []
+        lowers = []
+        uppers = []
+        for bin_idx in xs:
+            vals = [float(bins[bin_idx]) for bins in per_repeat_bins]
+            q1, q3 = iqr_bounds(vals)
+            medians.append(safe_median(vals) or 0.0)
+            lowers.append(q1 if q1 is not None else medians[-1])
+            uppers.append(q3 if q3 is not None else medians[-1])
+        ax.plot(xs, medians, linewidth=2, color=palette[mode], label=mode)
+        ax.fill_between(xs, lowers, uppers, color=palette[mode], alpha=0.16)
+    ax.set_title(f"{experiment} CTS/POST Progress-Bin Trace by W")
+    ax.set_xlabel("Normalized Progress Bin (50 bins across steady steps)")
+    ax.set_ylabel("Median POST Count")
+    ax.grid(True, alpha=0.25)
+    ax.legend(ncol=2, fontsize=9)
+    fig.tight_layout()
+    filename = f"{experiment}_cts_progress_by_w.png"
+    fig.savefig(output_dir / filename, dpi=160)
+    plt.close(fig)
+    return filename
+
+
+def plot_cts_channel_volume_for_bins(experiment: str, mode_repeats: Dict[str, Dict[str, List[RepeatData]]], output_dir: Path) -> List[str]:
+    modes = sorted(mode_repeats.keys(), key=mode_sort_key)
+    filenames: List[str] = []
+    for sampled_bin in SAMPLED_PROGRESS_BINS:
+        fig, ax = plt.subplots(figsize=(13, 6))
+        channels = sorted(
+            {
+                channel
+                for mode in modes
+                for repeat_name, items in sorted(mode_repeats[mode].items())
+                for channel in load_repeat_cts_metrics(str(items[0].repeat_dir), experiment, mode, repeat_name).progress_channel_counts.get(sampled_bin, {})
+            }
+        )
+        if not channels:
+            plt.close(fig)
+            continue
+        width = 0.8 / max(1, len(modes))
+        palette = make_mode_palette(modes)
+        for mode_idx, mode in enumerate(modes):
+            vals = []
+            for channel in channels:
+                per_repeat_vals = []
+                for repeat_name, items in sorted(mode_repeats[mode].items()):
+                    sample = items[0]
+                    metrics = load_repeat_cts_metrics(str(sample.repeat_dir), experiment, mode, repeat_name)
+                    per_repeat_vals.append(float(metrics.progress_channel_counts.get(sampled_bin, {}).get(channel, 0)))
+                vals.append(safe_median(per_repeat_vals) or 0.0)
+            xs = [idx + (mode_idx - (len(modes) - 1) / 2.0) * width for idx in range(len(channels))]
+            ax.bar(xs, vals, width=width, color=palette[mode], label=mode, alpha=0.85)
+        ax.set_xticks(list(range(len(channels))))
+        ax.set_xticklabels([f"ch{channel}" for channel in channels])
+        ax.set_title(f"{experiment} CTS Channel Volume at Normalized Progress Bin {sampled_bin}")
+        ax.set_xlabel("Channel")
+        ax.set_ylabel("Median POST Count")
+        ax.grid(True, axis="y", alpha=0.25)
+        ax.legend(ncol=2, fontsize=9)
+        fig.tight_layout()
+        filename = f"{experiment}_cts_channel_volume_step_{sampled_bin}.png"
+        fig.savefig(output_dir / filename, dpi=160)
+        plt.close(fig)
+        filenames.append(filename)
+    return filenames
+
+
 def build_experiment_table(experiment: str, mode_repeats: Dict[str, Dict[str, List[RepeatData]]]) -> str:
     rows = []
     modes = sorted(mode_repeats.keys(), key=mode_sort_key)
@@ -352,15 +965,20 @@ def build_experiment_table(experiment: str, mode_repeats: Dict[str, Dict[str, Li
         lat_medians = [x["latency_median_ms"] for x in per_repeat]
         thr_medians = [x["throughput_median_gbps"] for x in per_repeat]
         lat_p95s = [x["latency_p95_ms"] for x in per_repeat]
-        validation_status, validation_detail = summarize_validation(next(iter(mode_repeats[mode].values()))[0].validation_path if mode_repeats[mode] else None)
+        sample = next(iter(next(iter(mode_repeats[mode].values()))))
+        validation_status, validation_detail = summarize_validation(sample.validation_path)
+        switch_vals = mode_switch_metrics_for_experiment(experiment, {mode: mode_repeats[mode]}, "total_delta").get(mode, [])
+        switch_severity = mode_switch_metrics_for_experiment(experiment, {mode: mode_repeats[mode]}, "severity").get(mode, [])
         rows.append(
             "<tr>"
             f"<td>{escape(mode)}</td>"
             f"<td>{len(per_repeat)}</td>"
-            f"<td>{(safe_median(lat_medians) or 0.0):.3f}</td>"
-            f"<td>{(safe_mean(lat_medians) or 0.0):.3f}</td>"
-            f"<td>{(safe_median(lat_p95s) or 0.0):.3f}</td>"
-            f"<td>{(safe_median(thr_medians) or 0.0):.3f}</td>"
+            f"<td>{fmt_float(safe_median(lat_medians))}</td>"
+            f"<td>{fmt_float(safe_mean(lat_medians))}</td>"
+            f"<td>{fmt_float(safe_median(lat_p95s))}</td>"
+            f"<td>{fmt_float(safe_median(thr_medians))}</td>"
+            f"<td>{fmt_float(safe_median(switch_vals), 1)}</td>"
+            f"<td>{fmt_float(safe_median(switch_severity), 1)}</td>"
             f"<td>{validation_status}</td>"
             f"<td>{escape(validation_detail)}</td>"
             "</tr>"
@@ -369,14 +987,172 @@ def build_experiment_table(experiment: str, mode_repeats: Dict[str, Dict[str, Li
         "<table>"
         "<thead><tr>"
         "<th>Mode</th><th>Repeats</th><th>Median Latency (ms)</th><th>Mean Latency (ms)</th>"
-        "<th>Median p95 Latency (ms)</th><th>Median Throughput (GB/s)</th><th>Validation</th><th>Failed Workers</th>"
+        "<th>Median p95 Latency (ms)</th><th>Median Throughput (GB/s)</th><th>Median PFC Count</th>"
+        "<th>Median PFC Severity</th><th>Validation</th><th>Failed Workers</th>"
         "</tr></thead><tbody>"
         + "".join(rows)
         + "</tbody></table>"
     )
 
 
-def generate_html(run_root: Path, output_dir: Path, experiment_sections: List[str]) -> None:
+def plot_root_stock_vs_w(discovered: Dict[str, Dict[str, Dict[str, List[RepeatData]]]], output_dir: Path, metric: str, filename: str, title: str, ylabel: str) -> str:
+    experiments = sorted(discovered.keys(), key=experiment_sort_key)
+    fig, axes = plt.subplots(len(experiments), 1, figsize=(12, 4 * len(experiments)), sharex=True)
+    if len(experiments) == 1:
+        axes = [axes]
+    for ax, experiment in zip(axes, experiments):
+        mode_repeats = discovered[experiment]
+        stock_vals = [per_repeat_overall(items)[metric] for _, items in sorted(mode_repeats.get("STOCK", {}).items())]
+        stock_baseline = safe_median(stock_vals)
+        w_modes = sorted([mode for mode in mode_repeats if mode.startswith("W")], key=mode_sort_key)
+        xs = [parse_mode_w(mode) or 0.0 for mode in w_modes]
+        ys = []
+        q1s = []
+        q3s = []
+        for mode in w_modes:
+            vals = [per_repeat_overall(items)[metric] for _, items in sorted(mode_repeats[mode].items())]
+            q1, q3 = iqr_bounds(vals)
+            ys.append(safe_median(vals) or 0.0)
+            q1s.append(q1 if q1 is not None else ys[-1])
+            q3s.append(q3 if q3 is not None else ys[-1])
+        if stock_baseline is not None:
+            ax.axhline(stock_baseline, color="#222222", linestyle="--", linewidth=1.5, label="STOCK median")
+        ax.plot(xs, ys, marker="o", color="#1f77b4", linewidth=2, label="W sweep")
+        ax.fill_between(xs, q1s, q3s, color="#1f77b4", alpha=0.16)
+        ax.set_title(experiment)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.25)
+        ax.legend(loc="best")
+    axes[-1].set_xlabel("W")
+    fig.suptitle(title, y=0.995)
+    fig.tight_layout()
+    fig.savefig(output_dir / filename, dpi=160)
+    plt.close(fig)
+    return filename
+
+
+def plot_root_stock_vs_w_pfc(discovered: Dict[str, Dict[str, Dict[str, List[RepeatData]]]], output_dir: Path) -> str:
+    experiments = sorted(discovered.keys(), key=experiment_sort_key)
+    fig, axes = plt.subplots(len(experiments), 1, figsize=(12, 4 * len(experiments)), sharex=True)
+    if len(experiments) == 1:
+        axes = [axes]
+    for ax, experiment in zip(axes, experiments):
+        mode_repeats = discovered[experiment]
+        stock_vals = mode_switch_metrics_for_experiment(experiment, {"STOCK": mode_repeats.get("STOCK", {})}, "total_delta").get("STOCK", [])
+        stock_baseline = safe_median(stock_vals)
+        w_modes = sorted([mode for mode in mode_repeats if mode.startswith("W")], key=mode_sort_key)
+        xs = [parse_mode_w(mode) or 0.0 for mode in w_modes]
+        ys = []
+        q1s = []
+        q3s = []
+        for mode in w_modes:
+            vals = mode_switch_metrics_for_experiment(experiment, {mode: mode_repeats[mode]}, "total_delta").get(mode, [])
+            q1, q3 = iqr_bounds(vals)
+            ys.append(safe_median(vals) or 0.0)
+            q1s.append(q1 if q1 is not None else ys[-1])
+            q3s.append(q3 if q3 is not None else ys[-1])
+        if stock_baseline is not None:
+            ax.axhline(stock_baseline, color="#222222", linestyle="--", linewidth=1.5, label="STOCK median")
+        ax.plot(xs, ys, marker="o", color="#d62728", linewidth=2, label="W sweep")
+        ax.fill_between(xs, q1s, q3s, color="#d62728", alpha=0.16)
+        ax.set_title(experiment)
+        ax.set_ylabel("PFC Count Delta")
+        ax.grid(True, alpha=0.25)
+        ax.legend(loc="best")
+    axes[-1].set_xlabel("W")
+    fig.suptitle("STOCK vs W Switch PFC Count", y=0.995)
+    fig.tight_layout()
+    filename = "stock_vs_w_switch_pfc_counts.png"
+    fig.savefig(output_dir / filename, dpi=160)
+    plt.close(fig)
+    return filename
+
+
+def plot_root_stock_vs_w_window_trace(discovered: Dict[str, Dict[str, Dict[str, List[RepeatData]]]], output_dir: Path) -> str:
+    experiments = sorted(discovered.keys(), key=experiment_sort_key)
+    fig, axes = plt.subplots(len(experiments), 1, figsize=(12, 4 * len(experiments)), sharex=True)
+    if len(experiments) == 1:
+        axes = [axes]
+    for ax, experiment in zip(axes, experiments):
+        mode_repeats = discovered[experiment]
+        modes = sorted(mode_repeats.keys(), key=mode_sort_key)
+        palette = make_mode_palette(modes)
+        xs = list(range(PROGRESS_BINS))
+        for mode in modes:
+            per_repeat_occ: List[List[Optional[float]]] = []
+            for repeat_name, items in sorted(mode_repeats[mode].items()):
+                sample = items[0]
+                metrics = load_repeat_cts_metrics(str(sample.repeat_dir), experiment, mode, repeat_name)
+                per_repeat_occ.append(metrics.progress_occ_pr)
+            medians = []
+            for idx in xs:
+                vals = [row[idx] for row in per_repeat_occ if row[idx] is not None]
+                medians.append(safe_median(vals) or 0.0)
+            ax.plot(xs, medians, label=mode, color=palette[mode], linewidth=2)
+        ax.set_title(experiment)
+        ax.set_ylabel("Observed post-receive occupancy")
+        ax.grid(True, alpha=0.25)
+        ax.legend(ncol=2, fontsize=8)
+    axes[-1].set_xlabel("Normalized Progress Bin (50 bins across steady steps)")
+    fig.suptitle("STOCK vs W Observed Window Trace", y=0.995)
+    fig.tight_layout()
+    filename = "stock_vs_w_step_window_trace.png"
+    fig.savefig(output_dir / filename, dpi=160)
+    plt.close(fig)
+    return filename
+
+
+def plot_root_matrix_heatmap(
+    discovered: Dict[str, Dict[str, Dict[str, List[RepeatData]]]],
+    output_dir: Path,
+    metric_name: str,
+    filename: str,
+    title: str,
+    use_switch_metric: bool = False,
+) -> str:
+    experiments = sorted(discovered.keys(), key=experiment_sort_key)
+    w_modes = sorted({mode for modes in discovered.values() for mode in modes.keys() if mode.startswith("W")}, key=mode_sort_key)
+    if not w_modes:
+        w_modes = []
+    matrix: List[List[float]] = []
+    for experiment in experiments:
+        row: List[float] = []
+        mode_repeats = discovered[experiment]
+        for mode in w_modes:
+            if mode not in mode_repeats:
+                row.append(float("nan"))
+                continue
+            if use_switch_metric:
+                vals = mode_switch_metrics_for_experiment(experiment, {mode: mode_repeats[mode]}, metric_name).get(mode, [])
+            else:
+                vals = [per_repeat_overall(items)[metric_name] for _, items in sorted(mode_repeats[mode].items())]
+            row.append(safe_median(vals) if vals else float("nan"))
+        matrix.append(row)
+
+    fig, ax = plt.subplots(figsize=(max(8, len(w_modes) * 0.7 + 3), max(4, len(experiments) * 0.7 + 2)))
+    image = ax.imshow(matrix, aspect="auto", cmap="YlOrRd")
+    ax.set_xticks(list(range(len(w_modes))))
+    ax.set_xticklabels([mode.replace("_", ".") for mode in w_modes], rotation=45, ha="right")
+    ax.set_yticks(list(range(len(experiments))))
+    ax.set_yticklabels(experiments)
+    ax.set_xlabel("W")
+    ax.set_title(title)
+    for row_idx, row in enumerate(matrix):
+        for col_idx, value in enumerate(row):
+            if not math.isnan(value):
+                ax.text(col_idx, row_idx, f"{value:.1f}", ha="center", va="center", fontsize=8, color="#111111")
+    fig.colorbar(image, ax=ax, shrink=0.85)
+    fig.tight_layout()
+    fig.savefig(output_dir / filename, dpi=160)
+    plt.close(fig)
+    return filename
+
+
+def generate_html(run_root: Path, output_dir: Path, root_plots: List[Tuple[str, str]], experiment_sections: List[str], root_meta_html: str) -> None:
+    root_plot_html = "".join(
+        f'<div><h3>{escape(title)}</h3><img src="{escape(filename)}" alt="{escape(title)}"></div>'
+        for title, filename in root_plots
+    )
     html = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -399,7 +1175,7 @@ def generate_html(run_root: Path, output_dir: Path, experiment_sections: List[st
       font-family: "Pretendard", "Noto Sans KR", sans-serif;
     }}
     .wrap {{
-      max-width: 1400px;
+      max-width: 1480px;
       margin: 0 auto;
       padding: 32px 24px 60px;
     }}
@@ -411,7 +1187,7 @@ def generate_html(run_root: Path, output_dir: Path, experiment_sections: List[st
       margin-top: 20px;
     }}
     h1, h2, h3 {{ margin: 0 0 12px; }}
-    p {{ color: var(--muted); }}
+    p, li {{ color: var(--muted); }}
     .grid {{
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(420px, 1fr));
@@ -440,6 +1216,13 @@ def generate_html(run_root: Path, output_dir: Path, experiment_sections: List[st
       padding: 2px 6px;
       border-radius: 6px;
     }}
+    .note {{
+      background: #f7faff;
+      border-left: 4px solid #3d6ae6;
+      padding: 12px 14px;
+      border-radius: 10px;
+      margin-top: 14px;
+    }}
   </style>
 </head>
 <body>
@@ -448,7 +1231,19 @@ def generate_html(run_root: Path, output_dir: Path, experiment_sections: List[st
       <h1>PR Phase1 Report</h1>
       <p>Run root: <code>{escape(str(run_root))}</code></p>
       <p>Primary aggregate: median. Mean is kept as a secondary reference because step outliers can distort network experiments.</p>
+      {root_meta_html}
+      <div class="note">
+        <strong>CTS diagnostics note.</strong>
+        Step-level CTS plots are derived from <code>PROXY_RECV_POST</code> event order. Because the current launcher log does not record per-event timestamps, sampled points 10/20/30 are rendered as
+        <em>normalized progress bins</em> across the 50 steady steps, not exact DDP-step timestamps.
+      </div>
     </div>
+    <section class="card">
+      <h2>Root Summary</h2>
+      <div class="grid">
+        {root_plot_html}
+      </div>
+    </section>
     {''.join(experiment_sections)}
   </div>
 </body>
@@ -457,12 +1252,43 @@ def generate_html(run_root: Path, output_dir: Path, experiment_sections: List[st
     (output_dir / "phase1_report.html").write_text(html, encoding="utf-8")
 
 
+def build_root_meta_html(run_root: Path) -> str:
+    meta = parse_env_file(run_root / "switch_logger_meta.env")
+    if not meta:
+        return ""
+    items = []
+    for key in ("RUN_ID", "SWITCH_RUN_ID", "SWITCH_LOG_DIR", "PID_FILE", "MARKERS_JSONL"):
+        value = meta.get(key)
+        if value:
+            items.append(f"<li><strong>{escape(key)}</strong>: <code>{escape(value)}</code></li>")
+    if not items:
+        return ""
+    return "<ul>" + "".join(items) + "</ul>"
+
+
 def build_report(run_root: Path, output_dir: Path) -> None:
     discovered = discover_runs(run_root)
     output_dir.mkdir(parents=True, exist_ok=True)
-    sections: List[str] = []
+    experiment_sections: List[str] = []
 
-    for experiment in sorted(discovered.keys()):
+    root_plots = [
+        (
+            "STOCK vs W Latency",
+            plot_root_stock_vs_w(discovered, output_dir, "latency_median_ms", "stock_vs_w_latency.png", "STOCK vs W Latency", "Latency (ms)"),
+        ),
+        (
+            "STOCK vs W Throughput",
+            plot_root_stock_vs_w(discovered, output_dir, "throughput_median_gbps", "stock_vs_w_throughput.png", "STOCK vs W Throughput", "Throughput (GB/s)"),
+        ),
+        ("STOCK vs W Switch PFC Count", plot_root_stock_vs_w_pfc(discovered, output_dir)),
+        ("STOCK vs W Observed Window Trace", plot_root_stock_vs_w_window_trace(discovered, output_dir)),
+        ("W Matrix Latency", plot_root_matrix_heatmap(discovered, output_dir, "latency_median_ms", "w_matrix_latency.png", "W Matrix Latency")),
+        ("W Matrix Throughput", plot_root_matrix_heatmap(discovered, output_dir, "throughput_median_gbps", "w_matrix_throughput.png", "W Matrix Throughput")),
+        ("W Matrix PFC Count", plot_root_matrix_heatmap(discovered, output_dir, "total_delta", "w_matrix_pfc_count.png", "W Matrix PFC Count", use_switch_metric=True)),
+        ("W Matrix PFC Severity", plot_root_matrix_heatmap(discovered, output_dir, "severity", "w_matrix_pfc_severity.png", "W Matrix PFC Severity", use_switch_metric=True)),
+    ]
+
+    for experiment in sorted(discovered.keys(), key=experiment_sort_key):
         mode_repeats = discovered[experiment]
         latency_box = plot_summary_box(experiment, mode_repeats, output_dir, "latency_median_ms")
         throughput_box = plot_summary_box(experiment, mode_repeats, output_dir, "throughput_median_gbps")
@@ -471,13 +1297,23 @@ def build_report(run_root: Path, output_dir: Path) -> None:
         delta_vs_stock = plot_delta_vs_stock(experiment, mode_repeats, output_dir)
         latency_vs_w = plot_vs_w_lines(experiment, mode_repeats, output_dir, "latency_median_ms")
         throughput_vs_w = plot_vs_w_lines(experiment, mode_repeats, output_dir, "throughput_median_gbps")
+        cts_worker_volume = plot_cts_post_volume_by_worker_vs_w(experiment, mode_repeats, output_dir)
+        gate_effect = plot_post_receive_gate_effect_vs_w(experiment, mode_repeats, output_dir)
+        cts_progress = plot_cts_progress_by_w(experiment, mode_repeats, output_dir)
+        throughput_bar_all, throughput_bar_selected = plot_step_throughput_selected_modes(experiment, mode_repeats, output_dir)
+        channel_files = plot_cts_channel_volume_for_bins(experiment, mode_repeats, output_dir)
         summary_table = build_experiment_table(experiment, mode_repeats)
 
-        sections.append(
+        channel_html = "".join(
+            f'<div><h3>CTS Channel Volume Bin {escape(filename.rsplit("_", 1)[-1].replace(".png", ""))}</h3><img src="{escape(filename)}" alt="{escape(experiment)} {escape(filename)}"></div>'
+            for filename in channel_files
+        )
+
+        experiment_sections.append(
             f"""
             <section class="card">
               <h2>{escape(experiment)}</h2>
-              <p>Mode comparison is reported with repeat-level medians. Step overlays use per-step medians with IQR shading across repeats.</p>
+              <p>Mode comparison uses repeat-level medians. CTS diagnostics are derived from steady-phase <code>PROXY_RECV_POST</code> and <code>PROXY_RECV_WSTALL</code> events parsed from <code>worker_launcher.log</code>.</p>
               {summary_table}
               <div class="grid" style="margin-top:18px;">
                 <div><h3>Latency by Mode</h3><img src="{escape(latency_box)}" alt="{escape(experiment)} latency boxplot"></div>
@@ -486,6 +1322,12 @@ def build_report(run_root: Path, output_dir: Path) -> None:
                 <div><h3>Step Throughput Overlay</h3><img src="{escape(step_throughput)}" alt="{escape(experiment)} step throughput overlay"></div>
                 <div><h3>Latency vs W</h3><img src="{escape(latency_vs_w)}" alt="{escape(experiment)} latency vs W"></div>
                 <div><h3>Throughput vs W</h3><img src="{escape(throughput_vs_w)}" alt="{escape(experiment)} throughput vs W"></div>
+                <div><h3>CTS/POST Volume by Worker vs W</h3><img src="{escape(cts_worker_volume)}" alt="{escape(experiment)} CTS volume by worker"></div>
+                <div><h3>Post-Receive Gate Effect vs W</h3><img src="{escape(gate_effect)}" alt="{escape(experiment)} gate effect"></div>
+                <div><h3>CTS Progress by W</h3><img src="{escape(cts_progress)}" alt="{escape(experiment)} CTS progress by W"></div>
+                <div><h3>Step Throughput by W</h3><img src="{escape(throughput_bar_all)}" alt="{escape(experiment)} step throughput by W"></div>
+                <div><h3>Step Throughput: STOCK vs W2 vs W4</h3><img src="{escape(throughput_bar_selected)}" alt="{escape(experiment)} throughput stock w2 w4"></div>
+                {channel_html}
               </div>
               <div style="margin-top:18px;">
                 <h3>Delta vs STOCK</h3>
@@ -495,7 +1337,7 @@ def build_report(run_root: Path, output_dir: Path) -> None:
             """
         )
 
-    generate_html(run_root, output_dir, sections)
+    generate_html(run_root, output_dir, root_plots, experiment_sections, build_root_meta_html(run_root))
 
 
 def main() -> None:

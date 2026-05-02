@@ -106,6 +106,7 @@ def main():
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     world_size = int(os.environ["WORLD_SIZE"])
+    configured_w = os.environ.get("NCCL_PHASE1_INFLIGHT_W")
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
     dist.init_process_group(backend="nccl", init_method="env://")
@@ -139,6 +140,7 @@ def main():
                 "world_size": world_size,
                 "collective": args.collective,
                 "algorithm": args.algorithm,
+                "configured_w": configured_w,
                 "phase": phase,
                 "step_index": step_idx if phase == "warmup" else step_idx - args.warmup_steps,
                 "duration_ms": duration_ms,
@@ -160,6 +162,7 @@ def main():
         "world_size": world_size,
         "collective": args.collective,
         "algorithm": args.algorithm,
+        "configured_w": configured_w,
         "payload_mb": args.payload_mb,
         "numel": numel,
         "warmup_steps": args.warmup_steps,
