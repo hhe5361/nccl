@@ -48,6 +48,19 @@ class RepeatData:
 
 
 @dataclass
+class RunStatus:
+    mode: str
+    experiment: str
+    repeat_name: str
+    repeat_index: int
+    repeat_dir: Path
+    status: str
+    reason: str
+    detail: str
+    failed_workers: List[str]
+
+
+@dataclass
 class Phase1Event:
     event: str
     phase: str
@@ -239,6 +252,31 @@ def discover_runs(run_root: Path) -> Dict[str, Dict[str, Dict[str, List[RepeatDa
     return discovered
 
 
+def discover_run_statuses(run_root: Path) -> Dict[str, Dict[str, Dict[str, RunStatus]]]:
+    discovered: Dict[str, Dict[str, Dict[str, RunStatus]]] = {}
+    for mode_dir in sorted((p for p in run_root.iterdir() if p.is_dir()), key=lambda p: mode_sort_key(p.name)):
+        mode = mode_dir.name
+        for experiment_dir in sorted((p for p in mode_dir.iterdir() if p.is_dir()), key=lambda p: experiment_sort_key(p.name)):
+            experiment = experiment_dir.name
+            for repeat_dir in sorted((p for p in experiment_dir.iterdir() if p.is_dir())):
+                payload = {}
+                run_status_path = repeat_dir / "run_status.json"
+                if run_status_path.exists():
+                    payload = read_json(run_status_path)
+                discovered.setdefault(experiment, {}).setdefault(mode, {})[repeat_dir.name] = RunStatus(
+                    mode=mode,
+                    experiment=experiment,
+                    repeat_name=repeat_dir.name,
+                    repeat_index=parse_repeat_index(repeat_dir.name),
+                    repeat_dir=repeat_dir,
+                    status=str(payload.get("status", "unknown")),
+                    reason=str(payload.get("reason", "-")),
+                    detail=str(payload.get("detail", "-")),
+                    failed_workers=[str(w) for w in payload.get("failed_workers", [])],
+                )
+    return discovered
+
+
 @lru_cache(maxsize=None)
 def load_trace(path_str: str) -> List[dict]:
     path = Path(path_str)
@@ -363,6 +401,21 @@ def summarize_validation(validation_path: Optional[Path]) -> Tuple[str, str]:
     workers = payload.get("workers", [])
     failed = [w.get("worker", "?") for w in workers if not w.get("ok", False)]
     return ("OK" if ok else "FAIL", ",".join(failed) if failed else "-")
+
+
+def summarize_run_status(run_status: Optional[RunStatus]) -> Tuple[str, str]:
+    if run_status is None:
+        return ("-", "no run status")
+    if run_status.status == "done":
+        return ("DONE", "-")
+    if run_status.status == "failed":
+        detail = run_status.detail or "-"
+        if run_status.failed_workers:
+            detail = f"{detail}; failed_workers={','.join(run_status.failed_workers)}"
+        return ("FAILED", detail)
+    if run_status.status == "running":
+        return ("RUNNING", run_status.detail or "-")
+    return (run_status.status.upper(), run_status.detail or "-")
 
 
 def make_mode_palette(modes: List[str]) -> Dict[str, str]:
@@ -1187,7 +1240,11 @@ def plot_cts_channel_volume_for_bins(experiment: str, mode_repeats: Dict[str, Di
     return filenames
 
 
-def build_experiment_table(experiment: str, mode_repeats: Dict[str, Dict[str, List[RepeatData]]]) -> str:
+def build_experiment_table(
+    experiment: str,
+    mode_repeats: Dict[str, Dict[str, List[RepeatData]]],
+    status_map: Dict[str, Dict[str, RunStatus]],
+) -> str:
     rows = []
     modes = sorted(mode_repeats.keys(), key=mode_sort_key)
     for mode in modes:
@@ -1197,6 +1254,11 @@ def build_experiment_table(experiment: str, mode_repeats: Dict[str, Dict[str, Li
         lat_p95s = [x["latency_p95_ms"] for x in per_repeat]
         sample = next(iter(next(iter(mode_repeats[mode].values()))))
         validation_status, validation_detail = summarize_validation(sample.validation_path)
+        failed_repeats = [
+            repeat_name
+            for repeat_name, rs in sorted(status_map.get(mode, {}).items())
+            if rs.status == "failed"
+        ]
         switch_vals = mode_switch_metrics_for_experiment(experiment, {mode: mode_repeats[mode]}, "total_delta").get(mode, [])
         switch_severity = mode_switch_metrics_for_experiment(experiment, {mode: mode_repeats[mode]}, "severity").get(mode, [])
         rows.append(
@@ -1210,7 +1272,7 @@ def build_experiment_table(experiment: str, mode_repeats: Dict[str, Dict[str, Li
             f"<td>{fmt_float(safe_median(switch_vals), 1)}</td>"
             f"<td>{fmt_float(safe_median(switch_severity), 1)}</td>"
             f"<td>{validation_status}</td>"
-            f"<td>{escape(validation_detail)}</td>"
+            f"<td>{escape(','.join(failed_repeats) if failed_repeats else validation_detail)}</td>"
             "</tr>"
         )
     return (
@@ -1220,6 +1282,32 @@ def build_experiment_table(experiment: str, mode_repeats: Dict[str, Dict[str, Li
         "<th>Median p95 Latency (ms)</th><th>Median Throughput (GB/s)</th><th>Median PFC Count</th>"
         "<th>Median PFC Severity</th><th>Validation</th><th>Failed Workers</th>"
         "</tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def build_aborted_runs_table(status_map: Dict[str, Dict[str, RunStatus]]) -> str:
+    rows = []
+    for mode in sorted(status_map.keys(), key=mode_sort_key):
+        for repeat_name, rs in sorted(status_map[mode].items()):
+            if rs.status == "done":
+                continue
+            run_status, run_detail = summarize_run_status(rs)
+            rows.append(
+                "<tr>"
+                f"<td>{escape(mode)}</td>"
+                f"<td>{escape(repeat_name)}</td>"
+                f"<td>{escape(run_status)}</td>"
+                f"<td>{escape(rs.reason)}</td>"
+                f"<td>{escape(run_detail)}</td>"
+                "</tr>"
+            )
+    if not rows:
+        return "<p>No aborted or incomplete runs.</p>"
+    return (
+        "<table>"
+        "<thead><tr><th>Mode</th><th>Repeat</th><th>Status</th><th>Reason</th><th>Detail</th></tr></thead><tbody>"
         + "".join(rows)
         + "</tbody></table>"
     )
@@ -1501,6 +1589,7 @@ def build_root_meta_html(run_root: Path) -> str:
 
 def build_report(run_root: Path, output_dir: Path) -> None:
     discovered = discover_runs(run_root)
+    run_statuses = discover_run_statuses(run_root)
     output_dir.mkdir(parents=True, exist_ok=True)
     experiment_sections: List[str] = []
 
@@ -1525,9 +1614,26 @@ def build_report(run_root: Path, output_dir: Path) -> None:
         ("W Matrix PFC Severity", plot_root_matrix_heatmap(discovered, output_dir, "severity", "w_matrix_pfc_severity.png", "W Matrix PFC Severity", use_switch_metric=True)),
     ]
 
-    for experiment in sorted(discovered.keys(), key=experiment_sort_key):
-        mode_repeats = discovered[experiment]
+    experiment_names = sorted(set(discovered.keys()) | set(run_statuses.keys()), key=experiment_sort_key)
+    for experiment in experiment_names:
+        mode_repeats = discovered.get(experiment, {})
+        status_map = run_statuses.get(experiment, {})
         reporter_log(f"build experiment start experiment={experiment} modes={len(mode_repeats)}")
+        if not mode_repeats:
+            aborted_table = build_aborted_runs_table(status_map)
+            experiment_sections.append(
+                f"""
+                <section class="card">
+                  <h2>{escape(experiment)}</h2>
+                  <div class="note">
+                    <strong>Aborted / Incomplete Runs</strong>
+                    {aborted_table}
+                  </div>
+                </section>
+                """
+            )
+            reporter_log(f"build experiment end experiment={experiment}")
+            continue
         latency_box = plot_summary_box(experiment, mode_repeats, output_dir, "latency_median_ms")
         reporter_log(f"plot done experiment={experiment} file={latency_box}")
         throughput_box = plot_summary_box(experiment, mode_repeats, output_dir, "throughput_median_gbps")
@@ -1560,7 +1666,8 @@ def build_report(run_root: Path, output_dir: Path) -> None:
         channel_files = plot_cts_channel_volume_for_bins(experiment, mode_repeats, output_dir)
         for filename in channel_files:
             reporter_log(f"plot done experiment={experiment} file={filename}")
-        summary_table = build_experiment_table(experiment, mode_repeats)
+        summary_table = build_experiment_table(experiment, mode_repeats, status_map)
+        aborted_table = build_aborted_runs_table(status_map)
 
         exact_step_html = "".join(
             f'<div><h3>{escape(filename.replace(".png", "").replace("_", " "))}</h3><img src="{escape(filename)}" alt="{escape(experiment)} {escape(filename)}"></div>'
@@ -1581,6 +1688,10 @@ def build_report(run_root: Path, output_dir: Path) -> None:
               <h2>{escape(experiment)}</h2>
               <p>Mode comparison uses repeat-level medians. CTS diagnostics are derived from steady-phase <code>PROXY_RECV_POST</code> and <code>PROXY_RECV_WSTALL</code> events parsed from <code>worker_launcher.log</code>.</p>
               {summary_table}
+              <div class="note">
+                <strong>Aborted / Incomplete Runs</strong>
+                {aborted_table}
+              </div>
               <div class="grid" style="margin-top:18px;">
                 <div><h3>Latency by Mode</h3><img src="{escape(latency_box)}" alt="{escape(experiment)} latency boxplot"></div>
                 <div><h3>Throughput by Mode</h3><img src="{escape(throughput_box)}" alt="{escape(experiment)} throughput boxplot"></div>

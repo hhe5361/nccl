@@ -1535,6 +1535,11 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
     int p = args->protocol;
     int maxDepth = std::min(NCCL_STEPS, NCCL_SHARED_STEPS/args->nsubs);
     double configuredInflightW = phase1InflightWConfigured();
+    if (configuredInflightW > 0.0 && configuredInflightW + 1e-9 < (double)args->sliceSteps) {
+      WARN("PHASE1 invalid inflight W %.3f is smaller than sliceSteps %d (coll=%u algo=%u proto=%u nsubs=%d maxDepth=%d). Aborting experiment.",
+          configuredInflightW, args->sliceSteps, args->collAPI, args->algorithm, args->protocol, args->nsubs, maxDepth);
+      return ncclInvalidUsage;
+    }
     if (configuredInflightW > 0.0 && configuredInflightW > (double)maxDepth + 1e-9) {
       WARN("PHASE1 invalid inflight W %.3f exceeds baseline maxDepth %d (coll=%u algo=%u proto=%u nsubs=%d sliceSteps=%d). Aborting experiment.",
           configuredInflightW, maxDepth, args->collAPI, args->algorithm, args->protocol, args->nsubs, args->sliceSteps);

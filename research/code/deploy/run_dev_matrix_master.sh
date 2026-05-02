@@ -44,6 +44,10 @@ SWITCH_STARTED=0
 SWITCH_STOPPED=0
 TOTAL_RUNS=0
 CURRENT_RUN_INDEX=0
+FAILURE_COUNT=0
+WAIT_FAILURE_REASON=""
+WAIT_FAILURE_DETAIL=""
+WAIT_FAILED_WORKERS=""
 
 usage() {
   cat <<'EOF'
@@ -119,6 +123,26 @@ master_addr="$(deploy_lookup_worker_ip "${TOPOLOGY_FILE}" "${MASTER_WORKER}")" |
 
 ensure_local_dir() {
   mkdir -p "$1"
+}
+
+write_run_status() {
+  local run_output_dir="$1"
+  local status="$2"
+  local reason="$3"
+  local detail="$4"
+  local failed_workers="$5"
+  python3 - "$run_output_dir" "$status" "$reason" "$detail" "$failed_workers" <<'PY'
+import json, sys
+from pathlib import Path
+run_output_dir = Path(sys.argv[1])
+payload = {
+    "status": sys.argv[2],
+    "reason": sys.argv[3],
+    "detail": sys.argv[4],
+    "failed_workers": [w for w in sys.argv[5].split(",") if w],
+}
+(run_output_dir / "run_status.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+PY
 }
 
 switch_logger_enabled() {
@@ -337,6 +361,9 @@ wait_for_status_barrier() {
   local repeat="$5"
   local start_ts now_ts elapsed
   start_ts="$(date +%s)"
+  WAIT_FAILURE_REASON=""
+  WAIT_FAILURE_DETAIL=""
+  WAIT_FAILED_WORKERS=""
 
   while true; do
     local all_done=1
@@ -356,6 +383,9 @@ wait_for_status_barrier() {
       stage="$(deploy_read_status_field "${status_file}" stage)"
       if [[ "${state}" == "-1" ]]; then
         deploy_log "ERROR" "run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} worker=${worker} failed stage=${stage}"
+        WAIT_FAILURE_REASON="worker_failed"
+        WAIT_FAILURE_DETAIL="worker=${worker} stage=${stage}"
+        WAIT_FAILED_WORKERS="${worker}"
         return 1
       fi
       if [[ "${state}" == "0" ]]; then
@@ -377,6 +407,9 @@ wait_for_status_barrier() {
     deploy_log "INFO" "waiting run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} done=${done_count}/${WORLD_SIZE} pending=${pending_count} states=$(IFS=,; echo "${status_parts[*]}")"
     if (( elapsed > TIMEOUT_SEC )); then
       deploy_log "ERROR" "run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} timeout after ${TIMEOUT_SEC}s"
+      WAIT_FAILURE_REASON="timeout"
+      WAIT_FAILURE_DETAIL="timeout after ${TIMEOUT_SEC}s"
+      WAIT_FAILED_WORKERS="$(printf '%s\n' "${status_parts[@]}" | awk -F: '$2 !~ /^0\\// {print $1}' | paste -sd, -)"
       return 1
     fi
 
@@ -440,6 +473,7 @@ run_one() {
   ensure_local_dir "${status_dir}"
   find "${status_dir}" -type f -name '*.status' -delete 2>/dev/null || true
   switch_logger_write_run_meta "$(run_level_meta_file "${run_output_dir}")"
+  write_run_status "${run_output_dir}" "running" "-" "launched" ""
 
   deploy_log "INFO" "progress=${CURRENT_RUN_INDEX}/${TOTAL_RUNS} start run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} master=${MASTER_WORKER} world_size=${WORLD_SIZE} port=${MASTER_PORT} output_dir=${run_output_dir}"
   switch_logger_marker "mode_start" "run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} output_dir=${run_output_dir}"
@@ -456,6 +490,7 @@ run_one() {
   if ! wait_for_status_barrier "${status_dir}" "${run_id}" "${experiment}" "${mode}" "${repeat}"; then
     switch_logger_marker "ddp_end" "run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} failed barrier"
     switch_logger_marker "mode_end" "run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} failed"
+    write_run_status "${run_output_dir}" "failed" "${WAIT_FAILURE_REASON:-barrier_failed}" "${WAIT_FAILURE_DETAIL:-barrier failed}" "${WAIT_FAILED_WORKERS:-}"
     run_hook_if_set "${SWITCH_STOP_TEMPLATE}" "${run_id}" "${experiment}" "${mode}" "${repeat}" "${run_output_dir}" || true
     maybe_restart_containers_after_failure
     return 1
@@ -463,9 +498,18 @@ run_one() {
 
   switch_logger_marker "ddp_end" "run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} barrier complete"
   run_hook_if_set "${SWITCH_STOP_TEMPLATE}" "${run_id}" "${experiment}" "${mode}" "${repeat}" "${run_output_dir}"
-  run_validation_if_set "${run_id}" "${experiment}" "${mode}" "${repeat}" "${run_output_dir}"
-  run_cleanup_check_if_set "${run_id}" "${experiment}" "${mode}" "${repeat}" "${run_output_dir}"
+  if ! run_validation_if_set "${run_id}" "${experiment}" "${mode}" "${repeat}" "${run_output_dir}"; then
+    write_run_status "${run_output_dir}" "failed" "validation_failed" "correctness validation failed" ""
+    maybe_restart_containers_after_failure
+    return 1
+  fi
+  if ! run_cleanup_check_if_set "${run_id}" "${experiment}" "${mode}" "${repeat}" "${run_output_dir}"; then
+    write_run_status "${run_output_dir}" "failed" "cleanup_check_failed" "port cleanup check failed" ""
+    maybe_restart_containers_after_failure
+    return 1
+  fi
   switch_logger_marker "mode_end" "run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat} done"
+  write_run_status "${run_output_dir}" "done" "-" "completed" ""
 
   deploy_log "INFO" "done run_id=${run_id} experiment=${experiment} mode=${mode} repeat=${repeat}"
 }
@@ -481,7 +525,9 @@ for experiment in "${EXPERIMENTS[@]}"; do
   for mode in "${MODES[@]}"; do
     for ((repeat=1; repeat<=REPEATS; repeat++)); do
       if ! run_one "${experiment}" "${mode}" "${repeat}"; then
-        deploy_die "Experiment failed: experiment=${experiment} mode=${mode} repeat=${repeat}"
+        FAILURE_COUNT=$(( FAILURE_COUNT + 1 ))
+        deploy_log "ERROR" "Experiment failed: experiment=${experiment} mode=${mode} repeat=${repeat}"
+        continue
       fi
     done
   done
@@ -490,4 +536,8 @@ done
 
 switch_logger_marker "matrix_end" "run_id=${RUN_ID} output_root=${OUTPUT_ROOT}/${RUN_ID}"
 switch_logger_stop
+if (( FAILURE_COUNT > 0 )); then
+  deploy_log "WARN" "Matrix completed with failures count=${FAILURE_COUNT} run_id=${RUN_ID} output_root=${OUTPUT_ROOT}/${RUN_ID}"
+  exit 1
+fi
 deploy_log "INFO" "All experiments completed run_id=${RUN_ID} output_root=${OUTPUT_ROOT}/${RUN_ID}"
