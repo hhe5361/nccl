@@ -24,6 +24,7 @@ LOG_TS_PATTERNS = (
 KV_RE = re.compile(r"([A-Za-z0-9_]+)=([^ ]+)")
 PROGRESS_BINS = 50
 SAMPLED_PROGRESS_BINS = (10, 20, 30)
+SAMPLED_STEP_WINDOWS = ((10, 20), (20, 30))
 
 
 def reporter_log(message: str) -> None:
@@ -200,6 +201,10 @@ def parse_mode_w(mode: str) -> Optional[float]:
         except ValueError:
             return None
     return None
+
+
+def mode_filename_part(mode: str) -> str:
+    return mode.lower().replace(".", "_")
 
 
 def fmt_float(value: Optional[float], digits: int = 3) -> str:
@@ -998,49 +1003,78 @@ def plot_cts_post_volume_by_worker_vs_w(experiment: str, mode_repeats: Dict[str,
     return filename
 
 
+def plot_active_channels_by_w_repeat(experiment: str, mode_repeats: Dict[str, Dict[str, List[RepeatData]]], output_dir: Path) -> str:
+    modes = sorted([mode for mode in mode_repeats if mode.startswith("W")], key=mode_sort_key)
+    if not modes:
+        modes = sorted(mode_repeats.keys(), key=mode_sort_key)
+    palette = make_mode_palette(modes)
+    fig, ax = plt.subplots(figsize=(13, 6))
+
+    for mode in modes:
+        w_value = parse_mode_w(mode)
+        if w_value is None:
+            continue
+        repeats = sorted(mode_repeats[mode].items())
+        xs = []
+        ys = []
+        for repeat_name, items in repeats:
+            sample = items[0]
+            metrics = load_repeat_cts_metrics(str(sample.repeat_dir), experiment, mode, repeat_name)
+            active_channels = sum(1 for _, count in metrics.posts_by_channel.items() if count > 0)
+            xs.append(w_value)
+            ys.append(float(active_channels))
+        if not xs:
+            continue
+        ax.scatter(xs, ys, color=palette[mode], s=48, alpha=0.85, label=mode)
+
+    ax.set_title(f"{experiment} Active CTS Channels per Repeat")
+    ax.set_xlabel("Configured W")
+    ax.set_ylabel("Active Channel Count")
+    ax.grid(True, alpha=0.25)
+    ax.legend(ncol=2, fontsize=9)
+    fig.tight_layout()
+
+    filename = f"{experiment}_active_channels_by_w_repeat.png"
+    fig.savefig(output_dir / filename, dpi=160)
+    plt.close(fig)
+    return filename
+
+
 def plot_post_receive_gate_effect_vs_w(experiment: str, mode_repeats: Dict[str, Dict[str, List[RepeatData]]], output_dir: Path) -> str:
     modes = sorted(mode_repeats.keys(), key=mode_sort_key)
-    palette = make_mode_palette(modes)
     xs = list(range(len(modes)))
     posts = []
-    stalls = []
-    stall_ratios = []
     occ_post = []
-    occ_wstall = []
+    configured_w = []
+    observed_max_occ = []
     for mode in modes:
         per_repeat_posts = []
-        per_repeat_stalls = []
         per_repeat_occ_post = []
-        per_repeat_occ_wstall = []
+        per_repeat_obs_max = []
         for repeat_name, items in sorted(mode_repeats[mode].items()):
             sample = items[0]
             metrics = load_repeat_cts_metrics(str(sample.repeat_dir), experiment, mode, repeat_name)
             per_repeat_posts.append(metrics.total_posts)
-            per_repeat_stalls.append(metrics.total_wstalls)
             if metrics.mean_occ_pr_at_post is not None:
                 per_repeat_occ_post.append(metrics.mean_occ_pr_at_post)
-            if metrics.mean_occ_pr_at_wstall is not None:
-                per_repeat_occ_wstall.append(metrics.mean_occ_pr_at_wstall)
-        post_med = safe_median(per_repeat_posts) or 0.0
-        stall_med = safe_median(per_repeat_stalls) or 0.0
-        posts.append(post_med)
-        stalls.append(stall_med)
-        stall_ratios.append(stall_med / max(1.0, post_med + stall_med))
+            if metrics.observed_max_occ_pr is not None:
+                per_repeat_obs_max.append(metrics.observed_max_occ_pr)
+        posts.append(safe_median(per_repeat_posts) or 0.0)
         occ_post.append(safe_median(per_repeat_occ_post) or 0.0)
-        occ_wstall.append(safe_median(per_repeat_occ_wstall) or 0.0)
+        observed_max_occ.append(safe_median(per_repeat_obs_max) or 0.0)
+        configured_w.append(parse_mode_w(mode) or 0.0)
 
     fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-    axes[0].bar(xs, posts, color="#1f77b4", alpha=0.75, label="POST")
-    axes[0].bar(xs, stalls, bottom=posts, color="#d62728", alpha=0.75, label="WSTALL")
-    axes[0].set_ylabel("Median Event Count")
+    axes[0].bar(xs, posts, color="#1f77b4", alpha=0.80, label="POST")
+    axes[0].set_ylabel("Median POST Count")
     axes[0].set_title(f"{experiment} Post-Receive Gate Effect vs W")
     axes[0].grid(True, axis="y", alpha=0.25)
     axes[0].legend()
 
-    axes[1].plot(xs, stall_ratios, marker="o", color="#d62728", label="WSTALL ratio")
-    axes[1].plot(xs, occ_post, marker="o", color="#1f77b4", label="occPr at POST")
-    axes[1].plot(xs, occ_wstall, marker="o", color="#9467bd", label="occPr at WSTALL")
-    axes[1].set_ylabel("Ratio / Occupancy")
+    axes[1].plot(xs, configured_w, marker="o", color="#ff7f0e", label="Configured W")
+    axes[1].plot(xs, occ_post, marker="o", color="#1f77b4", label="Median occPr at POST")
+    axes[1].plot(xs, observed_max_occ, marker="o", color="#2ca02c", label="Observed max occPr")
+    axes[1].set_ylabel("Window / Occupancy")
     axes[1].set_xticks(xs)
     axes[1].set_xticklabels(modes, rotation=45, ha="right")
     axes[1].grid(True, alpha=0.25)
@@ -1048,6 +1082,54 @@ def plot_post_receive_gate_effect_vs_w(experiment: str, mode_repeats: Dict[str, 
 
     fig.tight_layout()
     filename = f"{experiment}_post_receive_gate_effect_vs_w.png"
+    fig.savefig(output_dir / filename, dpi=160)
+    plt.close(fig)
+    return filename
+
+
+def plot_repeat_occpr_vs_w(experiment: str, mode_repeats: Dict[str, Dict[str, List[RepeatData]]], output_dir: Path) -> str:
+    modes = sorted([mode for mode in mode_repeats if mode.startswith("W")], key=mode_sort_key)
+    if not modes:
+        modes = sorted(mode_repeats.keys(), key=mode_sort_key)
+    palette = make_mode_palette(modes)
+    fig, ax = plt.subplots(figsize=(13, 6))
+
+    x_min = math.inf
+    x_max = 0.0
+    for mode in modes:
+        w_value = parse_mode_w(mode)
+        if w_value is None:
+            continue
+        repeats = sorted(mode_repeats[mode].items())
+        xs = []
+        ys = []
+        for repeat_name, items in repeats:
+            sample = items[0]
+            metrics = load_repeat_cts_metrics(str(sample.repeat_dir), experiment, mode, repeat_name)
+            if metrics.observed_max_occ_pr is None:
+                continue
+            xs.append(w_value)
+            ys.append(float(metrics.observed_max_occ_pr))
+        if not xs:
+            continue
+        x_min = min(x_min, min(xs))
+        x_max = max(x_max, max(xs))
+        ax.scatter(xs, ys, color=palette[mode], s=48, alpha=0.85, label=mode)
+
+    if x_min != math.inf and x_max > 0:
+        line_max = max(x_max, ax.get_ylim()[1] if ax.get_ylim()[1] > 0 else x_max)
+        ax.plot([x_min, x_max], [x_min, x_max], linestyle="--", color="#333333", linewidth=1.2, label="occPr = W")
+        ax.set_xlim(left=max(0.0, x_min - 0.25), right=x_max + 0.25)
+        ax.set_ylim(bottom=0.0, top=max(line_max, x_max) + 0.5)
+
+    ax.set_title(f"{experiment} Observed inflight depth vs Configured W")
+    ax.set_xlabel("Configured W")
+    ax.set_ylabel("Observed max occPr (post - receive)")
+    ax.grid(True, alpha=0.25)
+    ax.legend(ncol=2, fontsize=9)
+    fig.tight_layout()
+
+    filename = f"{experiment}_observed_occpr_vs_w_repeat.png"
     fig.savefig(output_dir / filename, dpi=160)
     plt.close(fig)
     return filename
@@ -1087,6 +1169,120 @@ def plot_cts_progress_by_w(experiment: str, mode_repeats: Dict[str, Dict[str, Li
     return filename
 
 
+def plot_repeat_channel_cts_posts(experiment: str, mode_repeats: Dict[str, Dict[str, List[RepeatData]]], output_dir: Path) -> List[str]:
+    filenames: List[str] = []
+    modes = sorted([mode for mode in mode_repeats if mode != "STOCK"], key=mode_sort_key)
+    for mode in modes:
+        repeats = sorted(mode_repeats[mode].items())
+        if not repeats:
+            continue
+        repeat_metrics = []
+        channels = set()
+        for repeat_name, items in repeats:
+            sample = items[0]
+            metrics = load_repeat_cts_metrics(str(sample.repeat_dir), experiment, mode, repeat_name)
+            repeat_metrics.append((repeat_name, metrics))
+            channels.update(channel for channel, count in metrics.posts_by_channel.items() if count > 0)
+        if not channels:
+            continue
+
+        channels = sorted(channels)
+        rows = max(1, math.ceil(len(repeat_metrics) / 2))
+        cols = 2 if len(repeat_metrics) > 1 else 1
+        fig, axes = plt.subplots(rows, cols, figsize=(14, 4.2 * rows), squeeze=False)
+        axes_flat = [ax for row in axes for ax in row]
+        repeat_palette = make_mode_palette([name for name, _ in repeat_metrics])
+
+        for ax, (repeat_name, metrics) in zip(axes_flat, repeat_metrics):
+            vals = [float(metrics.posts_by_channel.get(channel, 0)) for channel in channels]
+            active_channels = sum(1 for v in vals if v > 0)
+            ax.bar(range(len(channels)), vals, color=repeat_palette[repeat_name], alpha=0.85)
+            ax.set_title(
+                f"{repeat_name} | active channels={active_channels} | total posts={metrics.total_posts}"
+            )
+            ax.set_xticks(list(range(len(channels))))
+            ax.set_xticklabels([f"ch{channel}" for channel in channels], rotation=45, ha="right")
+            ax.set_ylabel("CTS/POST count")
+            ax.grid(True, axis="y", alpha=0.25)
+
+        for ax in axes_flat[len(repeat_metrics):]:
+            ax.axis("off")
+
+        fig.suptitle(f"{experiment} {mode}: per-repeat CTS/POST by channel", y=0.995)
+        fig.tight_layout()
+        filename = f"{experiment}_{mode_filename_part(mode)}_repeat_channel_cts_post.png"
+        fig.savefig(output_dir / filename, dpi=160)
+        plt.close(fig)
+        filenames.append(filename)
+    return filenames
+
+
+def plot_repeat_channel_cts_posts_for_windows(
+    experiment: str,
+    mode_repeats: Dict[str, Dict[str, List[RepeatData]]],
+    output_dir: Path,
+) -> List[str]:
+    filenames: List[str] = []
+    modes = sorted([mode for mode in mode_repeats if mode != "STOCK"], key=mode_sort_key)
+    for mode in modes:
+        repeats = sorted(mode_repeats[mode].items())
+        if not repeats:
+            continue
+        for step_start, step_stop in SAMPLED_STEP_WINDOWS:
+            repeat_metrics = []
+            channels = set()
+            any_exact = False
+            for repeat_name, items in repeats:
+                sample = items[0]
+                metrics = load_repeat_cts_metrics(str(sample.repeat_dir), experiment, mode, repeat_name)
+                any_exact = any_exact or metrics.exact_ts_available
+                aggregated_counts: Dict[int, int] = defaultdict(int)
+                total_posts = 0
+                for step_idx in range(step_start, step_stop + 1):
+                    total_posts += int(metrics.exact_step_post_counts.get(step_idx, 0))
+                    for channel, count in metrics.exact_step_channel_counts.get(step_idx, {}).items():
+                        aggregated_counts[channel] += int(count)
+                repeat_metrics.append((repeat_name, dict(aggregated_counts), total_posts))
+                channels.update(channel for channel, count in aggregated_counts.items() if count > 0)
+            if not any_exact or not channels:
+                continue
+
+            channels = sorted(channels)
+            rows = max(1, math.ceil(len(repeat_metrics) / 2))
+            cols = 2 if len(repeat_metrics) > 1 else 1
+            fig, axes = plt.subplots(rows, cols, figsize=(14, 4.2 * rows), squeeze=False)
+            axes_flat = [ax for row in axes for ax in row]
+            repeat_palette = make_mode_palette([name for name, _, _ in repeat_metrics])
+
+            for ax, (repeat_name, channel_counts, total_posts) in zip(axes_flat, repeat_metrics):
+                vals = [float(channel_counts.get(channel, 0)) for channel in channels]
+                active_channels = sum(1 for v in vals if v > 0)
+                ax.bar(range(len(channels)), vals, color=repeat_palette[repeat_name], alpha=0.85)
+                ax.set_title(
+                    f"{repeat_name} | steps {step_start}-{step_stop} | active channels={active_channels} | total posts={total_posts}"
+                )
+                ax.set_xticks(list(range(len(channels))))
+                ax.set_xticklabels([f"ch{channel}" for channel in channels], rotation=45, ha="right")
+                ax.set_ylabel("CTS/POST count")
+                ax.grid(True, axis="y", alpha=0.25)
+
+            for ax in axes_flat[len(repeat_metrics):]:
+                ax.axis("off")
+
+            fig.suptitle(
+                f"{experiment} {mode}: per-repeat CTS/POST by channel for steps {step_start}-{step_stop}",
+                y=0.995,
+            )
+            fig.tight_layout()
+            filename = (
+                f"{experiment}_{mode_filename_part(mode)}_repeat_channel_cts_post_steps_{step_start}_{step_stop}.png"
+            )
+            fig.savefig(output_dir / filename, dpi=160)
+            plt.close(fig)
+            filenames.append(filename)
+    return filenames
+
+
 def plot_exact_step_cts_vs_w(experiment: str, mode_repeats: Dict[str, Dict[str, List[RepeatData]]], output_dir: Path) -> List[str]:
     filenames: List[str] = []
     modes = sorted(mode_repeats.keys(), key=mode_sort_key)
@@ -1095,13 +1291,13 @@ def plot_exact_step_cts_vs_w(experiment: str, mode_repeats: Dict[str, Dict[str, 
     for step_idx in SAMPLED_PROGRESS_BINS:
         labels = []
         posts = []
-        stalls = []
+        occ_posts = []
         latencies = []
         throughputs = []
         exact_available = False
         for mode in numeric_modes:
             per_repeat_posts = []
-            per_repeat_stalls = []
+            per_repeat_occ_post = []
             per_repeat_lat = []
             per_repeat_thr = []
             for repeat_name, items in sorted(mode_repeats[mode].items()):
@@ -1109,14 +1305,16 @@ def plot_exact_step_cts_vs_w(experiment: str, mode_repeats: Dict[str, Dict[str, 
                 metrics = load_repeat_cts_metrics(str(sample.repeat_dir), experiment, mode, repeat_name)
                 exact_available = exact_available or metrics.exact_ts_available
                 per_repeat_posts.append(float(metrics.exact_step_post_counts.get(step_idx, 0)))
-                per_repeat_stalls.append(float(metrics.exact_step_wstall_counts.get(step_idx, 0)))
+                occ_value = metrics.exact_step_occ_pr_post.get(step_idx)
+                if occ_value is not None:
+                    per_repeat_occ_post.append(float(occ_value))
                 if step_idx in metrics.exact_step_latency_ms and metrics.exact_step_latency_ms[step_idx] is not None:
                     per_repeat_lat.append(float(metrics.exact_step_latency_ms[step_idx]))
                 if step_idx in metrics.exact_step_throughput_gbps and metrics.exact_step_throughput_gbps[step_idx] is not None:
                     per_repeat_thr.append(float(metrics.exact_step_throughput_gbps[step_idx]))
             labels.append(mode)
             posts.append(safe_median(per_repeat_posts) or 0.0)
-            stalls.append(safe_median(per_repeat_stalls) or 0.0)
+            occ_posts.append(safe_median(per_repeat_occ_post) or 0.0)
             latencies.append(safe_median(per_repeat_lat) or 0.0)
             throughputs.append(safe_median(per_repeat_thr) or 0.0)
         if not exact_available:
@@ -1124,9 +1322,9 @@ def plot_exact_step_cts_vs_w(experiment: str, mode_repeats: Dict[str, Dict[str, 
         xs = list(range(len(labels)))
         fig, axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
         axes[0].bar(xs, posts, color=[palette[label] for label in labels], alpha=0.8, label="CTS/POST")
-        axes[0].bar(xs, stalls, bottom=posts, color="#d62728", alpha=0.7, label="WSTALL")
-        axes[0].set_ylabel("Event Count")
-        axes[0].set_title(f"{experiment} Exact Step {step_idx}: CTS/WSTALL by W")
+        axes[0].plot(xs, occ_posts, marker="o", color="#d62728", linewidth=2, label="occPr at POST")
+        axes[0].set_ylabel("POST Count / occPr")
+        axes[0].set_title(f"{experiment} Exact Step {step_idx}: CTS by W")
         axes[0].legend()
         axes[0].grid(True, axis="y", alpha=0.25)
 
@@ -1553,7 +1751,7 @@ def generate_html(run_root: Path, output_dir: Path, root_plots: List[Tuple[str, 
       <div class="note">
         <strong>CTS diagnostics note.</strong>
         Exact step CTS plots use <code>PHASE1 ts_unix_ns</code> from NCCL proxy logs and
-        map <code>PROXY_RECV_POST</code>/<code>PROXY_RECV_WSTALL</code> events into each DDP
+        map <code>PROXY_RECV_POST</code> events into each DDP
         step window using the step trace <code>ts_start_unix_ns</code> and
         <code>ts_end_unix_ns</code>. If a run root does not contain the new timestamp fields,
         the reporter falls back to normalized progress-bin plots only.
@@ -1650,10 +1848,20 @@ def build_report(run_root: Path, output_dir: Path) -> None:
         reporter_log(f"plot done experiment={experiment} file={throughput_vs_w}")
         cts_worker_volume = plot_cts_post_volume_by_worker_vs_w(experiment, mode_repeats, output_dir)
         reporter_log(f"plot done experiment={experiment} file={cts_worker_volume}")
+        active_channels = plot_active_channels_by_w_repeat(experiment, mode_repeats, output_dir)
+        reporter_log(f"plot done experiment={experiment} file={active_channels}")
         gate_effect = plot_post_receive_gate_effect_vs_w(experiment, mode_repeats, output_dir)
         reporter_log(f"plot done experiment={experiment} file={gate_effect}")
+        occpr_vs_w = plot_repeat_occpr_vs_w(experiment, mode_repeats, output_dir)
+        reporter_log(f"plot done experiment={experiment} file={occpr_vs_w}")
         cts_progress = plot_cts_progress_by_w(experiment, mode_repeats, output_dir)
         reporter_log(f"plot done experiment={experiment} file={cts_progress}")
+        repeat_channel_cts = plot_repeat_channel_cts_posts(experiment, mode_repeats, output_dir)
+        for filename in repeat_channel_cts:
+            reporter_log(f"plot done experiment={experiment} file={filename}")
+        repeat_channel_cts_windows = plot_repeat_channel_cts_posts_for_windows(experiment, mode_repeats, output_dir)
+        for filename in repeat_channel_cts_windows:
+            reporter_log(f"plot done experiment={experiment} file={filename}")
         exact_step_cts = plot_exact_step_cts_vs_w(experiment, mode_repeats, output_dir)
         for filename in exact_step_cts:
             reporter_log(f"plot done experiment={experiment} file={filename}")
@@ -1677,6 +1885,14 @@ def build_report(run_root: Path, output_dir: Path) -> None:
             f'<div><h3>{escape(filename.replace(".png", "").replace("_", " "))}</h3><img src="{escape(filename)}" alt="{escape(experiment)} {escape(filename)}"></div>'
             for filename in exact_step_channels
         )
+        repeat_channel_cts_html = "".join(
+            f'<div><h3>{escape(filename.replace(".png", "").replace("_", " "))}</h3><img src="{escape(filename)}" alt="{escape(experiment)} {escape(filename)}"></div>'
+            for filename in repeat_channel_cts
+        )
+        repeat_channel_cts_windows_html = "".join(
+            f'<div><h3>{escape(filename.replace(".png", "").replace("_", " "))}</h3><img src="{escape(filename)}" alt="{escape(experiment)} {escape(filename)}"></div>'
+            for filename in repeat_channel_cts_windows
+        )
         channel_html = "".join(
             f'<div><h3>CTS Channel Volume Bin {escape(filename.rsplit("_", 1)[-1].replace(".png", ""))}</h3><img src="{escape(filename)}" alt="{escape(experiment)} {escape(filename)}"></div>'
             for filename in channel_files
@@ -1686,7 +1902,14 @@ def build_report(run_root: Path, output_dir: Path) -> None:
             f"""
             <section class="card">
               <h2>{escape(experiment)}</h2>
-              <p>Mode comparison uses repeat-level medians. CTS diagnostics are derived from steady-phase <code>PROXY_RECV_POST</code> and <code>PROXY_RECV_WSTALL</code> events parsed from <code>worker_launcher.log</code>.</p>
+              <p>Mode comparison uses repeat-level medians. CTS diagnostics are derived from steady-phase <code>PROXY_RECV_POST</code>, <code>PROXY_RECV_NET_DONE</code>, <code>PROXY_RECV_VISIBLE</code>, and <code>PROXY_RECV_CONSUMED</code> events parsed from <code>worker_launcher.log</code>.</p>
+              <div class="note">
+                <strong>W-effect focus.</strong>
+                The most direct evidence for the feature is whether smaller/larger <code>W</code> changes
+                per-repeat CTS/POST volume, active channel count, and observed <code>post - receive</code>
+                occupancy. The plots below make that comparison explicitly at the experiment level and for
+                each <code>repeat</code>.
+              </div>
               {summary_table}
               <div class="note">
                 <strong>Aborted / Incomplete Runs</strong>
@@ -1700,8 +1923,12 @@ def build_report(run_root: Path, output_dir: Path) -> None:
                 <div><h3>Latency vs W</h3><img src="{escape(latency_vs_w)}" alt="{escape(experiment)} latency vs W"></div>
                 <div><h3>Throughput vs W</h3><img src="{escape(throughput_vs_w)}" alt="{escape(experiment)} throughput vs W"></div>
                 <div><h3>CTS/POST Volume by Worker vs W</h3><img src="{escape(cts_worker_volume)}" alt="{escape(experiment)} CTS volume by worker"></div>
+                <div><h3>Active CTS Channels by W (per repeat)</h3><img src="{escape(active_channels)}" alt="{escape(experiment)} active channels by W"></div>
                 <div><h3>Post-Receive Gate Effect vs W</h3><img src="{escape(gate_effect)}" alt="{escape(experiment)} gate effect"></div>
+                <div><h3>Observed occPr vs W (per repeat)</h3><img src="{escape(occpr_vs_w)}" alt="{escape(experiment)} occpr vs W"></div>
                 <div><h3>CTS Progress by W</h3><img src="{escape(cts_progress)}" alt="{escape(experiment)} CTS progress by W"></div>
+                {repeat_channel_cts_html}
+                {repeat_channel_cts_windows_html}
                 {exact_step_html}
                 {exact_channel_html}
                 <div><h3>Step Throughput by W</h3><img src="{escape(throughput_bar_all)}" alt="{escape(experiment)} step throughput by W"></div>
