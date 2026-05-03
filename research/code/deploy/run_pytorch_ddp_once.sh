@@ -20,6 +20,7 @@ VENV_DIR="${VENV_DIR:-${WORKSPACE_ROOT}/venvs/torch-cu121-custom}"
 PYTHON_SCRIPT="${PYTHON_SCRIPT:-research/code/pr_phase1/ddp_collective_runner.py}"
 BOOTSTRAP_IF_MISSING="${BOOTSTRAP_IF_MISSING:-0}"
 BOOTSTRAP_TARGET="${BOOTSTRAP_TARGET:-all}"
+RUNNER_EXTRA_ARGS="${RUNNER_EXTRA_ARGS:-}"
 
 usage() {
   cat <<'EOF'
@@ -40,6 +41,7 @@ Usage:
     [--python-script PATH]
     [--bootstrap-if-missing 0|1]
     [--bootstrap-target nccl|tests|pytorch|all]
+    [--runner-extra-args '...']
 EOF
 }
 
@@ -60,6 +62,7 @@ while [[ $# -gt 0 ]]; do
     --python-script) PYTHON_SCRIPT="${2:-}"; shift 2 ;;
     --bootstrap-if-missing) BOOTSTRAP_IF_MISSING="${2:-}"; shift 2 ;;
     --bootstrap-target) BOOTSTRAP_TARGET="${2:-}"; shift 2 ;;
+    --runner-extra-args) RUNNER_EXTRA_ARGS="${2:-}"; shift 2 ;;
     --help|-h) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
   esac
@@ -153,9 +156,16 @@ venv_dir=${VENV_DIR}
 python_script=${PYTHON_SCRIPT}
 nccl_phase1_inflight_w=${NCCL_PHASE1_INFLIGHT_W:-}
 nccl_algo=${NCCL_ALGO:-auto}
+runner_extra_args=${RUNNER_EXTRA_ARGS}
 EOF
 
 echo "[ddp-runner] start experiment=${EXPERIMENT_NAME} mode=${MODE_NAME} node_rank=${NODE_RANK} world_size=${WORLD_SIZE} master=${MASTER_ADDR}:${MASTER_PORT}"
+
+extra_args=()
+if [[ -n "${RUNNER_EXTRA_ARGS}" ]]; then
+  # shellcheck disable=SC2206
+  extra_args=( ${RUNNER_EXTRA_ARGS} )
+fi
 
 torchrun \
   --nnodes "${WORLD_SIZE}" \
@@ -169,6 +179,7 @@ torchrun \
   --steps "${STEPS}" \
   --warmup-steps "${WARMUP_STEPS}" \
   --payload-mb "${PAYLOAD_MB}" \
+  "${extra_args[@]}" \
   --output-dir "${OUTPUT_DIR}"
 
 echo "[ddp-runner] finished experiment=${EXPERIMENT_NAME} mode=${MODE_NAME} node_rank=${NODE_RANK}"

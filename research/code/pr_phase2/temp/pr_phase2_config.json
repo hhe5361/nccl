@@ -1,0 +1,18 @@
+{
+  "output_root": "/mnt/nfs_share/cts_experiments/pr_phase2",
+  "steps": 50,
+  "warmup_steps": 5,
+  "payload_mb": 128,
+  "repeats": 1,
+  "nproc_per_node": 1,
+  "venv_dir": "/workspace/venvs/torch-cu121-custom",
+  "bootstrap_if_missing": 0,
+  "bootstrap_target": "all",
+  "timeout_sec": 300,
+  "experiments": ["allreduce_ring"],
+  "hidden_dim": 256,
+  "num_layers": 4,
+  "batch_size": 8,
+  "bucket_cap_mb": 1,
+  "lr": 0.001
+}
