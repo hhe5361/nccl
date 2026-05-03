@@ -1492,12 +1492,19 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
   int checkedNetAttr = 0;
   if (args->state == ncclProxyOpReady) {
     // Initialize subs and group them by same recvComm.
+    // With phase1 inflight gating enabled, keep each sub independent.
+    // The grouped recv path assumes group members advance in lockstep, and
+    // a stalled sub can otherwise block progress for its siblings.
+    bool phase1DisableRecvGrouping = phase1InflightWConfigured() > 0.0;
     void* recvComm;
     int groupSize = 0;
     int maxRecvs = 1;
     for (int s=0; s<args->nsubs; s++) {
       struct ncclProxySubArgs* sub = args->subs+s;
-      if (groupSize == maxRecvs) {
+      if (phase1DisableRecvGrouping) {
+        groupSize = 0;
+        maxRecvs = 1;
+      } else if (groupSize == maxRecvs) {
         groupSize = 0;
       } else if (s>0) { // Find next sub with the same recvComm
         int next;
