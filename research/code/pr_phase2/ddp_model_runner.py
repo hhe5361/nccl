@@ -25,6 +25,13 @@ class TinyStack(nn.Module):
         return self.net(x)
 
 
+def debug_log(rank: int, stage: str, **fields) -> None:
+    payload = " ".join(f"{key}={value}" for key, value in fields.items())
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    suffix = f" {payload}" if payload else ""
+    print(f"[phase2-ddp][{ts}][rank={rank}] {stage}{suffix}", file=sys.stderr, flush=True)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="PR Phase2 tiny DDP training-like runner")
     parser.add_argument("--collective", choices=["allreduce"], required=True)
@@ -111,9 +118,12 @@ def main() -> None:
     world_size = int(os.environ["WORLD_SIZE"])
     configured_w = os.environ.get("NCCL_PHASE1_INFLIGHT_W")
 
+    debug_log(rank, "startup", local_rank=local_rank, world_size=world_size, configured_w=configured_w, output_dir=args.output_dir)
+
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
     dist.init_process_group(backend="nccl", init_method="env://")
+    debug_log(rank, "process_group_initialized")
 
     model = TinyStack(hidden_dim=args.hidden_dim, num_layers=args.num_layers).to(device=device, dtype=torch.float32)
     ddp_model = DDP(
@@ -139,6 +149,7 @@ def main() -> None:
     verification = []
 
     dist.barrier()
+    debug_log(rank, "startup_barrier_complete")
 
     with trace_path.open("w", encoding="utf-8") as trace_fp:
         total_steps = args.warmup_steps + args.steps
@@ -196,6 +207,8 @@ def main() -> None:
             trace_fp.write(json.dumps(record) + "\n")
             step_records.append(record)
 
+    debug_log(rank, "step_loop_complete", records=len(step_records), verification_all_ok=all(verification))
+
     steady = [row["duration_ms"] for row in step_records if row["phase"] == "steady"]
     summary = {
         "rank": rank,
@@ -222,15 +235,20 @@ def main() -> None:
         "steady_samples_per_sec_avg": (sum(float(global_batch_size) / max(v / 1000.0, 1e-9) for v in steady) / len(steady)) if steady else None,
         "trace_file": str(trace_path),
     }
+    debug_log(rank, "before_summary_write", summary_path=summary_path)
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    debug_log(rank, "after_summary_write", steady_count=len(steady))
 
     try:
         if dist.is_initialized():
+            debug_log(rank, "before_destroy_process_group")
             dist.destroy_process_group()
+            debug_log(rank, "after_destroy_process_group")
     except Exception:
-        pass
+        debug_log(rank, "destroy_process_group_failed")
     sys.stdout.flush()
     sys.stderr.flush()
+    debug_log(rank, "before_force_exit")
     os._exit(0)
 
 
