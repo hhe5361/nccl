@@ -1,7 +1,7 @@
 {
   "phase": "phase4",
   "name": "b4_post_received_ddp_tiny",
-  "description": "Appendix-1 phase4 experiment with grouped recv path preserved and an integer post-received < W gate.",
+  "description": "Appendix-1 phase4 experiment with grouped recv path preserved, repeat support, and a probabilistic real-valued post-received < W gate.",
   "run": {
     "run_id_prefix": "phase4_b4_ddp",
     "master_server": "worker01",
@@ -21,10 +21,14 @@
       "stock",
       "stock_2",
       "b4_w2",
+      "b4_w2_5",
       "b4_w4",
+      "b4_w5",
       "b4_w6",
+      "b4_w7",
       "b4_w8"
     ],
+    "repeats": 3,
     "steps": 50,
     "warmup_steps": 5,
     "mode_timeout_sec": 600,
@@ -55,14 +59,15 @@
   },
   "model": {
     "dtype": "float32",
-    "hidden_dim": 128,
-    "num_layers": 2,
-    "batch_size": 8,
+    "hidden_dim": 512,
+    "num_layers": 4,
+    "batch_size": 16,
     "bucket_cap_mb": 1,
-    "lr": 0.01
+    "lr": 0.01,
+    "model_seed": 20260504
   },
   "nccl": {
-    "algo": "auto",
+    "algo": "Ring",
     "proto": "auto",
     "phase0_log": 1,
     "phase4_log": 0,
@@ -88,25 +93,43 @@
       "mode_id": "b4_w2",
       "label": "B4_W2",
       "phase4_enable": 1,
-      "post_receive_w": 2
+      "post_receive_w": 2.0
+    },
+    {
+      "mode_id": "b4_w2_5",
+      "label": "B4_W2_5",
+      "phase4_enable": 1,
+      "post_receive_w": 2.5
     },
     {
       "mode_id": "b4_w4",
       "label": "B4_W4",
       "phase4_enable": 1,
-      "post_receive_w": 4
+      "post_receive_w": 4.0
+    },
+    {
+      "mode_id": "b4_w5",
+      "label": "B4_W5",
+      "phase4_enable": 1,
+      "post_receive_w": 5.0
     },
     {
       "mode_id": "b4_w6",
       "label": "B4_W6",
       "phase4_enable": 1,
-      "post_receive_w": 6
+      "post_receive_w": 6.0
+    },
+    {
+      "mode_id": "b4_w7",
+      "label": "B4_W7",
+      "phase4_enable": 1,
+      "post_receive_w": 7.0
     },
     {
       "mode_id": "b4_w8",
       "label": "B4_W8",
       "phase4_enable": 1,
-      "post_receive_w": 8
+      "post_receive_w": 8.0
     }
   ]
 }

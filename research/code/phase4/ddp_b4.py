@@ -96,8 +96,9 @@ def main() -> None:
     output_dir = Path(args.output_dir) if args.output_dir else None
     worker_name = os.environ.get("WORKER_NAME", f"worker_rank{rank}")
     phase4_mode = os.environ.get("PHASE4_MODE", "stock").lower()
+    repeat_label = os.environ.get("PHASE4_REPEAT_LABEL", "repeat_01")
     phase4_enable = int(os.environ.get("NCCL_PHASE4_ENABLE", "0"))
-    phase4_post_receive_w = int(os.environ.get("NCCL_PHASE4_POST_RECEIVE_W", "0"))
+    phase4_post_receive_w = float(os.environ.get("NCCL_PHASE4_POST_RECEIVE_W", "0"))
 
     if rank == 0 and output_dir is not None:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -129,7 +130,7 @@ def main() -> None:
             f"hidden_dim={args.hidden_dim} num_layers={args.num_layers} batch_size={args.batch_size} "
             f"bucket_cap_mb={args.bucket_cap_mb} dtype={args.dtype} world_size={world_size} "
             f"phase4_mode={phase4_mode} phase4_enable={phase4_enable} phase4_post_receive_w={phase4_post_receive_w} "
-            f"param_mb={total_param_mb:.6f}"
+            f"repeat_label={repeat_label} param_mb={total_param_mb:.6f}"
         )
 
     records = []
@@ -179,6 +180,7 @@ def main() -> None:
             record = {
                 "step": step,
                 "tag": run_tag,
+                "repeat_label": repeat_label,
                 "phase4_mode": phase4_mode,
                 "phase4_enable": phase4_enable,
                 "phase4_post_receive_w": phase4_post_receive_w,
@@ -217,6 +219,7 @@ def main() -> None:
                     "step": step,
                     "rank": rank,
                     "worker": worker_name,
+                    "repeat_label": repeat_label,
                     "phase4_mode": phase4_mode,
                     "phase4_enable": phase4_enable,
                     "phase4_post_receive_w": phase4_post_receive_w,
@@ -241,6 +244,7 @@ def main() -> None:
             "worker": worker_name,
             "rank": rank,
             "tag": run_tag,
+            "repeat_label": repeat_label,
             "phase4_mode": phase4_mode,
             "phase4_enable": phase4_enable,
             "phase4_post_receive_w": phase4_post_receive_w,
@@ -262,6 +266,7 @@ def main() -> None:
         effective = [r for r in records if not r["warmup"]]
         summary = {
             "run_tag": run_tag,
+            "repeat_label": repeat_label,
             "phase4_mode": phase4_mode,
             "phase4_enable": phase4_enable,
             "phase4_post_receive_w": phase4_post_receive_w,

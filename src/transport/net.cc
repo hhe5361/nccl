@@ -18,6 +18,7 @@
 #include "shm.h"
 #include "compiler.h"
 #include <assert.h>
+#include <stdlib.h>
 #include <string.h>
 #include "register_inline.h"
 
@@ -704,6 +705,48 @@ static inline int phase1WindowEff(struct ncclProxyArgs* args) {
   return (wCfg > 0) ? std::min(wBase, std::max(1, wCfg)) : wBase;
 }
 
+static inline double phase4WindowRaw() {
+  const char* env = getenv("NCCL_PHASE4_POST_RECEIVE_W");
+  if (env == NULL || env[0] == '\0') return 0.0;
+  char* end = NULL;
+  double value = strtod(env, &end);
+  if (end == env) return 0.0;
+  if (value < 0.0) return 0.0;
+  return value;
+}
+
+static inline uint64_t phase4Mix64(uint64_t x) {
+  x ^= x >> 30;
+  x *= 0xbf58476d1ce4e5b9ULL;
+  x ^= x >> 27;
+  x *= 0x94d049bb133111ebULL;
+  x ^= x >> 31;
+  return x;
+}
+
+static inline int phase4WindowEff(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    double wRaw) {
+  if (wRaw <= 0.0) return 0;
+  int wFloor = (int)wRaw;
+  double wFrac = wRaw - (double)wFloor;
+  if (wFrac <= 0.0) return wFloor;
+
+  uint64_t ticket = (uint64_t)sub->base + (uint64_t)sub->posted;
+  uint64_t seed = ticket;
+  seed ^= ((uint64_t)(proxyState->tpRank & 0xffff)) << 48;
+  seed ^= ((uint64_t)(sub->peer & 0xffff)) << 32;
+  seed ^= ((uint64_t)(sub->channelId & 0xffff)) << 16;
+  seed ^= ((uint64_t)(args->coll & 0xff)) << 8;
+  seed ^= (uint64_t)(args->protocol & 0xff);
+
+  uint64_t mixed = phase4Mix64(seed);
+  double unit = (double)(mixed >> 11) * (1.0 / 9007199254740992.0);
+  return unit < wFrac ? (wFloor + 1) : wFloor;
+}
+
 struct phase2WindowDecision {
   int enabled;
   int rackSelf;
@@ -896,7 +939,7 @@ static inline void phase1ProxyWindowCfgLog(
     int wEff) {
   if (ncclParamPhase0Log() == 0 || sub->phase1WindowCfgLogged) return;
   INFO(NCCL_NET,
-      "PHASE1 event=PROXY_WINDOW_CFG tNs=%llu rank=%d peer=%d channel=%d coll=%s collApi=%s algo=%s proto=%s shared=%d nsubs=%d base=%llu nsteps=%d wBase=%d wCfg=%d wEff=%d",
+      "PHASE1 event=PROXY_WINDOW_CFG tNs=%llu rank=%d peer=%d channel=%d coll=%s collApi=%s algo=%s proto=%s shared=%d nsubs=%d base=%llu nsteps=%d maxDepth=%d wBase=%d wCfg=%d wEff=%d",
       (unsigned long long)clockNano(),
       proxyState->tpRank,
       sub->peer,
@@ -909,6 +952,7 @@ static inline void phase1ProxyWindowCfgLog(
       args->nsubs,
       (unsigned long long)sub->base,
       sub->nsteps,
+      wBase,
       wBase,
       wCfg,
       wEff);
@@ -1083,10 +1127,12 @@ static inline void phase4ProxyWindowCfgLog(
     struct ncclProxyState* proxyState,
     struct ncclProxyArgs* args,
     struct ncclProxySubArgs* sub,
-    int wCfg) {
+    int maxDepth,
+    double wCfgRaw,
+    int wEff) {
   if (ncclParamPhase4Log() == 0 || sub->phase4WindowCfgLogged) return;
   INFO(NCCL_NET,
-      "PHASE4 event=PROXY_WINDOW_CFG tNs=%llu rank=%d peer=%d channel=%d coll=%s collApi=%s algo=%s proto=%s base=%llu nsteps=%d wCfg=%d",
+      "PHASE4 event=PROXY_WINDOW_CFG tNs=%llu rank=%d peer=%d channel=%d coll=%s collApi=%s algo=%s proto=%s base=%llu nsteps=%d maxDepth=%d wCfgRaw=%.3f wEff=%d",
       (unsigned long long)clockNano(),
       proxyState->tpRank,
       sub->peer,
@@ -1097,8 +1143,37 @@ static inline void phase4ProxyWindowCfgLog(
       ncclProtoToString(args->protocol),
       (unsigned long long)sub->base,
       sub->nsteps,
-      wCfg);
+      maxDepth,
+      wCfgRaw,
+      wEff);
   sub->phase4WindowCfgLogged = 1;
+}
+
+static inline void phase4ProxyMaxDepthLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    int maxDepth,
+    int phase4Enabled,
+    double wCfgRaw) {
+  if (args->phase4MaxDepthLogged) return;
+  if (ncclParamPhase0Log() == 0 && ncclParamPhase4Log() == 0) return;
+  INFO(NCCL_NET,
+      "PHASE4 event=PROXY_MAX_DEPTH tNs=%llu rank=%d peer=%d channel=%d coll=%s collApi=%s algo=%s proto=%s base=%llu nsteps=%d maxDepth=%d phase4Enable=%d wCfgRaw=%.3f",
+      (unsigned long long)clockNano(),
+      proxyState->tpRank,
+      sub->peer,
+      sub->channelId,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol),
+      (unsigned long long)sub->base,
+      sub->nsteps,
+      maxDepth,
+      phase4Enabled,
+      wCfgRaw);
+  args->phase4MaxDepthLogged = 1;
 }
 
 static inline void phase4ProxyWstallLog(
@@ -1107,12 +1182,13 @@ static inline void phase4ProxyWstallLog(
     struct ncclProxySubArgs* sub,
     const char* event,
     int slot,
-    int wCfg,
+    double wCfgRaw,
+    int wEff,
     uint8_t* stallFlag) {
   if (ncclParamAppendix2DisableWstallLog()) return;
   if (ncclParamPhase4Log() == 0 || *stallFlag) return;
   INFO(NCCL_NET,
-      "PHASE4 event=%s tNs=%llu rank=%d peer=%d channel=%d slot=%d coll=%s collApi=%s algo=%s proto=%s base=%llu posted=%llu received=%llu transmitted=%llu done=%llu nsteps=%d wCfg=%d occPr=%llu occPd=%llu",
+      "PHASE4 event=%s tNs=%llu rank=%d peer=%d channel=%d slot=%d coll=%s collApi=%s algo=%s proto=%s base=%llu posted=%llu received=%llu transmitted=%llu done=%llu nsteps=%d wCfgRaw=%.3f wEff=%d occPr=%llu occPd=%llu",
       event,
       (unsigned long long)clockNano(),
       proxyState->tpRank,
@@ -1129,7 +1205,8 @@ static inline void phase4ProxyWstallLog(
       (unsigned long long)sub->transmitted,
       (unsigned long long)sub->done,
       sub->nsteps,
-      wCfg,
+      wCfgRaw,
+      wEff,
       (unsigned long long)(sub->posted - sub->received),
       (unsigned long long)(sub->posted - sub->done));
   *stallFlag = 1;
@@ -2016,6 +2093,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
   int checkedNetAttr = 0;
   if (args->state == ncclProxyOpReady) {
     // Initialize subs and group them by same recvComm.
+    args->phase4MaxDepthLogged = 0;
     void* recvComm;
     int groupSize = 0;
     int maxRecvs = 1;
@@ -2081,7 +2159,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
     int wBase = phase1WindowBaseDepth(args);
     int wCfg = phase1WindowCfg();
     int phase4Enabled = ncclParamPhase4Enable();
-    int phase4W = ncclParamPhase4PostReceiveW();
+    double phase4WRaw = phase4WindowRaw();
     for (int s=0; s<args->nsubs; s+=args->subs[s].groupSize) {
       struct ncclProxySubArgs* subGroup = args->subs+s;
       int subCount = 0;
@@ -2099,9 +2177,10 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
           struct phase3WindowDecision phase3Decision = phase3SnapshotWindow(sub, &semanticDecision);
           int wEff = wBase;
           int slotDepth = wBase;
-          if (phase4Enabled && phase4W > 0) {
-            wEff = phase4W;
-            phase4ProxyWindowCfgLog(proxyState, args, sub, wEff);
+          phase4ProxyMaxDepthLog(proxyState, args, sub, wBase, phase4Enabled, phase4WRaw);
+          if (phase4Enabled && phase4WRaw > 0.0) {
+            wEff = phase4WindowEff(proxyState, args, sub, phase4WRaw);
+            phase4ProxyWindowCfgLog(proxyState, args, sub, wBase, phase4WRaw, wEff);
           } else if (wCfg > 0) {
             wEff = phase1WindowEff(args);
           } else if (phase3Decision.enabled) {
@@ -2124,8 +2203,8 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             subCount = 0;
             break;
           }
-          if (phase4Enabled && phase4W > 0 && sub->posted >= sub->received + wEff) {
-            phase4ProxyWstallLog(proxyState, args, sub, "PROXY_RECV_WSTALL", (sub->base+sub->posted)%NCCL_STEPS, wEff, &sub->phase4RecvWstall);
+          if (phase4Enabled && phase4WRaw > 0.0 && sub->posted >= sub->received + wEff) {
+            phase4ProxyWstallLog(proxyState, args, sub, "PROXY_RECV_WSTALL", (sub->base+sub->posted)%NCCL_STEPS, phase4WRaw, wEff, &sub->phase4RecvWstall);
             subCount = 0;
             break;
           }

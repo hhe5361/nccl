@@ -30,6 +30,10 @@ NUM_LAYERS=${NUM_LAYERS:-2}
 BATCH_SIZE=${BATCH_SIZE:-8}
 BUCKET_CAP_MB=${BUCKET_CAP_MB:-1}
 LR=${LR:-0.01}
+MODEL_SEED=${MODEL_SEED:-20260504}
+REPEAT_LABEL=${REPEAT_LABEL:-repeat_01}
+PHASE4_ENABLE_VALUE=${PHASE4_ENABLE_VALUE:-}
+PHASE4_POST_RECEIVE_W_VALUE=${PHASE4_POST_RECEIVE_W_VALUE:-}
 
 mkdir -p "${RUN_ROOT}" "${RUN_ROOT}/${WORKER_NAME}" "${STATUS_DIR}"
 
@@ -53,16 +57,16 @@ export NCCL_PHASE1_STATIC_W=0
 
 case "${MODE}" in
   stock)
-    export NCCL_PHASE4_ENABLE=0
-    export NCCL_PHASE4_POST_RECEIVE_W=0
+    export NCCL_PHASE4_ENABLE=${PHASE4_ENABLE_VALUE:-0}
+    export NCCL_PHASE4_POST_RECEIVE_W=${PHASE4_POST_RECEIVE_W_VALUE:-0}
     ;;
   stock_2)
-    export NCCL_PHASE4_ENABLE=0
-    export NCCL_PHASE4_POST_RECEIVE_W=0
+    export NCCL_PHASE4_ENABLE=${PHASE4_ENABLE_VALUE:-0}
+    export NCCL_PHASE4_POST_RECEIVE_W=${PHASE4_POST_RECEIVE_W_VALUE:-0}
     ;;
   b4_w*)
-    export NCCL_PHASE4_ENABLE=1
-    export NCCL_PHASE4_POST_RECEIVE_W="${MODE#b4_w}"
+    export NCCL_PHASE4_ENABLE=${PHASE4_ENABLE_VALUE:-1}
+    export NCCL_PHASE4_POST_RECEIVE_W=${PHASE4_POST_RECEIVE_W_VALUE:-${MODE#b4_w}}
     ;;
   *)
     echo "[phase4-worker] unsupported MODE=${MODE}" >&2
@@ -99,6 +103,7 @@ fi
 MODE_UPPER=$(echo "${MODE}" | tr '[:lower:]' '[:upper:]')
 export PHASE4_MODE="${MODE}"
 export PHASE4_OUTPUT_DIR="${RUN_ROOT}"
+export PHASE4_REPEAT_LABEL="${REPEAT_LABEL}"
 export NCCL_DEBUG_FILE="${RUN_ROOT}/${WORKER_NAME}/nccl.%h.%p.log"
 
 STATUS_DDP=-1
@@ -159,11 +164,13 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 echo "[phase4-worker] RUN_ID=${RUN_ID} EXPERIMENT=${EXPERIMENT_LABEL}"
+echo "[phase4-worker] REPEAT_LABEL=${REPEAT_LABEL}"
 echo "[phase4-worker] WORKER_NAME=${WORKER_NAME} NODE_RANK=${NODE_RANK}/${NNODES} MODE=${MODE_UPPER}"
 echo "[phase4-worker] MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT}"
 echo "[phase4-worker] PHASE4_ENABLE=${NCCL_PHASE4_ENABLE} PHASE4_POST_RECEIVE_W=${NCCL_PHASE4_POST_RECEIVE_W}"
 echo "[phase4-worker] APPENDIX2_GROUP_LOG=${NCCL_APPENDIX2_GROUP_LOG}"
 echo "[phase4-worker] HIDDEN_DIM=${HIDDEN_DIM} NUM_LAYERS=${NUM_LAYERS} BATCH_SIZE=${BATCH_SIZE} BUCKET_CAP_MB=${BUCKET_CAP_MB} LR=${LR}"
+echo "[phase4-worker] MODEL_SEED=${MODEL_SEED}"
 echo "[phase4-worker] NCCL_ALGO=${ALGO_SETTING} NCCL_PROTO=${PROTO_SETTING} STATUS_FILE=${STATUS_FILE}"
 echo "[phase4-worker] NCCL_DEBUG_FILE=${NCCL_DEBUG_FILE}"
 
@@ -187,7 +194,8 @@ timeout --signal=TERM --kill-after=30 "${MODE_TIMEOUT_SEC}" \
     --num-layers "${NUM_LAYERS}" \
     --batch-size "${BATCH_SIZE}" \
     --bucket-cap-mb "${BUCKET_CAP_MB}" \
-    --lr "${LR}"
+    --lr "${LR}" \
+    --model-seed "${MODEL_SEED}"
 RUN_RC=$?
 set -e
 

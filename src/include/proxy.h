@@ -216,6 +216,7 @@ struct ncclProxyArgs {
   int nPeers;
 
   int idle;
+  uint8_t phase4MaxDepthLogged;
 
   // Element linking
   struct ncclProxyArgs* next;

@@ -28,6 +28,7 @@ ssh = cfg.get("ssh", {})
 paths = cfg.get("paths", {})
 nccl = cfg.get("nccl", {})
 modes = [m.get("mode_id") for m in cfg.get("mode_matrix", []) if m.get("mode_id")]
+mode_matrix_json = json.dumps(cfg.get("mode_matrix", []), separators=(",", ":"))
 workers = run.get("all_workers", [])
 
 pairs = {
@@ -38,8 +39,10 @@ pairs = {
     "CFG_LOG_ROOT_BASE": paths.get("log_root_base", "/mnt/nfs_share/cts_experiments"),
     "CFG_ALL_WORKERS": ",".join(workers),
     "CFG_RUN_MODES": ",".join(modes),
+    "CFG_MODE_MATRIX_JSON": mode_matrix_json,
     "CFG_STEPS": run.get("steps", 40),
     "CFG_WARMUP_STEPS": run.get("warmup_steps", 5),
+    "CFG_REPEATS": run.get("repeats", 1),
     "CFG_MODE_TIMEOUT_SEC": run.get("mode_timeout_sec", 600),
     "CFG_TORCH_ENV": run.get("torch_env", "/workspace/venvs/torch-cu121-custom/bin/activate"),
     "CFG_TARGET_SCRIPT": run.get("target_script", "research/code/phase4/ddp_b4.py"),
@@ -64,6 +67,7 @@ pairs = {
     "CFG_BATCH_SIZE": model.get("batch_size", 8),
     "CFG_BUCKET_CAP_MB": model.get("bucket_cap_mb", 1),
     "CFG_LR": model.get("lr", 0.01),
+    "CFG_MODEL_SEED": model.get("model_seed", 20260504),
     "CFG_NCCL_ALGO": nccl.get("algo", "auto"),
     "CFG_NCCL_PROTO": nccl.get("proto", "auto"),
     "CFG_NCCL_PHASE0_LOG": nccl.get("phase0_log", 1),
@@ -87,8 +91,10 @@ LOG_ROOT_BASE=${LOG_ROOT_BASE:-${CFG_LOG_ROOT_BASE}}
 LOG_ROOT=${LOG_ROOT:-${LOG_ROOT_BASE}/${RUN_ID}}
 ALL_WORKERS=${ALL_WORKERS:-${CFG_ALL_WORKERS}}
 RUN_MODES=${RUN_MODES:-${CFG_RUN_MODES}}
+MODE_MATRIX_JSON=${MODE_MATRIX_JSON:-${CFG_MODE_MATRIX_JSON}}
 STEPS=${STEPS:-${CFG_STEPS}}
 WARMUP_STEPS=${WARMUP_STEPS:-${CFG_WARMUP_STEPS}}
+REPEATS=${REPEATS:-${CFG_REPEATS}}
 MODE_TIMEOUT_SEC=${MODE_TIMEOUT_SEC:-${CFG_MODE_TIMEOUT_SEC}}
 TORCH_ENV=${TORCH_ENV:-${CFG_TORCH_ENV}}
 TARGET_SCRIPT=${TARGET_SCRIPT:-${CFG_TARGET_SCRIPT}}
@@ -113,6 +119,7 @@ NUM_LAYERS=${NUM_LAYERS:-${CFG_NUM_LAYERS}}
 BATCH_SIZE=${BATCH_SIZE:-${CFG_BATCH_SIZE}}
 BUCKET_CAP_MB=${BUCKET_CAP_MB:-${CFG_BUCKET_CAP_MB}}
 LR=${LR:-${CFG_LR}}
+MODEL_SEED=${MODEL_SEED:-${CFG_MODEL_SEED}}
 NCCL_ALGO=${NCCL_ALGO:-${CFG_NCCL_ALGO}}
 NCCL_PROTO=${NCCL_PROTO:-${CFG_NCCL_PROTO}}
 NCCL_PHASE0_LOG=${NCCL_PHASE0_LOG:-${CFG_NCCL_PHASE0_LOG}}
@@ -259,6 +266,31 @@ resolve_worker_ssh_port() {
   echo "${WORKER_SSH_PORT}"
 }
 
+mode_field() {
+  local mode_id=$1
+  local field=$2
+  local default_value=${3:-}
+  python3 - "${MODE_MATRIX_JSON}" "${mode_id}" "${field}" "${default_value}" <<'PY'
+import json
+import sys
+
+matrix = json.loads(sys.argv[1])
+mode_id = sys.argv[2]
+field = sys.argv[3]
+default_value = sys.argv[4]
+
+for row in matrix:
+    if row.get("mode_id") == mode_id:
+        value = row.get(field, default_value)
+        if value is None:
+            value = default_value
+        print(value)
+        sys.exit(0)
+
+print(default_value)
+PY
+}
+
 remote_worker_bash() {
   local worker=$1
   local cmd=$2
@@ -382,8 +414,11 @@ build_worker_host_command() {
   local worker=$1
   local rank=$2
   local mode=$3
-  local run_root=$4
-  local status_file=$5
+  local repeat_label=$4
+  local phase4_enable_value=$5
+  local phase4_post_receive_w_value=$6
+  local run_root=$7
+  local status_file=$8
   local remote_repo_root
 
   remote_repo_root=$(resolve_remote_repo_root "${worker}")
@@ -393,6 +428,9 @@ cd $(printf '%q' "${CONTAINER_REPO_ROOT}") && \
 RUN_ID=$(printf '%q' "${RUN_ID}") \
 EXPERIMENT_LABEL=$(printf '%q' "phase4_ddp_tiny") \
 MODE=$(printf '%q' "${mode}") \
+REPEAT_LABEL=$(printf '%q' "${repeat_label}") \
+PHASE4_ENABLE_VALUE=$(printf '%q' "${phase4_enable_value}") \
+PHASE4_POST_RECEIVE_W_VALUE=$(printf '%q' "${phase4_post_receive_w_value}") \
 MASTER_ADDR=$(printf '%q' "${MASTER_ADDR}") \
 MASTER_PORT=$(printf '%q' "${MASTER_PORT}") \
 NNODES=$(printf '%q' "${NNODES}") \
@@ -422,6 +460,7 @@ NUM_LAYERS=$(printf '%q' "${NUM_LAYERS}") \
 BATCH_SIZE=$(printf '%q' "${BATCH_SIZE}") \
 BUCKET_CAP_MB=$(printf '%q' "${BUCKET_CAP_MB}") \
 LR=$(printf '%q' "${LR}") \
+MODEL_SEED=$(printf '%q' "${MODEL_SEED}") \
 bash $(printf '%q' "${WORKER_SCRIPT}")
 EOF
 )
@@ -438,8 +477,11 @@ launch_worker_mode() {
   local worker=$1
   local rank=$2
   local mode=$3
-  local run_root=$4
-  local status_file=$5
+  local repeat_label=$4
+  local phase4_enable_value=$5
+  local phase4_post_receive_w_value=$6
+  local run_root=$7
+  local status_file=$8
   local mode_upper_value
   mode_upper_value=$(echo "${mode}" | tr '[:lower:]' '[:upper:]')
   local worker_log_root="${run_root}/${worker}"
@@ -447,7 +489,7 @@ launch_worker_mode() {
   mkdir -p "${worker_log_root}"
   write_pending_status "${status_file}" "${worker}" "${rank}" "${mode_upper_value}"
   local host_cmd
-  host_cmd=$(build_worker_host_command "${worker}" "${rank}" "${mode}" "${run_root}" "${status_file}")
+  host_cmd=$(build_worker_host_command "${worker}" "${rank}" "${mode}" "${repeat_label}" "${phase4_enable_value}" "${phase4_post_receive_w_value}" "${run_root}" "${status_file}")
 
   echo "[phase4-matrix] launch worker=${worker} rank=${rank} mode=${mode_upper_value}"
   if [[ "${worker}" == "${MASTER_SERVER}" ]]; then
@@ -542,31 +584,31 @@ print_failed_worker_logs() {
   done
 }
 
-VALIDATION_JSON="${LOG_ROOT}/final_output_validation.json"
-
 compare_outputs() {
+  local experiment_root=$1
+  local output_json=$2
   if [[ ! -f "${REPO_ROOT}/${COMPARE_SCRIPT}" ]]; then
     echo "[phase4-matrix] compare script missing path=${COMPARE_SCRIPT}"
     return 0
   fi
-  echo "[phase4-matrix] validating final outputs against STOCK"
+  echo "[phase4-matrix] validating final outputs against STOCK experiment_root=${experiment_root}"
   python3 "${REPO_ROOT}/${COMPARE_SCRIPT}" \
-    --experiment-root "${LOG_ROOT}" \
-    --output-json "${VALIDATION_JSON}" || true
+    --experiment-root "${experiment_root}" \
+    --output-json "${output_json}" || true
 }
 
-NCC_EVENT_SUMMARY_JSON="${LOG_ROOT}/phase4_ncc_event_summary.json"
-
 summarize_nccl_events() {
+  local experiment_root=$1
+  local output_json=$2
   local summary_script="${REPO_ROOT}/research/code/phase4/phase4_ncc_event_summary.py"
   if [[ ! -f "${summary_script}" ]]; then
     echo "[phase4-matrix] ncc event summary script missing path=${summary_script}"
     return 0
   fi
-  echo "[phase4-matrix] summarizing NCCL recv/group events"
+  echo "[phase4-matrix] summarizing NCCL recv/group events experiment_root=${experiment_root}"
   python3 "${summary_script}" \
-    --experiment-root "${LOG_ROOT}" \
-    --output-json "${NCC_EVENT_SUMMARY_JSON}" || true
+    --experiment-root "${experiment_root}" \
+    --output-json "${output_json}" || true
 }
 
 MANIFEST_JSON="${LOG_ROOT}/phase4_manifest.json"
@@ -578,6 +620,7 @@ cat > "${MANIFEST_JSON}" <<EOF
   "master_addr": "${MASTER_ADDR}",
   "master_port": ${MASTER_PORT},
   "run_modes": "${RUN_MODES}",
+  "repeats": ${REPEATS},
   "steps": ${STEPS},
   "warmup_steps": ${WARMUP_STEPS},
   "dtype": "${DTYPE}",
@@ -596,6 +639,7 @@ echo "[phase4-matrix] RUN_ID=${RUN_ID}"
 echo "[phase4-matrix] MASTER_SERVER=${MASTER_SERVER} MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT}"
 echo "[phase4-matrix] WORKERS=${ALL_WORKERS}"
 echo "[phase4-matrix] MODES=${RUN_MODES}"
+echo "[phase4-matrix] REPEATS=${REPEATS}"
 echo "[phase4-matrix] MODEL hidden_dim=${HIDDEN_DIM} num_layers=${NUM_LAYERS} batch_size=${BATCH_SIZE} bucket_cap_mb=${BUCKET_CAP_MB} lr=${LR}"
 echo "[phase4-matrix] LOG_ROOT=${LOG_ROOT}"
 
@@ -608,62 +652,74 @@ cleanup_all_workers
 wait_for_master_port_free 10
 
 overall_rc=0
-for mode in "${MODE_VALUES[@]}"; do
-  mode_upper_value=$(echo "${mode}" | tr '[:lower:]' '[:upper:]')
-  run_root="${LOG_ROOT}/${mode_upper_value}"
-  status_dir="${LOG_ROOT}/.ddp_status/${mode_upper_value}"
-  mkdir -p "${run_root}" "${status_dir}"
+for repeat_idx in $(seq 1 "${REPEATS}"); do
+  repeat_label=$(printf 'repeat_%02d' "${repeat_idx}")
+  repeat_root="${LOG_ROOT}/${repeat_label}"
+  repeat_status_root="${LOG_ROOT}/.ddp_status/${repeat_label}"
+  mkdir -p "${repeat_root}" "${repeat_status_root}"
 
-  echo "[phase4-matrix] ------------------------------------------------------------"
-  echo "[phase4-matrix] start mode=${mode_upper_value} port=${MASTER_PORT}"
+  echo "[phase4-matrix] ============================================================"
+  echo "[phase4-matrix] start repeat=${repeat_label}"
 
-  cleanup_all_workers
-  wait_for_master_port_free 10
+  for mode in "${MODE_VALUES[@]}"; do
+    mode_upper_value=$(echo "${mode}" | tr '[:lower:]' '[:upper:]')
+    phase4_enable_value=$(mode_field "${mode}" "phase4_enable" "0")
+    phase4_post_receive_w_value=$(mode_field "${mode}" "post_receive_w" "0")
+    run_root="${repeat_root}/${mode_upper_value}"
+    status_dir="${repeat_status_root}/${mode_upper_value}"
+    mkdir -p "${run_root}" "${status_dir}"
 
-  unset LAUNCH_PIDS
-  unset LAUNCH_LOGS
-  declare -A LAUNCH_PIDS=()
-  declare -A LAUNCH_LOGS=()
+    echo "[phase4-matrix] ------------------------------------------------------------"
+    echo "[phase4-matrix] start repeat=${repeat_label} mode=${mode_upper_value} port=${MASTER_PORT} phase4_enable=${phase4_enable_value} phase4_post_receive_w=${phase4_post_receive_w_value}"
 
-  launch_worker_mode "${ALL_WORKER_ARRAY[0]}" 0 "${mode}" "${run_root}" "${status_dir}/${ALL_WORKER_ARRAY[0]}.status"
+    cleanup_all_workers
+    wait_for_master_port_free 10
 
-  rank0_pid="${LAUNCH_PIDS[${ALL_WORKER_ARRAY[0]}]}"
-  if ! wait_for_master_port_listen "${rank0_pid}"; then
-    overall_rc=1
-    print_failed_worker_logs "${status_dir}"
-    break
-  fi
+    unset LAUNCH_PIDS
+    unset LAUNCH_LOGS
+    declare -A LAUNCH_PIDS=()
+    declare -A LAUNCH_LOGS=()
 
-  for idx in "${!ALL_WORKER_ARRAY[@]}"; do
-    if (( idx == 0 )); then
-      continue
+    launch_worker_mode "${ALL_WORKER_ARRAY[0]}" 0 "${mode}" "${repeat_label}" "${phase4_enable_value}" "${phase4_post_receive_w_value}" "${run_root}" "${status_dir}/${ALL_WORKER_ARRAY[0]}.status"
+
+    rank0_pid="${LAUNCH_PIDS[${ALL_WORKER_ARRAY[0]}]}"
+    if ! wait_for_master_port_listen "${rank0_pid}"; then
+      overall_rc=1
+      print_failed_worker_logs "${status_dir}"
+      break 2
     fi
-    worker="${ALL_WORKER_ARRAY[$idx]}"
-    launch_worker_mode "${worker}" "${idx}" "${mode}" "${run_root}" "${status_dir}/${worker}.status"
+
+    for idx in "${!ALL_WORKER_ARRAY[@]}"; do
+      if (( idx == 0 )); then
+        continue
+      fi
+      worker="${ALL_WORKER_ARRAY[$idx]}"
+      launch_worker_mode "${worker}" "${idx}" "${mode}" "${repeat_label}" "${phase4_enable_value}" "${phase4_post_receive_w_value}" "${run_root}" "${status_dir}/${worker}.status"
+    done
+
+    mode_start_ts=$(date +%s)
+    if ! wait_for_mode_completion "${status_dir}" "${mode_upper_value}" "${mode_start_ts}"; then
+      overall_rc=1
+      print_failed_worker_logs "${status_dir}"
+      wait_for_launchers || true
+      cleanup_all_workers
+      wait_for_master_port_free 15 || true
+      break 2
+    fi
+
+    wait_for_launchers || overall_rc=1
+    cleanup_all_workers
+    if ! wait_for_master_port_free 15; then
+      overall_rc=1
+      break 2
+    fi
+
+    echo "[phase4-matrix] complete repeat=${repeat_label} mode=${mode_upper_value}"
   done
 
-  mode_start_ts=$(date +%s)
-  if ! wait_for_mode_completion "${status_dir}" "${mode_upper_value}" "${mode_start_ts}"; then
-    overall_rc=1
-    print_failed_worker_logs "${status_dir}"
-    wait_for_launchers || true
-    cleanup_all_workers
-    wait_for_master_port_free 15 || true
-    break
-  fi
-
-  wait_for_launchers || overall_rc=1
-  cleanup_all_workers
-  if ! wait_for_master_port_free 15; then
-    overall_rc=1
-    break
-  fi
-
-  echo "[phase4-matrix] complete mode=${mode_upper_value}"
+  compare_outputs "${repeat_root}" "${repeat_root}/final_output_validation.json"
+  summarize_nccl_events "${repeat_root}" "${repeat_root}/phase4_ncc_event_summary.json"
 done
-
-compare_outputs
-summarize_nccl_events
 
 if (( overall_rc != 0 )); then
   echo "[phase4-matrix] experiment failed" >&2
