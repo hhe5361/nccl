@@ -253,6 +253,7 @@ mode_static_w() {
   case "${mode}" in
     stock) echo 0 ;;
     stock_2) echo 0 ;;
+    phase4) echo 0 ;;
     b2_w*) echo "${mode#b2_w}" ;;
     *) echo "[phase2-master] unsupported mode=${mode}" >&2; return 1 ;;
   esac
