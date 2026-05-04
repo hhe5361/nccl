@@ -158,6 +158,8 @@ struct ncclProxySubArgs {
   uint8_t phase2RecvWstall;
   uint8_t phase3WindowCfgLogged;
   uint8_t phase3RecvWstall;
+  uint8_t phase4WindowCfgLogged;
+  uint8_t phase4RecvWstall;
   int phase3CurrentW;
   int phase3LastLoggedW;
   int phase3HiCount;
