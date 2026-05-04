@@ -19,6 +19,7 @@
     ],
     "run_modes": [
       "stock",
+      "stock_2",
       "b4_w2",
       "b4_w4",
       "b4_w6",
@@ -74,6 +75,12 @@
     {
       "mode_id": "stock",
       "label": "STOCK",
+      "phase4_enable": 0,
+      "post_receive_w": null
+    },
+    {
+      "mode_id": "stock_2",
+      "label": "STOCK_2",
       "phase4_enable": 0,
       "post_receive_w": null
     },

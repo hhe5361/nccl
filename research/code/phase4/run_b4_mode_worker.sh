@@ -56,6 +56,10 @@ case "${MODE}" in
     export NCCL_PHASE4_ENABLE=0
     export NCCL_PHASE4_POST_RECEIVE_W=0
     ;;
+  stock_2)
+    export NCCL_PHASE4_ENABLE=0
+    export NCCL_PHASE4_POST_RECEIVE_W=0
+    ;;
   b4_w*)
     export NCCL_PHASE4_ENABLE=1
     export NCCL_PHASE4_POST_RECEIVE_W="${MODE#b4_w}"
