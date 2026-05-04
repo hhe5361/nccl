@@ -86,16 +86,22 @@ def elapsed_seconds(base_ns: int, ns: int) -> float:
     return (ns - base_ns) / 1e9
 
 
+def mode_start_ns(records: list[StepRecord]) -> int:
+    return min(record.ts_start_unix_ns for record in records)
+
+
 def plot_latency_over_time(records_by_mode: dict[str, list[StepRecord]], output_path: Path) -> None:
     modes = list(records_by_mode.keys())
     palette = build_palette(modes)
-    base_ns = first_start_ns(records_by_mode)
 
     fig, ax = plt.subplots(figsize=(12, 5))
     for mode in modes:
         records = records_by_mode[mode]
         color = palette[mode]
+        base_ns = mode_start_ns(records)
         first = True
+        line_xs = []
+        line_ys = []
         for record in records:
             start_s = elapsed_seconds(base_ns, record.ts_start_unix_ns)
             end_s = elapsed_seconds(base_ns, record.ts_end_unix_ns)
@@ -108,13 +114,16 @@ def plot_latency_over_time(records_by_mode: dict[str, list[StepRecord]], output_
                 color=color,
                 linewidth=2.2,
                 alpha=alpha,
-                label=mode if first else None,
+                label=None,
             )
-            ax.scatter([mid_s], [record.step_ms_max], color=color, s=10, alpha=alpha)
+            ax.scatter([start_s], [record.step_ms_max], color=color, s=12, alpha=alpha)
+            line_xs.append(mid_s)
+            line_ys.append(record.step_ms_max)
             first = False
+        ax.plot(line_xs, line_ys, color=color, linewidth=1.6, alpha=0.9, label=mode)
 
-    ax.set_title("Latency Overlay Over Time")
-    ax.set_xlabel("Elapsed Time Since First Step Start (s)")
+    ax.set_title("Latency Overlay Over Relative Mode Time")
+    ax.set_xlabel("Time Since Mode Start (s)")
     ax.set_ylabel("Latency (ms)")
     ax.grid(True, alpha=0.25)
     ax.legend()
@@ -126,13 +135,15 @@ def plot_latency_over_time(records_by_mode: dict[str, list[StepRecord]], output_
 def plot_throughput_over_time(records_by_mode: dict[str, list[StepRecord]], output_path: Path) -> None:
     modes = list(records_by_mode.keys())
     palette = build_palette(modes)
-    base_ns = first_start_ns(records_by_mode)
 
     fig, ax = plt.subplots(figsize=(12, 5))
     for mode in modes:
         records = records_by_mode[mode]
         color = palette[mode]
+        base_ns = mode_start_ns(records)
         first = True
+        line_xs = []
+        line_ys = []
         for record in records:
             start_s = elapsed_seconds(base_ns, record.ts_start_unix_ns)
             end_s = elapsed_seconds(base_ns, record.ts_end_unix_ns)
@@ -145,13 +156,16 @@ def plot_throughput_over_time(records_by_mode: dict[str, list[StepRecord]], outp
                 color=color,
                 linewidth=2.2,
                 alpha=alpha,
-                label=mode if first else None,
+                label=None,
             )
-            ax.scatter([mid_s], [record.samples_per_sec], color=color, s=10, alpha=alpha)
+            ax.scatter([start_s], [record.samples_per_sec], color=color, s=12, alpha=alpha)
+            line_xs.append(mid_s)
+            line_ys.append(record.samples_per_sec)
             first = False
+        ax.plot(line_xs, line_ys, color=color, linewidth=1.6, alpha=0.9, label=mode)
 
-    ax.set_title("Throughput Overlay Over Time")
-    ax.set_xlabel("Elapsed Time Since First Step Start (s)")
+    ax.set_title("Throughput Overlay Over Relative Mode Time")
+    ax.set_xlabel("Time Since Mode Start (s)")
     ax.set_ylabel("Samples / sec")
     ax.grid(True, alpha=0.25)
     ax.legend()
@@ -163,13 +177,13 @@ def plot_throughput_over_time(records_by_mode: dict[str, list[StepRecord]], outp
 def plot_step_timeline(records_by_mode: dict[str, list[StepRecord]], output_path: Path) -> None:
     modes = list(records_by_mode.keys())
     palette = build_palette(modes)
-    base_ns = first_start_ns(records_by_mode)
 
     fig, ax = plt.subplots(figsize=(12, max(3.5, 1.1 * len(modes) + 1.5)))
     yticks: list[float] = []
     ylabels: list[str] = []
 
     for y, mode in enumerate(modes):
+        base_ns = mode_start_ns(records_by_mode[mode])
         for record in records_by_mode[mode]:
             start_s = elapsed_seconds(base_ns, record.ts_start_unix_ns)
             end_s = elapsed_seconds(base_ns, record.ts_end_unix_ns)
@@ -188,8 +202,8 @@ def plot_step_timeline(records_by_mode: dict[str, list[StepRecord]], output_path
         yticks.append(y)
         ylabels.append(mode)
 
-    ax.set_title("Mode Step Timeline Overlay")
-    ax.set_xlabel("Elapsed Time Since First Step Start (s)")
+    ax.set_title("Mode Step Timeline Overlay Over Relative Mode Time")
+    ax.set_xlabel("Time Since Mode Start (s)")
     ax.set_ylabel("Mode")
     ax.set_yticks(yticks)
     ax.set_yticklabels(ylabels, fontsize=9)
@@ -200,9 +214,9 @@ def plot_step_timeline(records_by_mode: dict[str, list[StepRecord]], output_path
 
 
 def write_timeline_table(records_by_mode: dict[str, list[StepRecord]], output_path: Path) -> None:
-    base_ns = first_start_ns(records_by_mode)
     rows = []
     for mode, records in records_by_mode.items():
+        base_ns = mode_start_ns(records)
         for record in records:
             rows.append(
                 {
@@ -224,9 +238,9 @@ def write_timeline_table(records_by_mode: dict[str, list[StepRecord]], output_pa
 
 def write_html(run_root: Path, output_dir: Path, modes: list[str]) -> None:
     sections = [
-        ("Latency Overlay Over Time", "latency_over_time.png"),
-        ("Throughput Overlay Over Time", "throughput_over_time.png"),
-        ("Mode Step Timeline Overlay", "step_timeline.png"),
+        ("Latency Overlay Over Relative Mode Time", "latency_over_time.png"),
+        ("Throughput Overlay Over Relative Mode Time", "throughput_over_time.png"),
+        ("Mode Step Timeline Overlay Over Relative Mode Time", "step_timeline.png"),
     ]
     html = [
         "<!doctype html>",
@@ -237,7 +251,7 @@ def write_html(run_root: Path, output_dir: Path, modes: list[str]) -> None:
         f"<p><strong>Run root:</strong> <code>{run_root}</code></p>",
         f"<p><strong>Modes:</strong> {', '.join(modes)}</p>",
         "<p><strong>Timeline table:</strong> <code>step_timeline_table.json</code></p>",
-        "<p>Each step is rendered as a start-stop segment on a shared elapsed-time axis for direct mode-to-mode comparison.</p>",
+        "<p>Each mode is normalized so its first step starts at t=0, then step start-stop segments and mode overlays are drawn on the same relative-time axis.</p>",
     ]
     for title, filename in sections:
         html.append(f"<h2>{title}</h2>")
