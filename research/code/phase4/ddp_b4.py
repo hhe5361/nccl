@@ -25,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--bucket-cap-mb", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--model-seed", type=int, default=20260504)
     return parser.parse_args()
 
 
@@ -85,6 +86,11 @@ def main() -> None:
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
     dtype = resolve_dtype(args.dtype)
+
+    # Keep model initialization identical across modes/runs so STOCK vs B4
+    # validation reflects communication behavior rather than random init drift.
+    torch.manual_seed(args.model_seed)
+    torch.cuda.manual_seed_all(args.model_seed)
 
     run_tag = args.tag or os.environ.get("PHASE4_MODE", "B4").upper()
     output_dir = Path(args.output_dir) if args.output_dir else None
@@ -183,6 +189,7 @@ def main() -> None:
                 "num_layers": args.num_layers,
                 "bucket_cap_mb": args.bucket_cap_mb,
                 "lr": args.lr,
+                "model_seed": args.model_seed,
                 "dtype": args.dtype,
                 "param_mb": total_param_mb,
                 "ts_start_unix_ns": int(ts_start_unix_ns),
@@ -213,6 +220,7 @@ def main() -> None:
                     "phase4_mode": phase4_mode,
                     "phase4_enable": phase4_enable,
                     "phase4_post_receive_w": phase4_post_receive_w,
+                    "model_seed": args.model_seed,
                     "warmup": step < args.warmup_steps,
                     "start_ns": step_start_ns,
                     "end_ns": step_end_ns,
@@ -238,6 +246,7 @@ def main() -> None:
             "phase4_post_receive_w": phase4_post_receive_w,
             "world_size": world_size,
             "dtype": args.dtype,
+            "model_seed": args.model_seed,
             "numel": int(cpu_tensor.numel()),
             "hidden_dim": args.hidden_dim,
             "num_layers": args.num_layers,
@@ -266,6 +275,7 @@ def main() -> None:
             "num_layers": args.num_layers,
             "bucket_cap_mb": args.bucket_cap_mb,
             "lr": args.lr,
+            "model_seed": args.model_seed,
             "dtype": args.dtype,
             "param_mb": total_param_mb,
             "algo": os.environ.get("NCCL_ALGO", ""),
