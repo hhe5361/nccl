@@ -58,6 +58,11 @@ case "${MODE}" in
     export NCCL_PHASE4_ENABLE=0
     export NCCL_PHASE4_POST_RECEIVE_W=0
     ;;
+  stock_2)
+    export NCCL_APPENDIX2_GROUP_LOG=0
+    export NCCL_PHASE4_ENABLE=0
+    export NCCL_PHASE4_POST_RECEIVE_W=0
+    ;;
   phase4)
     export NCCL_APPENDIX2_GROUP_LOG=1
     export NCCL_PHASE4_ENABLE=1
