@@ -34,6 +34,7 @@ MODEL_SEED=${MODEL_SEED:-20260504}
 REPEAT_LABEL=${REPEAT_LABEL:-repeat_01}
 PHASE4_ENABLE_VALUE=${PHASE4_ENABLE_VALUE:-}
 PHASE4_POST_RECEIVE_W_VALUE=${PHASE4_POST_RECEIVE_W_VALUE:-}
+PYTHON_BIN=${PYTHON_BIN:-python}
 
 mkdir -p "${RUN_ROOT}" "${RUN_ROOT}/${WORKER_NAME}" "${STATUS_DIR}"
 
@@ -86,17 +87,8 @@ else
   export NCCL_PROTO="${PROTO_SETTING}"
 fi
 
-if command -v torchrun >/dev/null 2>&1; then
-  LAUNCHER=(torchrun)
-elif python - <<'PYTORCHCHECK' >/dev/null 2>&1
-import importlib.util
-import sys
-sys.exit(0 if importlib.util.find_spec('torch.distributed.run') else 1)
-PYTORCHCHECK
-then
-  LAUNCHER=(python -m torch.distributed.run)
-else
-  echo "[phase4-worker] PyTorch launcher not found in current environment." >&2
+if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+  echo "[phase4-worker] Python launcher not found: ${PYTHON_BIN}" >&2
   exit 1
 fi
 
@@ -105,6 +97,13 @@ export PHASE4_MODE="${MODE}"
 export PHASE4_OUTPUT_DIR="${RUN_ROOT}"
 export PHASE4_REPEAT_LABEL="${REPEAT_LABEL}"
 export NCCL_DEBUG_FILE="${RUN_ROOT}/${WORKER_NAME}/nccl.%h.%p.log"
+export MASTER_ADDR
+export MASTER_PORT
+export WORLD_SIZE="${NNODES}"
+export RANK="${NODE_RANK}"
+export LOCAL_RANK=0
+export LOCAL_WORLD_SIZE=1
+export GROUP_RANK="${NODE_RANK}"
 
 STATUS_DDP=-1
 RUN_RC=1
@@ -171,6 +170,7 @@ echo "[phase4-worker] PHASE4_ENABLE=${NCCL_PHASE4_ENABLE} PHASE4_POST_RECEIVE_W=
 echo "[phase4-worker] APPENDIX2_GROUP_LOG=${NCCL_APPENDIX2_GROUP_LOG}"
 echo "[phase4-worker] HIDDEN_DIM=${HIDDEN_DIM} NUM_LAYERS=${NUM_LAYERS} BATCH_SIZE=${BATCH_SIZE} BUCKET_CAP_MB=${BUCKET_CAP_MB} LR=${LR}"
 echo "[phase4-worker] MODEL_SEED=${MODEL_SEED}"
+echo "[phase4-worker] PYTHON_BIN=${PYTHON_BIN} RANK=${RANK} WORLD_SIZE=${WORLD_SIZE} LOCAL_RANK=${LOCAL_RANK}"
 echo "[phase4-worker] NCCL_ALGO=${ALGO_SETTING} NCCL_PROTO=${PROTO_SETTING} STATUS_FILE=${STATUS_FILE}"
 echo "[phase4-worker] NCCL_DEBUG_FILE=${NCCL_DEBUG_FILE}"
 
@@ -178,13 +178,7 @@ mark_running
 
 set +e
 timeout --signal=TERM --kill-after=30 "${MODE_TIMEOUT_SEC}" \
-  "${LAUNCHER[@]}" \
-    --nnodes="${NNODES}" \
-    --nproc_per_node="${NPROC_PER_NODE}" \
-    --node_rank="${NODE_RANK}" \
-    --master_addr="${MASTER_ADDR}" \
-    --master_port="${MASTER_PORT}" \
-    "${REPO_ROOT}/${TARGET_SCRIPT}" \
+  "${PYTHON_BIN}" "${REPO_ROOT}/${TARGET_SCRIPT}" \
     --steps "${STEPS}" \
     --warmup-steps "${WARMUP_STEPS}" \
     --dtype "${DTYPE}" \
