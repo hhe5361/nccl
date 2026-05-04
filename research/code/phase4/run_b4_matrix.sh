@@ -68,6 +68,7 @@ pairs = {
     "CFG_NCCL_PROTO": nccl.get("proto", "auto"),
     "CFG_NCCL_PHASE0_LOG": nccl.get("phase0_log", 1),
     "CFG_NCCL_PHASE4_LOG": nccl.get("phase4_log", 0),
+    "CFG_NCCL_APPENDIX2_GROUP_LOG": nccl.get("appendix2_group_log", 0),
     "CFG_NCCL_DEBUG": nccl.get("debug", "INFO"),
     "CFG_NCCL_DEBUG_SUBSYS": nccl.get("debug_subsys", "NET"),
     "CFG_NCCL_NET_GDR_LEVEL": nccl.get("net_gdr_level", 0),
@@ -116,6 +117,7 @@ NCCL_ALGO=${NCCL_ALGO:-${CFG_NCCL_ALGO}}
 NCCL_PROTO=${NCCL_PROTO:-${CFG_NCCL_PROTO}}
 NCCL_PHASE0_LOG=${NCCL_PHASE0_LOG:-${CFG_NCCL_PHASE0_LOG}}
 NCCL_PHASE4_LOG=${NCCL_PHASE4_LOG:-${CFG_NCCL_PHASE4_LOG}}
+NCCL_APPENDIX2_GROUP_LOG=${NCCL_APPENDIX2_GROUP_LOG:-${CFG_NCCL_APPENDIX2_GROUP_LOG}}
 NCCL_DEBUG=${NCCL_DEBUG:-${CFG_NCCL_DEBUG}}
 NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-${CFG_NCCL_DEBUG_SUBSYS}}
 NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL:-${CFG_NCCL_NET_GDR_LEVEL}}
@@ -411,6 +413,7 @@ NCCL_ALGO=$(printf '%q' "${NCCL_ALGO}") \
 NCCL_PROTO=$(printf '%q' "${NCCL_PROTO}") \
 NCCL_PHASE0_LOG=$(printf '%q' "${NCCL_PHASE0_LOG}") \
 NCCL_PHASE4_LOG=$(printf '%q' "${NCCL_PHASE4_LOG}") \
+NCCL_APPENDIX2_GROUP_LOG=$(printf '%q' "${NCCL_APPENDIX2_GROUP_LOG}") \
 NCCL_DEBUG=$(printf '%q' "${NCCL_DEBUG}") \
 NCCL_DEBUG_SUBSYS=$(printf '%q' "${NCCL_DEBUG_SUBSYS}") \
 NCCL_NET_GDR_LEVEL=$(printf '%q' "${NCCL_NET_GDR_LEVEL}") \
@@ -552,6 +555,20 @@ compare_outputs() {
     --output-json "${VALIDATION_JSON}" || true
 }
 
+NCC_EVENT_SUMMARY_JSON="${LOG_ROOT}/phase4_ncc_event_summary.json"
+
+summarize_nccl_events() {
+  local summary_script="${REPO_ROOT}/research/code/phase4/phase4_ncc_event_summary.py"
+  if [[ ! -f "${summary_script}" ]]; then
+    echo "[phase4-matrix] ncc event summary script missing path=${summary_script}"
+    return 0
+  fi
+  echo "[phase4-matrix] summarizing NCCL recv/group events"
+  python3 "${summary_script}" \
+    --experiment-root "${LOG_ROOT}" \
+    --output-json "${NCC_EVENT_SUMMARY_JSON}" || true
+}
+
 MANIFEST_JSON="${LOG_ROOT}/phase4_manifest.json"
 cat > "${MANIFEST_JSON}" <<EOF
 {
@@ -646,6 +663,7 @@ for mode in "${MODE_VALUES[@]}"; do
 done
 
 compare_outputs
+summarize_nccl_events
 
 if (( overall_rc != 0 )); then
   echo "[phase4-matrix] experiment failed" >&2

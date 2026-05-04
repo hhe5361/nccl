@@ -19,9 +19,12 @@
     ],
     "run_modes": [
       "stock",
-      "b4_w4"
+      "b4_w2",
+      "b4_w4",
+      "b4_w6",
+      "b4_w8"
     ],
-    "steps": 40,
+    "steps": 50,
     "warmup_steps": 5,
     "mode_timeout_sec": 600,
     "torch_env": "/workspace/venvs/torch-cu121-custom/bin/activate",
@@ -45,7 +48,7 @@
   "ssh": {
     "worker_ssh_user": "",
     "worker_ssh_user_map": "",
-    "worker_ssh_port": 22,
+    "worker_ssh_port": 14750,
     "worker_ssh_port_map": "",
     "ssh_connect_timeout_sec": 10
   },
@@ -62,6 +65,7 @@
     "proto": "auto",
     "phase0_log": 1,
     "phase4_log": 0,
+    "appendix2_group_log": 0,
     "debug": "INFO",
     "debug_subsys": "NET",
     "net_gdr_level": 0
@@ -74,10 +78,28 @@
       "post_receive_w": null
     },
     {
+      "mode_id": "b4_w2",
+      "label": "B4_W2",
+      "phase4_enable": 1,
+      "post_receive_w": 2
+    },
+    {
       "mode_id": "b4_w4",
       "label": "B4_W4",
       "phase4_enable": 1,
       "post_receive_w": 4
+    },
+    {
+      "mode_id": "b4_w6",
+      "label": "B4_W6",
+      "phase4_enable": 1,
+      "post_receive_w": 6
+    },
+    {
+      "mode_id": "b4_w8",
+      "label": "B4_W8",
+      "phase4_enable": 1,
+      "post_receive_w": 8
     }
   ]
 }
