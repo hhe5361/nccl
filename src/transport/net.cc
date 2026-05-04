@@ -2113,20 +2113,19 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
           } else {
             phase1ProxyWindowCfgLog(proxyState, args, sub, resources->shared, wBase, wCfg, wEff);
           }
-          if (phase4Enabled && phase4W > 0) {
-            if (sub->posted >= sub->received + wEff) {
-              phase4ProxyWstallLog(proxyState, args, sub, "PROXY_RECV_WSTALL", (sub->base+sub->posted)%NCCL_STEPS, wEff, &sub->phase4RecvWstall);
-              subCount = 0;
-              break;
-            }
-          } else if (sub->posted >= sub->done + wEff) {
+          if (sub->posted >= sub->done + wBase) {
             if (phase3Decision.enabled && wCfg == 0) {
               phase3ProxyRecvWstallLog(proxyState, args, sub, (sub->base+sub->posted)%NCCL_STEPS, &phase3Decision);
             } else if (semanticDecision.enabled && wCfg == 0) {
               phase2ProxyRecvWstallLog(proxyState, args, sub, (sub->base+sub->posted)%NCCL_STEPS, &semanticDecision);
             } else {
-              phase1ProxyWstallLog(proxyState, args, sub, "PROXY_RECV_WSTALL", (sub->base+sub->posted)%NCCL_STEPS, wBase, wCfg, wEff, &sub->phase1RecvWstall);
+              phase1ProxyWstallLog(proxyState, args, sub, "PROXY_RECV_WSTALL", (sub->base+sub->posted)%NCCL_STEPS, wBase, wCfg, wBase, &sub->phase1RecvWstall);
             }
+            subCount = 0;
+            break;
+          }
+          if (phase4Enabled && phase4W > 0 && sub->posted >= sub->received + wEff) {
+            phase4ProxyWstallLog(proxyState, args, sub, "PROXY_RECV_WSTALL", (sub->base+sub->posted)%NCCL_STEPS, wEff, &sub->phase4RecvWstall);
             subCount = 0;
             break;
           }
