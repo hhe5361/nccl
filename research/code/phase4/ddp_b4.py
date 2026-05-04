@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Iterable, List
@@ -107,6 +108,31 @@ def main() -> None:
     worker_dir = output_dir / worker_name if output_dir is not None else None
     step_timing_path = worker_dir / f"{run_tag}_worker_step_timing.jsonl" if worker_dir is not None else None
     validation_path = worker_dir / f"{run_tag}_rank_validation.json" if worker_dir is not None else None
+    final_stage_path = worker_dir / f"{run_tag}_final_stage.json" if worker_dir is not None else None
+
+    if worker_dir is not None:
+        worker_dir.mkdir(parents=True, exist_ok=True)
+
+    def stage_log(stage: str, **extra: object) -> None:
+        row = {
+            "ts_unix_ns": time.time_ns(),
+            "rank": rank,
+            "local_rank": local_rank,
+            "world_size": world_size,
+            "worker": worker_name,
+            "tag": run_tag,
+            "repeat_label": repeat_label,
+            "phase4_mode": phase4_mode,
+            "phase4_enable": phase4_enable,
+            "phase4_post_receive_w": phase4_post_receive_w,
+            "stage": stage,
+        }
+        row.update(extra)
+        print(f"[phase4-ddp] {json.dumps(row, sort_keys=True)}", file=sys.stderr, flush=True)
+        if final_stage_path is not None:
+            final_stage_path.write_text(json.dumps(row, indent=2, sort_keys=True), encoding="utf-8")
+
+    stage_log("startup")
 
     model = TinyStack(hidden_dim=args.hidden_dim, num_layers=args.num_layers).to(device=device, dtype=dtype)
     ddp_model = DDP(
@@ -134,11 +160,12 @@ def main() -> None:
         )
 
     records = []
+    stage_log("before_startup_barrier")
     dist.barrier()
+    stage_log("after_startup_barrier")
     handle = step_metrics_path.open("w", encoding="utf-8") if step_metrics_path is not None else None
     timing_handle = None
     if worker_dir is not None:
-        worker_dir.mkdir(parents=True, exist_ok=True)
         timing_handle = step_timing_path.open("w", encoding="utf-8")
 
     try:
@@ -237,7 +264,10 @@ def main() -> None:
         if timing_handle is not None:
             timing_handle.close()
 
+    stage_log("step_loop_complete", records=len(records))
+
     if validation_path is not None:
+        stage_log("before_validation_write")
         cpu_tensor = flatten_params(ddp_model.module).contiguous().cpu()
         tensor_bytes = cpu_tensor.numpy().tobytes()
         validation_row = {
@@ -261,8 +291,14 @@ def main() -> None:
             "final_head": cpu_tensor.flatten()[:8].tolist(),
         }
         validation_path.write_text(json.dumps(validation_row, indent=2, sort_keys=True), encoding="utf-8")
+        stage_log(
+            "after_validation_write",
+            final_sha256=validation_row["final_sha256"],
+            local_validation_passed=validation_row["local_validation_passed"],
+        )
 
     if rank == 0 and output_dir is not None:
+        stage_log("before_summary_write")
         effective = [r for r in records if not r["warmup"]]
         summary = {
             "run_tag": run_tag,
@@ -300,9 +336,24 @@ def main() -> None:
         }
         summary_path = output_dir / f"{run_tag}_summary.json"
         summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+        stage_log("after_summary_write", summary_path=str(summary_path), effective_steps=len(effective))
 
-    dist.barrier()
-    dist.destroy_process_group()
+    stage_log("before_final_barrier")
+    try:
+        dist.barrier()
+    except Exception as exc:
+        stage_log("final_barrier_failed", error=repr(exc))
+        raise
+    stage_log("after_final_barrier")
+
+    stage_log("before_destroy_process_group")
+    try:
+        dist.destroy_process_group()
+    except Exception as exc:
+        stage_log("destroy_process_group_failed", error=repr(exc))
+        raise
+    stage_log("after_destroy_process_group")
+    stage_log("before_python_exit")
 
 
 if __name__ == "__main__":

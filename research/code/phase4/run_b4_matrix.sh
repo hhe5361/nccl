@@ -591,6 +591,10 @@ compare_outputs() {
     echo "[phase4-matrix] compare script missing path=${COMPARE_SCRIPT}"
     return 0
   fi
+  if [[ ! -d "${experiment_root}/STOCK" ]]; then
+    echo "[phase4-matrix] skip STOCK comparison: STOCK directory not present experiment_root=${experiment_root}"
+    return 0
+  fi
   echo "[phase4-matrix] validating final outputs against STOCK experiment_root=${experiment_root}"
   python3 "${REPO_ROOT}/${COMPARE_SCRIPT}" \
     --experiment-root "${experiment_root}" \
