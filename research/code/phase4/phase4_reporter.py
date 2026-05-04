@@ -90,7 +90,15 @@ def mode_start_ns(records: list[StepRecord]) -> int:
     return min(record.ts_start_unix_ns for record in records)
 
 
-def plot_latency_over_time(records_by_mode: dict[str, list[StepRecord]], output_path: Path) -> None:
+def plot_metric_over_time(
+    records_by_mode: dict[str, list[StepRecord]],
+    output_path: Path,
+    *,
+    title: str,
+    ylabel: str,
+    metric_key: str,
+    y_limits: tuple[float, float] | None = None,
+) -> None:
     modes = list(records_by_mode.keys())
     palette = build_palette(modes)
 
@@ -107,8 +115,9 @@ def plot_latency_over_time(records_by_mode: dict[str, list[StepRecord]], output_
             end_s = elapsed_seconds(base_ns, record.ts_end_unix_ns)
             mid_s = elapsed_seconds(base_ns, record.ts_mid_unix_ns)
             alpha = 0.35 if record.warmup else 0.9
+            metric_value = getattr(record, metric_key)
             ax.hlines(
-                record.step_ms_max,
+                metric_value,
                 start_s,
                 end_s,
                 color=color,
@@ -116,62 +125,65 @@ def plot_latency_over_time(records_by_mode: dict[str, list[StepRecord]], output_
                 alpha=alpha,
                 label=None,
             )
-            ax.scatter([start_s], [record.step_ms_max], color=color, s=12, alpha=alpha)
+            marker = "x" if record.warmup else "o"
+            marker_size = 18 if record.warmup else 14
+            ax.scatter([start_s], [metric_value], color=color, s=marker_size, marker=marker, alpha=alpha)
             line_xs.append(mid_s)
-            line_ys.append(record.step_ms_max)
-            first = False
+            line_ys.append(metric_value)
         ax.plot(line_xs, line_ys, color=color, linewidth=1.6, alpha=0.9, label=mode)
 
-    ax.set_title("Latency Overlay Over Relative Mode Time")
+    ax.set_title(title)
     ax.set_xlabel("Time Since Mode Start (s)")
-    ax.set_ylabel("Latency (ms)")
+    ax.set_ylabel(ylabel)
+    if y_limits is not None:
+        ax.set_ylim(*y_limits)
     ax.grid(True, alpha=0.25)
     ax.legend()
     fig.tight_layout()
     fig.savefig(output_path, dpi=160)
     plt.close(fig)
+
+
+def plot_latency_over_time(records_by_mode: dict[str, list[StepRecord]], output_path: Path) -> None:
+    plot_metric_over_time(
+        records_by_mode,
+        output_path,
+        title="Latency Overlay Over Relative Mode Time",
+        ylabel="Latency (ms)",
+        metric_key="step_ms_max",
+    )
+
+
+def plot_latency_over_time_zoom(records_by_mode: dict[str, list[StepRecord]], output_path: Path) -> None:
+    plot_metric_over_time(
+        records_by_mode,
+        output_path,
+        title="Latency Overlay Over Relative Mode Time (0-10 ms)",
+        ylabel="Latency (ms)",
+        metric_key="step_ms_max",
+        y_limits=(0.0, 10.0),
+    )
 
 
 def plot_throughput_over_time(records_by_mode: dict[str, list[StepRecord]], output_path: Path) -> None:
-    modes = list(records_by_mode.keys())
-    palette = build_palette(modes)
+    plot_metric_over_time(
+        records_by_mode,
+        output_path,
+        title="Throughput Overlay Over Relative Mode Time",
+        ylabel="Samples / sec",
+        metric_key="samples_per_sec",
+    )
 
-    fig, ax = plt.subplots(figsize=(12, 5))
-    for mode in modes:
-        records = records_by_mode[mode]
-        color = palette[mode]
-        base_ns = mode_start_ns(records)
-        first = True
-        line_xs = []
-        line_ys = []
-        for record in records:
-            start_s = elapsed_seconds(base_ns, record.ts_start_unix_ns)
-            end_s = elapsed_seconds(base_ns, record.ts_end_unix_ns)
-            mid_s = elapsed_seconds(base_ns, record.ts_mid_unix_ns)
-            alpha = 0.35 if record.warmup else 0.9
-            ax.hlines(
-                record.samples_per_sec,
-                start_s,
-                end_s,
-                color=color,
-                linewidth=2.2,
-                alpha=alpha,
-                label=None,
-            )
-            ax.scatter([start_s], [record.samples_per_sec], color=color, s=12, alpha=alpha)
-            line_xs.append(mid_s)
-            line_ys.append(record.samples_per_sec)
-            first = False
-        ax.plot(line_xs, line_ys, color=color, linewidth=1.6, alpha=0.9, label=mode)
 
-    ax.set_title("Throughput Overlay Over Relative Mode Time")
-    ax.set_xlabel("Time Since Mode Start (s)")
-    ax.set_ylabel("Samples / sec")
-    ax.grid(True, alpha=0.25)
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=160)
-    plt.close(fig)
+def plot_throughput_over_time_zoom(records_by_mode: dict[str, list[StepRecord]], output_path: Path) -> None:
+    plot_metric_over_time(
+        records_by_mode,
+        output_path,
+        title="Throughput Overlay Over Relative Mode Time (25000-40000)",
+        ylabel="Samples / sec",
+        metric_key="samples_per_sec",
+        y_limits=(25000.0, 40000.0),
+    )
 
 
 def plot_step_timeline(records_by_mode: dict[str, list[StepRecord]], output_path: Path) -> None:
@@ -239,7 +251,9 @@ def write_timeline_table(records_by_mode: dict[str, list[StepRecord]], output_pa
 def write_html(run_root: Path, output_dir: Path, modes: list[str]) -> None:
     sections = [
         ("Latency Overlay Over Relative Mode Time", "latency_over_time.png"),
+        ("Latency Overlay Over Relative Mode Time (0-10 ms)", "latency_over_time_zoom_0_10ms.png"),
         ("Throughput Overlay Over Relative Mode Time", "throughput_over_time.png"),
+        ("Throughput Overlay Over Relative Mode Time (25000-40000)", "throughput_over_time_zoom_25000_40000.png"),
         ("Mode Step Timeline Overlay Over Relative Mode Time", "step_timeline.png"),
     ]
     html = [
@@ -252,6 +266,7 @@ def write_html(run_root: Path, output_dir: Path, modes: list[str]) -> None:
         f"<p><strong>Modes:</strong> {', '.join(modes)}</p>",
         "<p><strong>Timeline table:</strong> <code>step_timeline_table.json</code></p>",
         "<p>Each mode is normalized so its first step starts at t=0, then step start-stop segments and mode overlays are drawn on the same relative-time axis.</p>",
+        "<p>Warmup steps are marked with <code>x</code>; measured steps are marked with <code>o</code>.</p>",
     ]
     for title, filename in sections:
         html.append(f"<h2>{title}</h2>")
@@ -282,14 +297,20 @@ def main() -> None:
     modes = list(records_by_mode.keys())
 
     latency_png = output_dir / "latency_over_time.png"
+    latency_zoom_png = output_dir / "latency_over_time_zoom_0_10ms.png"
     throughput_png = output_dir / "throughput_over_time.png"
+    throughput_zoom_png = output_dir / "throughput_over_time_zoom_25000_40000.png"
     timeline_png = output_dir / "step_timeline.png"
     timeline_json = output_dir / "step_timeline_table.json"
 
     print("[phase4-reporter] plot latency overlay")
     plot_latency_over_time(records_by_mode, latency_png)
+    print("[phase4-reporter] plot latency overlay zoom")
+    plot_latency_over_time_zoom(records_by_mode, latency_zoom_png)
     print("[phase4-reporter] plot throughput overlay")
     plot_throughput_over_time(records_by_mode, throughput_png)
+    print("[phase4-reporter] plot throughput overlay zoom")
+    plot_throughput_over_time_zoom(records_by_mode, throughput_zoom_png)
     print("[phase4-reporter] plot mode timeline overlay")
     plot_step_timeline(records_by_mode, timeline_png)
     print("[phase4-reporter] write step timeline table")
