@@ -176,6 +176,8 @@ NCCL_PARAM(Phase3Log, "PHASE3_LOG", 0);
 NCCL_PARAM(Phase4Enable, "PHASE4_ENABLE", 0);
 NCCL_PARAM(Phase4Log, "PHASE4_LOG", 0);
 NCCL_PARAM(Phase4PostReceiveW, "PHASE4_POST_RECEIVE_W", 0);
+NCCL_PARAM(Appendix2GroupLog, "APPENDIX2_GROUP_LOG", 0);
+NCCL_PARAM(Appendix2DisableWstallLog, "APPENDIX2_DISABLE_WSTALL_LOG", 0);
 NCCL_PARAM(Phase3WarmupIntervals, "PHASE3_WARMUP_INTERVALS", 4);
 NCCL_PARAM(Phase3HiIntervals, "PHASE3_HI_INTERVALS", 2);
 NCCL_PARAM(Phase3LoIntervals, "PHASE3_LO_INTERVALS", 8);
@@ -923,31 +925,41 @@ static inline void phase1ProxyWstallLog(
     int wCfg,
     int wEff,
     uint8_t* stallFlag) {
-  if (ncclParamPhase0Log() == 0 || *stallFlag) return;
+  (void)proxyState;
+  (void)args;
+  (void)sub;
+  (void)event;
+  (void)slot;
+  (void)wBase;
+  (void)wCfg;
+  (void)wEff;
+  (void)stallFlag;
+  return;
+}
+
+static inline void appendix2RecvGroupLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    int groupStart,
+    int groupSize,
+    int maxRecvs) {
+  if (ncclParamAppendix2GroupLog() == 0) return;
   INFO(NCCL_NET,
-      "PHASE1 event=%s tNs=%llu rank=%d peer=%d channel=%d slot=%d coll=%s collApi=%s algo=%s proto=%s base=%llu posted=%llu received=%llu transmitted=%llu done=%llu nsteps=%d wBase=%d wCfg=%d wEff=%d occPd=%llu occTr=%llu",
-      event,
+      "APPENDIX2 event=RECV_GROUP_CFG tNs=%llu rank=%d peer=%d channel=%d groupStart=%d groupSize=%d maxRecvs=%d coll=%s collApi=%s algo=%s proto=%s base=%llu nsteps=%d",
       (unsigned long long)clockNano(),
       proxyState->tpRank,
       sub->peer,
       sub->channelId,
-      slot,
+      groupStart,
+      groupSize,
+      maxRecvs,
       ncclFuncToString((ncclFunc_t)args->coll),
       ncclFuncToString((ncclFunc_t)args->collAPI),
       ncclAlgoToString(args->algorithm),
       ncclProtoToString(args->protocol),
       (unsigned long long)sub->base,
-      (unsigned long long)sub->posted,
-      (unsigned long long)sub->received,
-      (unsigned long long)sub->transmitted,
-      (unsigned long long)sub->done,
-      sub->nsteps,
-      wBase,
-      wCfg,
-      wEff,
-      (unsigned long long)(sub->posted - sub->done),
-      (unsigned long long)(sub->transmitted - sub->done));
-  *stallFlag = 1;
+      sub->nsteps);
 }
 
 static inline void phase2ProxyWindowCfgLog(
@@ -990,6 +1002,7 @@ static inline void phase2ProxyRecvWstallLog(
     struct ncclProxySubArgs* sub,
     int slot,
     const struct phase2WindowDecision* decision) {
+  if (ncclParamAppendix2DisableWstallLog()) return;
   if (ncclParamPhase2Log() == 0 || sub->phase2RecvWstall) return;
   INFO(NCCL_NET,
       "PHASE2 event=PROXY_B2_RECV_WSTALL tNs=%llu rank=%d peer=%d channel=%d slot=%d coll=%s collApi=%s algo=%s proto=%s base=%llu posted=%llu received=%llu transmitted=%llu done=%llu nsteps=%d rackSelf=%d rackPeer=%d rackKnown=%d interRack=%d penTopo=%d penColl=%d penAlgo=%d penTotal=%d wBase=%d wMin=%d wMax=%d wRaw=%d wEff=%d occPd=%llu occTr=%llu",
@@ -1096,6 +1109,7 @@ static inline void phase4ProxyWstallLog(
     int slot,
     int wCfg,
     uint8_t* stallFlag) {
+  if (ncclParamAppendix2DisableWstallLog()) return;
   if (ncclParamPhase4Log() == 0 || *stallFlag) return;
   INFO(NCCL_NET,
       "PHASE4 event=%s tNs=%llu rank=%d peer=%d channel=%d slot=%d coll=%s collApi=%s algo=%s proto=%s base=%llu posted=%llu received=%llu transmitted=%llu done=%llu nsteps=%d wCfg=%d occPr=%llu occPd=%llu",
@@ -1189,6 +1203,7 @@ static inline void phase3ProxyRecvWstallLog(
     struct ncclProxySubArgs* sub,
     int slot,
     const struct phase3WindowDecision* decision) {
+  if (ncclParamAppendix2DisableWstallLog()) return;
   if (ncclParamPhase3Log() == 0 || sub->phase3RecvWstall) return;
   INFO(NCCL_NET,
       "PHASE3 event=PROXY_B3_RECV_WSTALL tNs=%llu rank=%d peer=%d channel=%d slot=%d coll=%s collApi=%s algo=%s proto=%s base=%llu posted=%llu received=%llu transmitted=%llu done=%llu nsteps=%d ctrlStep=%llu wSem=%d wEff=%d occPd=%d occTr=%d recvLag=%d pressureScore=%d",
@@ -2053,6 +2068,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
       sub->phase3LastDelayNs = 0;
       memset(sub->phase3PostTs, 0, sizeof(sub->phase3PostTs));
       for (int i=0; i<groupSize; i++) sub[-i].groupSize = groupSize;
+      appendix2RecvGroupLog(proxyState, args, sub, s - groupSize + 1, groupSize, maxRecvs);
       ncclProfilerRecordProxyOpEventState(s, args, ncclProfilerProxyOpInProgress_v4);
       if (!sub->reg)
         sub->recvMhandle = resources->mhandles[args->protocol];

@@ -252,6 +252,7 @@ mode_static_w() {
   local mode=$1
   case "${mode}" in
     stock) echo 0 ;;
+    stock_2) echo 0 ;;
     b2_w*) echo "${mode#b2_w}" ;;
     *) echo "[phase2-master] unsupported mode=${mode}" >&2; return 1 ;;
   esac
