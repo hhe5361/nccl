@@ -58,6 +58,16 @@ def mean(values: Iterable[float]) -> float:
     return sum(values) / len(values)
 
 
+def distributed_stat(local_value: float, device: torch.device) -> tuple[float, float]:
+    values = torch.tensor([local_value], device=device, dtype=torch.float64)
+    max_values = values.clone()
+    mean_values = values.clone()
+    dist.all_reduce(max_values, op=dist.ReduceOp.MAX)
+    dist.all_reduce(mean_values, op=dist.ReduceOp.SUM)
+    mean_values /= dist.get_world_size()
+    return float(max_values[0].item()), float(mean_values[0].item())
+
+
 class TinyStack(nn.Module):
     def __init__(self, hidden_dim: int, num_layers: int):
         super().__init__()
@@ -182,25 +192,37 @@ def main() -> None:
             ts_start_unix_ns = time.time_ns()
             t0 = time.perf_counter()
 
+            fwd_t0 = time.perf_counter()
             outputs = ddp_model(inputs)
             loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
-
             torch.cuda.synchronize(device)
+            fwd_t1 = time.perf_counter()
+
+            bwd_t0 = time.perf_counter()
+            loss.backward()
+            torch.cuda.synchronize(device)
+            bwd_t1 = time.perf_counter()
+
+            opt_t0 = time.perf_counter()
+            optimizer.step()
+            torch.cuda.synchronize(device)
+            opt_t1 = time.perf_counter()
+
             t1 = time.perf_counter()
             ts_end_unix_ns = time.time_ns()
             step_end_ns = time.monotonic_ns()
 
             local_ms = (t1 - t0) * 1000.0
-            local_times = torch.tensor([local_ms], device=device, dtype=torch.float64)
-            max_times = local_times.clone()
-            mean_times = local_times.clone()
-            dist.all_reduce(max_times, op=dist.ReduceOp.MAX)
-            dist.all_reduce(mean_times, op=dist.ReduceOp.SUM)
-            mean_times /= world_size
+            local_forward_ms = (fwd_t1 - fwd_t0) * 1000.0
+            local_backward_ms = (bwd_t1 - bwd_t0) * 1000.0
+            local_optimizer_ms = (opt_t1 - opt_t0) * 1000.0
 
-            duration_s = max(float(max_times[0].item()) / 1000.0, 1e-9)
+            max_step_ms, mean_step_ms = distributed_stat(local_ms, device)
+            max_forward_ms, mean_forward_ms = distributed_stat(local_forward_ms, device)
+            max_backward_ms, mean_backward_ms = distributed_stat(local_backward_ms, device)
+            max_optimizer_ms, mean_optimizer_ms = distributed_stat(local_optimizer_ms, device)
+
+            duration_s = max(max_step_ms / 1000.0, 1e-9)
             steps_per_sec = 1.0 / duration_s
             samples_per_sec = global_batch_size / duration_s
 
@@ -224,8 +246,14 @@ def main() -> None:
                 "ts_start_unix_ns": int(ts_start_unix_ns),
                 "ts_end_unix_ns": int(ts_end_unix_ns),
                 "ts_mid_unix_ns": int((ts_start_unix_ns + ts_end_unix_ns) // 2),
-                "step_ms_max": float(max_times[0].item()),
-                "step_ms_mean": float(mean_times[0].item()),
+                "step_ms_max": max_step_ms,
+                "step_ms_mean": mean_step_ms,
+                "forward_ms_max": max_forward_ms,
+                "forward_ms_mean": mean_forward_ms,
+                "backward_ms_max": max_backward_ms,
+                "backward_ms_mean": mean_backward_ms,
+                "optimizer_ms_max": max_optimizer_ms,
+                "optimizer_ms_mean": mean_optimizer_ms,
                 "steps_per_sec": steps_per_sec,
                 "samples_per_sec": samples_per_sec,
                 "loss": float(loss.detach().float().item()),
@@ -255,6 +283,9 @@ def main() -> None:
                     "start_ns": step_start_ns,
                     "end_ns": step_end_ns,
                     "local_step_ms": local_ms,
+                    "local_forward_ms": local_forward_ms,
+                    "local_backward_ms": local_backward_ms,
+                    "local_optimizer_ms": local_optimizer_ms,
                 }
                 timing_handle.write(json.dumps(timing_row, sort_keys=True) + "\n")
                 timing_handle.flush()
@@ -324,6 +355,15 @@ def main() -> None:
             "step_ms_avg": mean(r["step_ms_max"] for r in effective),
             "step_ms_p50": percentile([r["step_ms_max"] for r in effective], 0.50),
             "step_ms_p95": percentile([r["step_ms_max"] for r in effective], 0.95),
+            "forward_ms_avg": mean(r["forward_ms_max"] for r in effective),
+            "forward_ms_p50": percentile([r["forward_ms_max"] for r in effective], 0.50),
+            "forward_ms_p95": percentile([r["forward_ms_max"] for r in effective], 0.95),
+            "backward_ms_avg": mean(r["backward_ms_max"] for r in effective),
+            "backward_ms_p50": percentile([r["backward_ms_max"] for r in effective], 0.50),
+            "backward_ms_p95": percentile([r["backward_ms_max"] for r in effective], 0.95),
+            "optimizer_ms_avg": mean(r["optimizer_ms_max"] for r in effective),
+            "optimizer_ms_p50": percentile([r["optimizer_ms_max"] for r in effective], 0.50),
+            "optimizer_ms_p95": percentile([r["optimizer_ms_max"] for r in effective], 0.95),
             "steps_per_sec_avg": mean(r["steps_per_sec"] for r in effective),
             "steps_per_sec_p50": percentile([r["steps_per_sec"] for r in effective], 0.50),
             "steps_per_sec_p95": percentile([r["steps_per_sec"] for r in effective], 0.95),

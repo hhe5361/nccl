@@ -18,7 +18,19 @@
       "worker08"
     ],
     "run_modes": [
-      "b4_w2"
+      "b4_w2",
+      "b4_w2_5",
+      "b4_w3",
+      "b4_w3_5",
+      "b4_w4",
+      "b4_w4_5",
+      "b4_w5",
+      "b4_w5_5",
+      "b4_w6",
+      "b4_w6_5",
+      "b4_w7",
+      "b4_w7_5",
+      "b4_w8"
     ],
     "repeats": 1,
     "steps": 50,
@@ -51,7 +63,7 @@
   },
   "model": {
     "dtype": "float32",
-    "hidden_dim": 512,
+    "hidden_dim": 1024,
     "num_layers": 4,
     "batch_size": 16,
     "bucket_cap_mb": 1,
@@ -74,6 +86,78 @@
       "label": "B4_W2",
       "phase4_enable": 1,
       "post_receive_w": 2.0
+    },
+    {
+      "mode_id": "b4_w2_5",
+      "label": "B4_W2_5",
+      "phase4_enable": 1,
+      "post_receive_w": 2.5
+    },
+    {
+      "mode_id": "b4_w3",
+      "label": "B4_W3",
+      "phase4_enable": 1,
+      "post_receive_w": 3.0
+    },
+    {
+      "mode_id": "b4_w3_5",
+      "label": "B4_W3_5",
+      "phase4_enable": 1,
+      "post_receive_w": 3.5
+    },
+    {
+      "mode_id": "b4_w4",
+      "label": "B4_W4",
+      "phase4_enable": 1,
+      "post_receive_w": 4.0
+    },
+    {
+      "mode_id": "b4_w4_5",
+      "label": "B4_W4_5",
+      "phase4_enable": 1,
+      "post_receive_w": 4.5
+    },
+    {
+      "mode_id": "b4_w5",
+      "label": "B4_W5",
+      "phase4_enable": 1,
+      "post_receive_w": 5.0
+    },
+    {
+      "mode_id": "b4_w5_5",
+      "label": "B4_W5_5",
+      "phase4_enable": 1,
+      "post_receive_w": 5.5
+    },
+    {
+      "mode_id": "b4_w6",
+      "label": "B4_W6",
+      "phase4_enable": 1,
+      "post_receive_w": 6.0
+    },
+    {
+      "mode_id": "b4_w6_5",
+      "label": "B4_W6_5",
+      "phase4_enable": 1,
+      "post_receive_w": 6.5
+    },
+    {
+      "mode_id": "b4_w7",
+      "label": "B4_W7",
+      "phase4_enable": 1,
+      "post_receive_w": 7.0
+    },
+    {
+      "mode_id": "b4_w7_5",
+      "label": "B4_W7_5",
+      "phase4_enable": 1,
+      "post_receive_w": 7.5
+    },
+    {
+      "mode_id": "b4_w8",
+      "label": "B4_W8",
+      "phase4_enable": 1,
+      "post_receive_w": 8.0
     }
   ]
 }
