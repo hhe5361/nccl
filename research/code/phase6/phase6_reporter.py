@@ -47,6 +47,22 @@ def parse_kv_line(line: str, marker: str) -> dict[str, str] | None:
     return row if "event" in row else None
 
 
+def build_rate_series(times_ns: list[int], bin_ms: float = 1.0) -> list[tuple[float, float]]:
+    if not times_ns:
+        return []
+    t0 = min(times_ns)
+    t1 = max(times_ns)
+    if t1 <= t0:
+        return [(0.0, float(len(times_ns)) / max(bin_ms, 1e-6))]
+    bin_ns = max(int(bin_ms * 1e6), 1)
+    nbins = ((t1 - t0) // bin_ns) + 1
+    counts = [0] * nbins
+    for t in times_ns:
+        idx = (t - t0) // bin_ns
+        counts[int(idx)] += 1
+    return [((i + 0.5) * bin_ms, counts[i] / bin_ms) for i in range(nbins)]
+
+
 def load_mode_series(mode_dir: Path) -> dict[str, list[tuple[float, float]]]:
     worker_dirs = sorted(p for p in mode_dir.iterdir() if p.is_dir() and p.name.startswith("worker"))
     chosen_worker = next((p for p in worker_dirs if p.name == "worker01"), worker_dirs[0] if worker_dirs else None)
@@ -103,6 +119,7 @@ def load_mode_series(mode_dir: Path) -> dict[str, list[tuple[float, float]]]:
         "cumulative_posts": cumulative_posts,
         "cumulative_allow": cumulative_allow,
         "cumulative_stalls": cumulative_stalls,
+        "post_rate": build_rate_series(posts_sorted, bin_ms=1.0),
     }
 
 
@@ -113,6 +130,7 @@ def plot_step_overlay(
     value_key: str,
     output_path: Path,
     y_limits: tuple[float, float] | None = None,
+    label_every: int = 5,
 ) -> None:
     fig, ax = plt.subplots(figsize=(12, 7))
     for mode, records in records_by_mode.items():
@@ -123,15 +141,16 @@ def plot_step_overlay(
         ax.plot(xs_mid, ys, linewidth=2, label=mode)
         for r in records:
             ax.hlines(r[value_key], r["elapsed_start_ms"], r["elapsed_end_ms"], linewidth=1.2, alpha=0.55)
-            ax.text(
-                r["elapsed_start_ms"],
-                r[value_key],
-                str(r["step_plot_index"]),
-                fontsize=7,
-                ha="center",
-                va="bottom",
-                clip_on=True,
-            )
+            if r["step_plot_index"] == 1 or (label_every > 0 and r["step_plot_index"] % label_every == 0):
+                ax.text(
+                    r["elapsed_start_ms"],
+                    r[value_key],
+                    str(r["step_plot_index"]),
+                    fontsize=7,
+                    ha="center",
+                    va="bottom",
+                    clip_on=True,
+                )
     ax.set_title(title)
     ax.set_xlabel("Relative mode time (ms)")
     ax.set_ylabel(ylabel)
@@ -218,6 +237,7 @@ def main() -> None:
         posts_plot = output_dir / f"{repeat_dir.name}_cumulative_posts_overlay.png"
         allow_plot = output_dir / f"{repeat_dir.name}_cumulative_rate_allow_overlay.png"
         stalls_plot = output_dir / f"{repeat_dir.name}_cumulative_rate_stall_overlay.png"
+        post_rate_plot = output_dir / f"{repeat_dir.name}_post_rate_overlay.png"
         latency_plot = output_dir / f"{repeat_dir.name}_latency_overlay_full.png"
         latency_median_plot = output_dir / f"{repeat_dir.name}_latency_overlay_median_band.png"
         throughput_plot = output_dir / f"{repeat_dir.name}_throughput_overlay_full.png"
@@ -240,6 +260,12 @@ def main() -> None:
             title=f"{repeat_dir.name} cumulative rate-stall events (worker01)",
             ylabel="Cumulative stall events",
             output_path=stalls_plot,
+        )
+        plot_cumulative_overlay(
+            {mode: values["post_rate"] for mode, values in cumulative_data.items()},
+            title=f"{repeat_dir.name} recv POST rate (worker01)",
+            ylabel="POST events / ms",
+            output_path=post_rate_plot,
         )
 
         latency_values = [r["latency_ms"] for records in step_data.values() for r in records if not r["warmup"]]
@@ -304,6 +330,7 @@ def main() -> None:
               <h2>{repeat_dir.name}</h2>
               <p>Raw cumulative NCCL plots use a single representative worker per mode: worker01 if present, otherwise the first worker directory.</p>
               <img src="{posts_plot.name}" style="max-width: 100%;"><br>
+              <img src="{post_rate_plot.name}" style="max-width: 100%;"><br>
               <img src="{allow_plot.name}" style="max-width: 100%;"><br>
               <img src="{stalls_plot.name}" style="max-width: 100%;"><br>
               <img src="{latency_plot.name}" style="max-width: 100%;"><br>
