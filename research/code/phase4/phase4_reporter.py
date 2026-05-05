@@ -112,6 +112,19 @@ def elapsed_seconds(base_ns: int, ns: int) -> float:
     return (ns - base_ns) / 1e9
 
 
+def percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = (len(ordered) - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, len(ordered) - 1)
+    frac = pos - lo
+    return ordered[lo] * (1.0 - frac) + ordered[hi] * frac
+
+
 def centered_limits(values: list[float], *, min_half_span: float, frac: float) -> tuple[float, float] | None:
     if not values:
         return None
