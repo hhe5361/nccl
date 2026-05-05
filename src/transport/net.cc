@@ -177,6 +177,8 @@ NCCL_PARAM(Phase3Log, "PHASE3_LOG", 0);
 NCCL_PARAM(Phase4Enable, "PHASE4_ENABLE", 0);
 NCCL_PARAM(Phase4Log, "PHASE4_LOG", 0);
 NCCL_PARAM(Phase4PostReceiveW, "PHASE4_POST_RECEIVE_W", 0);
+NCCL_PARAM(Phase5Log, "PHASE5_LOG", 0);
+NCCL_PARAM(Phase5ProgressLogEvery, "PHASE5_PROGRESS_LOG_EVERY", 128);
 NCCL_PARAM(Appendix2GroupLog, "APPENDIX2_GROUP_LOG", 0);
 NCCL_PARAM(Appendix2DisableWstallLog, "APPENDIX2_DISABLE_WSTALL_LOG", 0);
 NCCL_PARAM(Phase3WarmupIntervals, "PHASE3_WARMUP_INTERVALS", 4);
@@ -235,6 +237,81 @@ static inline void phase0ProxyLog(
       wEff,
       (unsigned long long)(sub->posted - sub->done),
       (unsigned long long)(sub->transmitted - sub->done));
+}
+
+static inline int phase5ShouldLogProgress(uint64_t callCount) {
+  int logEvery = ncclParamPhase5ProgressLogEvery();
+  return ncclParamPhase5Log() != 0 && logEvery > 0 && (callCount == 1 || (callCount % (uint64_t)logEvery) == 0);
+}
+
+static inline void phase5RecvProgressLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    int maxDepth,
+    int phase4Enabled,
+    double phase4WRaw,
+    uint64_t deltaNs) {
+  if (!phase5ShouldLogProgress(args->phase5RecvProxyCalls)) return;
+  INFO(NCCL_NET,
+      "PHASE5 event=RECV_PROXY_PROGRESS tNs=%llu rank=%d call=%llu deltaNs=%llu state=%d idle=%d done=%d nsubs=%d coll=%s collApi=%s algo=%s proto=%s maxDepth=%d phase4Enable=%d phase4WRaw=%.3f",
+      (unsigned long long)clockNano(),
+      proxyState->tpRank,
+      (unsigned long long)args->phase5RecvProxyCalls,
+      (unsigned long long)deltaNs,
+      args->state,
+      args->idle,
+      args->done,
+      args->nsubs,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol),
+      maxDepth,
+      phase4Enabled,
+      phase4WRaw);
+}
+
+static inline void phase5RecvEventLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    const char* event,
+    int slot,
+    ssize_t size,
+    int maxDepth,
+    double phase4WRaw,
+    int wEff,
+    uint64_t postTsNs,
+    uint64_t postToNetDoneNs,
+    uint64_t progressCallsSincePost) {
+  if (ncclParamPhase5Log() == 0) return;
+  INFO(NCCL_NET,
+      "PHASE5 event=%s tNs=%llu rank=%d peer=%d channel=%d slot=%d coll=%s collApi=%s algo=%s proto=%s size=%lld base=%llu posted=%llu received=%llu transmitted=%llu done=%llu nsteps=%d maxDepth=%d wCfgRaw=%.3f wEff=%d postTsNs=%llu postToNetDoneNs=%llu progressCallsSincePost=%llu occPr=%llu occPd=%llu",
+      event,
+      (unsigned long long)clockNano(),
+      proxyState->tpRank,
+      sub->peer,
+      sub->channelId,
+      slot,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol),
+      (long long)size,
+      (unsigned long long)sub->base,
+      (unsigned long long)sub->posted,
+      (unsigned long long)sub->received,
+      (unsigned long long)sub->transmitted,
+      (unsigned long long)sub->done,
+      sub->nsteps,
+      maxDepth,
+      phase4WRaw,
+      wEff,
+      (unsigned long long)postTsNs,
+      (unsigned long long)postToNetDoneNs,
+      (unsigned long long)progressCallsSincePost,
+      (unsigned long long)(sub->posted - sub->received),
+      (unsigned long long)(sub->posted - sub->done));
 }
 
 static_assert(sizeof(ncclNetHandle_t) + sizeof(int) <= CONNECT_SIZE, "Not large enough ncclConnect to hold ncclNetHandle_t and useGdr flag");
@@ -2145,12 +2222,16 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
       sub->phase3DelayEwmaNs = 0;
       sub->phase3LastDelayNs = 0;
       memset(sub->phase3PostTs, 0, sizeof(sub->phase3PostTs));
+      memset(sub->phase5PostTs, 0, sizeof(sub->phase5PostTs));
+      memset(sub->phase5PostProgressCall, 0, sizeof(sub->phase5PostProgressCall));
       for (int i=0; i<groupSize; i++) sub[-i].groupSize = groupSize;
       appendix2RecvGroupLog(proxyState, args, sub, s - groupSize + 1, groupSize, maxRecvs);
       ncclProfilerRecordProxyOpEventState(s, args, ncclProfilerProxyOpInProgress_v4);
       if (!sub->reg)
         sub->recvMhandle = resources->mhandles[args->protocol];
     }
+    args->phase5RecvProxyCalls = 0;
+    args->phase5LastRecvProxyNs = 0;
     args->state = ncclProxyOpProgress;
   }
   args->idle = 1;
@@ -2160,6 +2241,13 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
     int wCfg = phase1WindowCfg();
     int phase4Enabled = ncclParamPhase4Enable();
     double phase4WRaw = phase4WindowRaw();
+    if (ncclParamPhase5Log() != 0) {
+      uint64_t nowNs = clockNano();
+      uint64_t deltaNs = args->phase5LastRecvProxyNs ? nowNs - args->phase5LastRecvProxyNs : 0;
+      args->phase5RecvProxyCalls++;
+      args->phase5LastRecvProxyNs = nowNs;
+      phase5RecvProgressLog(proxyState, args, wBase, phase4Enabled, phase4WRaw, deltaNs);
+    }
     for (int s=0; s<args->nsubs; s+=args->subs[s].groupSize) {
       struct ncclProxySubArgs* subGroup = args->subs+s;
       int subCount = 0;
@@ -2205,6 +2293,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
           }
           if (phase4Enabled && phase4WRaw > 0.0 && sub->posted >= sub->received + wEff) {
             phase4ProxyWstallLog(proxyState, args, sub, "PROXY_RECV_WSTALL", (sub->base+sub->posted)%NCCL_STEPS, phase4WRaw, wEff, &sub->phase4RecvWstall);
+            phase5RecvEventLog(proxyState, args, sub, "PROXY_RECV_WSTALL", (sub->base + sub->posted) % NCCL_STEPS, 0, wBase, phase4WRaw, wEff, 0, 0, 0);
             subCount = 0;
             break;
           }
@@ -2273,9 +2362,14 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             struct phase2WindowDecision semanticDecision = phase2SelectWindow(proxyState, args, sub);
             struct phase3WindowDecision phase3Decision = phase3SnapshotWindow(sub, &semanticDecision);
             int wEff = (wCfg > 0) ? phase1WindowEff(args) : (phase3Decision.enabled ? phase3Decision.wEff : (semanticDecision.enabled ? semanticDecision.wEff : wBase));
-            TRACE(NCCL_NET, "recvProxy [%ld/%ld/%d] Irecv posted, buff %p, size %ld, myRank %d, channelId %d, mhandle %p", sub->posted, (sub->base + sub->posted) % NCCL_STEPS, sub->nsteps, ptrs[i], sizes[i], proxyState->tpRank, sub->channelId, mhandles[i]);
-            phase0ProxyLog(proxyState, args, sub, "PROXY_RECV_POST", (sub->base + sub->posted) % NCCL_STEPS, sizes[i], wBase, wCfg, wEff);
-            sub->phase3PostTs[(sub->base + sub->posted) % NCCL_STEPS] = clockNano();
+            int buffSlot = (sub->base + sub->posted) % NCCL_STEPS;
+            uint64_t postTsNs = clockNano();
+            TRACE(NCCL_NET, "recvProxy [%ld/%d/%d] Irecv posted, buff %p, size %ld, myRank %d, channelId %d, mhandle %p", sub->posted, buffSlot, sub->nsteps, ptrs[i], sizes[i], proxyState->tpRank, sub->channelId, mhandles[i]);
+            phase0ProxyLog(proxyState, args, sub, "PROXY_RECV_POST", buffSlot, sizes[i], wBase, wCfg, wEff);
+            sub->phase3PostTs[buffSlot] = postTsNs;
+            sub->phase5PostTs[buffSlot] = postTsNs;
+            sub->phase5PostProgressCall[buffSlot] = args->phase5RecvProxyCalls;
+            phase5RecvEventLog(proxyState, args, sub, "PROXY_RECV_POST", buffSlot, sizes[i], wBase, phase4WRaw, wEff, postTsNs, 0, 0);
             sub->posted += args->sliceSteps;
             ncclProfilerRecordProxyStepEventState(s+i, args, postedStepId, ncclProfilerProxyStepRecvWait);
           }
@@ -2319,6 +2413,12 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
               if (sub->phase3DelayBaseNs == 0) sub->phase3DelayBaseNs = sub->phase3DelayEwmaNs;
             }
             phase0ProxyLog(proxyState, args, sub, "PROXY_RECV_NET_DONE", buffSlot, sizes[i], wBase, wCfg, wEff);
+            {
+              uint64_t phase5PostTsNs = sub->phase5PostTs[buffSlot];
+              uint64_t phase5DelayNs = (phase5PostTsNs != 0 && nowNs >= phase5PostTsNs) ? (nowNs - phase5PostTsNs) : 0;
+              uint64_t progressCallsSincePost = sub->phase5PostProgressCall[buffSlot] ? (args->phase5RecvProxyCalls - sub->phase5PostProgressCall[buffSlot]) : 0;
+              phase5RecvEventLog(proxyState, args, sub, "PROXY_RECV_NET_DONE", buffSlot, sizes[i], wBase, phase4WRaw, wEff, phase5PostTsNs, phase5DelayNs, progressCallsSincePost);
+            }
             sub->received += args->sliceSteps;
             ncclProfilerRecordProxyStepEventState(s+i, args, receivedStepId, ncclProfilerProxyStepRecvFlushWait);
             if (phase3Decision.enabled && wCfg == 0) {

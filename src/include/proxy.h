@@ -170,6 +170,8 @@ struct ncclProxySubArgs {
   uint64_t phase3DelayEwmaNs;
   uint64_t phase3LastDelayNs;
   uint64_t phase3PostTs[NCCL_STEPS];
+  uint64_t phase5PostTs[NCCL_STEPS];
+  uint64_t phase5PostProgressCall[NCCL_STEPS];
   void* requests[NCCL_STEPS];
 
   // Profiler plugin
@@ -217,6 +219,8 @@ struct ncclProxyArgs {
 
   int idle;
   uint8_t phase4MaxDepthLogged;
+  uint64_t phase5RecvProxyCalls;
+  uint64_t phase5LastRecvProxyNs;
 
   // Element linking
   struct ncclProxyArgs* next;

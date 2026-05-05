@@ -21,6 +21,7 @@ python3 - "${CONFIG_PATH}" <<'PY'
 import json, shlex, sys
 
 cfg = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+phase_name = cfg.get("phase", "phase4")
 run = cfg.get("run", {})
 model = cfg.get("model", {})
 container = cfg.get("container", {})
@@ -48,6 +49,8 @@ pairs = {
     "CFG_TARGET_SCRIPT": run.get("target_script", "research/code/phase4/ddp_b4.py"),
     "CFG_WORKER_SCRIPT": run.get("worker_script", "research/code/phase4/run_b4_mode_worker.sh"),
     "CFG_COMPARE_SCRIPT": run.get("compare_script", "research/code/phase4/compare_b4_vs_stock.py"),
+    "CFG_SUMMARY_SCRIPT": run.get("summary_script", "research/code/phase4/phase4_ncc_event_summary.py"),
+    "CFG_SUMMARY_OUTPUT_NAME": run.get("summary_output_name", "phase4_ncc_event_summary.json"),
     "CFG_HOST_REPO_ROOT": paths.get("host_repo_root", ""),
     "CFG_REMOTE_REPO_ROOT": paths.get("remote_repo_root", ""),
     "CFG_REMOTE_REPO_ROOT_MAP": paths.get("remote_repo_root_map", ""),
@@ -76,6 +79,7 @@ pairs = {
     "CFG_NCCL_DEBUG": nccl.get("debug", "INFO"),
     "CFG_NCCL_DEBUG_SUBSYS": nccl.get("debug_subsys", "NET"),
     "CFG_NCCL_NET_GDR_LEVEL": nccl.get("net_gdr_level", 0),
+    "CFG_PHASE_NAME": phase_name,
 }
 
 for key, value in pairs.items():
@@ -100,6 +104,8 @@ TORCH_ENV=${TORCH_ENV:-${CFG_TORCH_ENV}}
 TARGET_SCRIPT=${TARGET_SCRIPT:-${CFG_TARGET_SCRIPT}}
 WORKER_SCRIPT=${WORKER_SCRIPT:-${CFG_WORKER_SCRIPT}}
 COMPARE_SCRIPT=${COMPARE_SCRIPT:-${CFG_COMPARE_SCRIPT}}
+SUMMARY_SCRIPT=${SUMMARY_SCRIPT:-${CFG_SUMMARY_SCRIPT}}
+SUMMARY_OUTPUT_NAME=${SUMMARY_OUTPUT_NAME:-${CFG_SUMMARY_OUTPUT_NAME}}
 HOST_REPO_ROOT=${HOST_REPO_ROOT:-${CFG_HOST_REPO_ROOT:-${REPO_ROOT}}}
 REMOTE_REPO_ROOT=${REMOTE_REPO_ROOT:-${CFG_REMOTE_REPO_ROOT:-${HOST_REPO_ROOT}}}
 REMOTE_REPO_ROOT_MAP=${REMOTE_REPO_ROOT_MAP:-${CFG_REMOTE_REPO_ROOT_MAP}}
@@ -128,6 +134,7 @@ NCCL_APPENDIX2_GROUP_LOG=${NCCL_APPENDIX2_GROUP_LOG:-${CFG_NCCL_APPENDIX2_GROUP_
 NCCL_DEBUG=${NCCL_DEBUG:-${CFG_NCCL_DEBUG}}
 NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-${CFG_NCCL_DEBUG_SUBSYS}}
 NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL:-${CFG_NCCL_NET_GDR_LEVEL}}
+PHASE_NAME=${PHASE_NAME:-${CFG_PHASE_NAME}}
 
 if [[ "${NETWORK_TOPOLOGY_FILE}" != /* ]]; then
   NETWORK_TOPOLOGY_FILE="${REPO_ROOT}/${NETWORK_TOPOLOGY_FILE}"
@@ -604,7 +611,7 @@ compare_outputs() {
 summarize_nccl_events() {
   local experiment_root=$1
   local output_json=$2
-  local summary_script="${REPO_ROOT}/research/code/phase4/phase4_ncc_event_summary.py"
+  local summary_script="${REPO_ROOT}/${SUMMARY_SCRIPT}"
   if [[ ! -f "${summary_script}" ]]; then
     echo "[phase4-matrix] ncc event summary script missing path=${summary_script}"
     return 0
@@ -615,10 +622,10 @@ summarize_nccl_events() {
     --output-json "${output_json}" || true
 }
 
-MANIFEST_JSON="${LOG_ROOT}/phase4_manifest.json"
+MANIFEST_JSON="${LOG_ROOT}/${PHASE_NAME}_manifest.json"
 cat > "${MANIFEST_JSON}" <<EOF
 {
-  "phase": "phase4",
+  "phase": "${PHASE_NAME}",
   "run_id": "${RUN_ID}",
   "master_server": "${MASTER_SERVER}",
   "master_addr": "${MASTER_ADDR}",
@@ -722,7 +729,7 @@ for repeat_idx in $(seq 1 "${REPEATS}"); do
   done
 
   compare_outputs "${repeat_root}" "${repeat_root}/final_output_validation.json"
-  summarize_nccl_events "${repeat_root}" "${repeat_root}/phase4_ncc_event_summary.json"
+  summarize_nccl_events "${repeat_root}" "${repeat_root}/${SUMMARY_OUTPUT_NAME}"
 done
 
 if (( overall_rc != 0 )); then
