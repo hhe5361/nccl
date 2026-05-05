@@ -75,6 +75,7 @@ pairs = {
     "CFG_NCCL_PROTO": nccl.get("proto", "auto"),
     "CFG_NCCL_PHASE0_LOG": nccl.get("phase0_log", 1),
     "CFG_NCCL_PHASE4_LOG": nccl.get("phase4_log", 0),
+    "CFG_NCCL_PHASE6_LOG": nccl.get("phase6_log", 0),
     "CFG_NCCL_APPENDIX2_GROUP_LOG": nccl.get("appendix2_group_log", 0),
     "CFG_NCCL_DEBUG": nccl.get("debug", "INFO"),
     "CFG_NCCL_DEBUG_SUBSYS": nccl.get("debug_subsys", "NET"),
@@ -130,6 +131,7 @@ NCCL_ALGO=${NCCL_ALGO:-${CFG_NCCL_ALGO}}
 NCCL_PROTO=${NCCL_PROTO:-${CFG_NCCL_PROTO}}
 NCCL_PHASE0_LOG=${NCCL_PHASE0_LOG:-${CFG_NCCL_PHASE0_LOG}}
 NCCL_PHASE4_LOG=${NCCL_PHASE4_LOG:-${CFG_NCCL_PHASE4_LOG}}
+NCCL_PHASE6_LOG=${NCCL_PHASE6_LOG:-${CFG_NCCL_PHASE6_LOG}}
 NCCL_APPENDIX2_GROUP_LOG=${NCCL_APPENDIX2_GROUP_LOG:-${CFG_NCCL_APPENDIX2_GROUP_LOG}}
 NCCL_DEBUG=${NCCL_DEBUG:-${CFG_NCCL_DEBUG}}
 NCCL_DEBUG_SUBSYS=${NCCL_DEBUG_SUBSYS:-${CFG_NCCL_DEBUG_SUBSYS}}
@@ -424,8 +426,11 @@ build_worker_host_command() {
   local repeat_label=$4
   local phase4_enable_value=$5
   local phase4_post_receive_w_value=$6
-  local run_root=$7
-  local status_file=$8
+  local phase6_enable_value=$7
+  local phase6_post_rate_value=$8
+  local phase6_post_burst_value=$9
+  local run_root=${10}
+  local status_file=${11}
   local remote_repo_root
 
   remote_repo_root=$(resolve_remote_repo_root "${worker}")
@@ -438,6 +443,9 @@ MODE=$(printf '%q' "${mode}") \
 REPEAT_LABEL=$(printf '%q' "${repeat_label}") \
 PHASE4_ENABLE_VALUE=$(printf '%q' "${phase4_enable_value}") \
 PHASE4_POST_RECEIVE_W_VALUE=$(printf '%q' "${phase4_post_receive_w_value}") \
+PHASE6_ENABLE_VALUE=$(printf '%q' "${phase6_enable_value}") \
+PHASE6_POST_RATE_VALUE=$(printf '%q' "${phase6_post_rate_value}") \
+PHASE6_POST_BURST_VALUE=$(printf '%q' "${phase6_post_burst_value}") \
 MASTER_ADDR=$(printf '%q' "${MASTER_ADDR}") \
 MASTER_PORT=$(printf '%q' "${MASTER_PORT}") \
 NNODES=$(printf '%q' "${NNODES}") \
@@ -458,6 +466,7 @@ NCCL_ALGO=$(printf '%q' "${NCCL_ALGO}") \
 NCCL_PROTO=$(printf '%q' "${NCCL_PROTO}") \
 NCCL_PHASE0_LOG=$(printf '%q' "${NCCL_PHASE0_LOG}") \
 NCCL_PHASE4_LOG=$(printf '%q' "${NCCL_PHASE4_LOG}") \
+NCCL_PHASE6_LOG=$(printf '%q' "${NCCL_PHASE6_LOG}") \
 NCCL_APPENDIX2_GROUP_LOG=$(printf '%q' "${NCCL_APPENDIX2_GROUP_LOG}") \
 NCCL_DEBUG=$(printf '%q' "${NCCL_DEBUG}") \
 NCCL_DEBUG_SUBSYS=$(printf '%q' "${NCCL_DEBUG_SUBSYS}") \
@@ -487,8 +496,11 @@ launch_worker_mode() {
   local repeat_label=$4
   local phase4_enable_value=$5
   local phase4_post_receive_w_value=$6
-  local run_root=$7
-  local status_file=$8
+  local phase6_enable_value=$7
+  local phase6_post_rate_value=$8
+  local phase6_post_burst_value=$9
+  local run_root=${10}
+  local status_file=${11}
   local mode_upper_value
   mode_upper_value=$(echo "${mode}" | tr '[:lower:]' '[:upper:]')
   local worker_log_root="${run_root}/${worker}"
@@ -496,7 +508,7 @@ launch_worker_mode() {
   mkdir -p "${worker_log_root}"
   write_pending_status "${status_file}" "${worker}" "${rank}" "${mode_upper_value}"
   local host_cmd
-  host_cmd=$(build_worker_host_command "${worker}" "${rank}" "${mode}" "${repeat_label}" "${phase4_enable_value}" "${phase4_post_receive_w_value}" "${run_root}" "${status_file}")
+  host_cmd=$(build_worker_host_command "${worker}" "${rank}" "${mode}" "${repeat_label}" "${phase4_enable_value}" "${phase4_post_receive_w_value}" "${phase6_enable_value}" "${phase6_post_rate_value}" "${phase6_post_burst_value}" "${run_root}" "${status_file}")
 
   echo "[phase4-matrix] launch worker=${worker} rank=${rank} mode=${mode_upper_value}"
   if [[ "${worker}" == "${MASTER_SERVER}" ]]; then
@@ -676,12 +688,15 @@ for repeat_idx in $(seq 1 "${REPEATS}"); do
     mode_upper_value=$(echo "${mode}" | tr '[:lower:]' '[:upper:]')
     phase4_enable_value=$(mode_field "${mode}" "phase4_enable" "0")
     phase4_post_receive_w_value=$(mode_field "${mode}" "post_receive_w" "0")
+    phase6_enable_value=$(mode_field "${mode}" "phase6_enable" "0")
+    phase6_post_rate_value=$(mode_field "${mode}" "post_rate" "0")
+    phase6_post_burst_value=$(mode_field "${mode}" "post_burst" "0")
     run_root="${repeat_root}/${mode_upper_value}"
     status_dir="${repeat_status_root}/${mode_upper_value}"
     mkdir -p "${run_root}" "${status_dir}"
 
     echo "[phase4-matrix] ------------------------------------------------------------"
-    echo "[phase4-matrix] start repeat=${repeat_label} mode=${mode_upper_value} port=${MASTER_PORT} phase4_enable=${phase4_enable_value} phase4_post_receive_w=${phase4_post_receive_w_value}"
+    echo "[phase4-matrix] start repeat=${repeat_label} mode=${mode_upper_value} port=${MASTER_PORT} phase4_enable=${phase4_enable_value} phase4_post_receive_w=${phase4_post_receive_w_value} phase6_enable=${phase6_enable_value} phase6_post_rate=${phase6_post_rate_value} phase6_post_burst=${phase6_post_burst_value}"
 
     cleanup_all_workers
     wait_for_master_port_free 10
@@ -691,7 +706,7 @@ for repeat_idx in $(seq 1 "${REPEATS}"); do
     declare -A LAUNCH_PIDS=()
     declare -A LAUNCH_LOGS=()
 
-    launch_worker_mode "${ALL_WORKER_ARRAY[0]}" 0 "${mode}" "${repeat_label}" "${phase4_enable_value}" "${phase4_post_receive_w_value}" "${run_root}" "${status_dir}/${ALL_WORKER_ARRAY[0]}.status"
+    launch_worker_mode "${ALL_WORKER_ARRAY[0]}" 0 "${mode}" "${repeat_label}" "${phase4_enable_value}" "${phase4_post_receive_w_value}" "${phase6_enable_value}" "${phase6_post_rate_value}" "${phase6_post_burst_value}" "${run_root}" "${status_dir}/${ALL_WORKER_ARRAY[0]}.status"
 
     rank0_pid="${LAUNCH_PIDS[${ALL_WORKER_ARRAY[0]}]}"
     if ! wait_for_master_port_listen "${rank0_pid}"; then
@@ -705,7 +720,7 @@ for repeat_idx in $(seq 1 "${REPEATS}"); do
         continue
       fi
       worker="${ALL_WORKER_ARRAY[$idx]}"
-      launch_worker_mode "${worker}" "${idx}" "${mode}" "${repeat_label}" "${phase4_enable_value}" "${phase4_post_receive_w_value}" "${run_root}" "${status_dir}/${worker}.status"
+      launch_worker_mode "${worker}" "${idx}" "${mode}" "${repeat_label}" "${phase4_enable_value}" "${phase4_post_receive_w_value}" "${phase6_enable_value}" "${phase6_post_rate_value}" "${phase6_post_burst_value}" "${run_root}" "${status_dir}/${worker}.status"
     done
 
     mode_start_ts=$(date +%s)

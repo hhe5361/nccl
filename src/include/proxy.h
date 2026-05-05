@@ -172,6 +172,10 @@ struct ncclProxySubArgs {
   uint64_t phase3PostTs[NCCL_STEPS];
   uint64_t phase5PostTs[NCCL_STEPS];
   uint64_t phase5PostProgressCall[NCCL_STEPS];
+  uint8_t phase6RateCfgLogged;
+  uint8_t phase6RateStall;
+  double phase6Tokens;
+  uint64_t phase6LastRefillNs;
   void* requests[NCCL_STEPS];
 
   // Profiler plugin

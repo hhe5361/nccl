@@ -179,6 +179,8 @@ NCCL_PARAM(Phase4Log, "PHASE4_LOG", 0);
 NCCL_PARAM(Phase4PostReceiveW, "PHASE4_POST_RECEIVE_W", 0);
 NCCL_PARAM(Phase5Log, "PHASE5_LOG", 0);
 NCCL_PARAM(Phase5ProgressLogEvery, "PHASE5_PROGRESS_LOG_EVERY", 128);
+NCCL_PARAM(Phase6Enable, "PHASE6_ENABLE", 0);
+NCCL_PARAM(Phase6Log, "PHASE6_LOG", 0);
 NCCL_PARAM(Appendix2GroupLog, "APPENDIX2_GROUP_LOG", 0);
 NCCL_PARAM(Appendix2DisableWstallLog, "APPENDIX2_DISABLE_WSTALL_LOG", 0);
 NCCL_PARAM(Phase3WarmupIntervals, "PHASE3_WARMUP_INTERVALS", 4);
@@ -790,6 +792,84 @@ static inline double phase4WindowRaw() {
   if (end == env) return 0.0;
   if (value < 0.0) return 0.0;
   return value;
+}
+
+static inline double phase6PostRateRaw() {
+  const char* env = getenv("NCCL_PHASE6_POST_RATE");
+  if (env == NULL || env[0] == '\0') return 0.0;
+  char* end = NULL;
+  double value = strtod(env, &end);
+  if (end == env) return 0.0;
+  if (value < 0.0) return 0.0;
+  return value;
+}
+
+static inline double phase6PostBurstRaw() {
+  const char* env = getenv("NCCL_PHASE6_POST_BURST");
+  if (env == NULL || env[0] == '\0') return 0.0;
+  char* end = NULL;
+  double value = strtod(env, &end);
+  if (end == env) return 0.0;
+  if (value < 0.0) return 0.0;
+  return value;
+}
+
+static inline int phase6Enabled() {
+  return ncclParamPhase6Enable() != 0 || phase6PostRateRaw() > 0.0;
+}
+
+static inline void phase6RateCfgLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    double rateRaw,
+    double burstRaw) {
+  if (ncclParamPhase6Log() == 0) return;
+  INFO(NCCL_NET,
+      "PHASE6 event=RATE_CFG tNs=%llu rank=%d peer=%d channel=%d groupSize=%d coll=%s collApi=%s algo=%s proto=%s postRatePerMs=%.6f postBurst=%.3f",
+      (unsigned long long)clockNano(),
+      proxyState->tpRank,
+      sub->peer,
+      sub->channelId,
+      sub->groupSize,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol),
+      rateRaw,
+      burstRaw);
+}
+
+static inline void phase6RateDecisionLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    const char* event,
+    uint64_t elapsedNs,
+    int postCost,
+    double rateRaw,
+    double burstRaw,
+    double tokensBefore,
+    double tokensAfter) {
+  if (ncclParamPhase6Log() == 0) return;
+  INFO(NCCL_NET,
+      "PHASE6 event=%s tNs=%llu rank=%d peer=%d channel=%d groupSize=%d coll=%s collApi=%s algo=%s proto=%s elapsedNs=%llu postCost=%d postRatePerMs=%.6f postBurst=%.3f tokensBefore=%.6f tokensAfter=%.6f",
+      event,
+      (unsigned long long)clockNano(),
+      proxyState->tpRank,
+      sub->peer,
+      sub->channelId,
+      sub->groupSize,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol),
+      (unsigned long long)elapsedNs,
+      postCost,
+      rateRaw,
+      burstRaw,
+      tokensBefore,
+      tokensAfter);
 }
 
 static inline uint64_t phase4Mix64(uint64_t x) {
@@ -2006,6 +2086,10 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
       sub->phase3RecvWstall = 0;
       sub->phase4WindowCfgLogged = 0;
       sub->phase4RecvWstall = 0;
+      sub->phase6RateCfgLogged = 0;
+      sub->phase6RateStall = 0;
+      sub->phase6Tokens = 0.0;
+      sub->phase6LastRefillNs = 0;
       sub->phase3CurrentW = 0;
       sub->phase3LastLoggedW = 0;
       sub->phase3HiCount = 0;
@@ -2241,6 +2325,9 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
     int wCfg = phase1WindowCfg();
     int phase4Enabled = ncclParamPhase4Enable();
     double phase4WRaw = phase4WindowRaw();
+    int phase6RateEnabled = phase6Enabled();
+    double phase6RateRaw = phase6PostRateRaw();
+    double phase6BurstRaw = phase6PostBurstRaw();
     if (ncclParamPhase5Log() != 0) {
       uint64_t nowNs = clockNano();
       uint64_t deltaNs = args->phase5LastRecvProxyNs ? nowNs - args->phase5LastRecvProxyNs : 0;
@@ -2348,6 +2435,31 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
         uint64_t step = subGroup->posted;
         struct recvNetResources* resources = (struct recvNetResources*) (subGroup->connection->transportResources);
         void** requestPtr = subGroup->requests+(step%NCCL_STEPS);
+        if (phase6RateEnabled && phase6RateRaw > 0.0 && phase6BurstRaw > 0.0) {
+          struct ncclProxySubArgs* leader = subGroup;
+          uint64_t nowNs = clockNano();
+          if (!leader->phase6RateCfgLogged) {
+            leader->phase6Tokens = phase6BurstRaw;
+            leader->phase6LastRefillNs = nowNs;
+            phase6RateCfgLog(proxyState, args, leader, phase6RateRaw, phase6BurstRaw);
+            leader->phase6RateCfgLogged = 1;
+          }
+          uint64_t elapsedNs = leader->phase6LastRefillNs ? (nowNs - leader->phase6LastRefillNs) : 0;
+          double tokensBefore = leader->phase6Tokens;
+          if (elapsedNs > 0) {
+            leader->phase6Tokens = std::min(phase6BurstRaw, leader->phase6Tokens + phase6RateRaw * ((double)elapsedNs / 1000000.0));
+          }
+          leader->phase6LastRefillNs = nowNs;
+          int postCost = subCount;
+          if (leader->phase6Tokens + 1.0e-12 < (double)postCost) {
+            phase6RateDecisionLog(proxyState, args, leader, "RATE_STALL", elapsedNs, postCost, phase6RateRaw, phase6BurstRaw, tokensBefore, leader->phase6Tokens);
+            leader->phase6RateStall = 1;
+            continue;
+          }
+          leader->phase6RateStall = 0;
+          leader->phase6Tokens -= (double)postCost;
+          phase6RateDecisionLog(proxyState, args, leader, "RATE_ALLOW", elapsedNs, postCost, phase6RateRaw, phase6BurstRaw, tokensBefore, leader->phase6Tokens);
+        }
         bool ignoreCompletion = ncclParamNetOptionalRecvCompletion() && ((args->protocol == NCCL_PROTO_LL128) || (args->protocol == NCCL_PROTO_LL)) && (subCount == 1);
         if (!checkedNetAttr++)
           setXferNetAttrs(proxyState, args, 0);
