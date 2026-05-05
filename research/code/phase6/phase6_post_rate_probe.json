@@ -22,7 +22,7 @@
       "p6_r1_0_b8",
       "p6_r2_0_b16"
     ],
-    "steps": 20,
+    "steps": 100,
     "warmup_steps": 5,
     "repeats": 1,
     "mode_timeout_sec": 600,
