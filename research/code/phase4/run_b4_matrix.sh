@@ -5,11 +5,23 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/../../.." && pwd)
 
 CONFIG_PATH=${SCRIPT_DIR}/phase4_b4_post_receive_ddp.json
-if [[ "${1:-}" == "--config" ]]; then
-  CONFIG_PATH=${2:?config path required}
-elif [[ -n "${1:-}" ]]; then
-  CONFIG_PATH=${1}
-fi
+NET_BURST=${NET_BURST:-0}
+while (( $# > 0 )); do
+  case "${1}" in
+    --config)
+      CONFIG_PATH=${2:?config path required}
+      shift 2
+      ;;
+    --net-burst)
+      NET_BURST=${2:?net-burst value required}
+      shift 2
+      ;;
+    *)
+      CONFIG_PATH=${1}
+      shift
+      ;;
+  esac
+done
 
 if [[ ! -f "${CONFIG_PATH}" ]]; then
   echo "[phase4-matrix] config not found: ${CONFIG_PATH}" >&2
@@ -442,15 +454,16 @@ build_worker_host_command() {
   local repeat_label=$4
   local phase4_enable_value=$5
   local phase4_post_receive_w_value=$6
-  local phase6_enable_value=$7
-  local phase6_post_rate_value=$8
-  local phase6_post_burst_value=$9
-  local phase7_enable_value=${10}
-  local phase7_ratio_pct_value=${11}
-  local phase7_observe_ms_value=${12}
-  local phase7_burst_window_ms_value=${13}
-  local run_root=${14}
-  local status_file=${15}
+  local net_burst_value=$7
+  local phase6_enable_value=$8
+  local phase6_post_rate_value=$9
+  local phase6_post_burst_value=${10}
+  local phase7_enable_value=${11}
+  local phase7_ratio_pct_value=${12}
+  local phase7_observe_ms_value=${13}
+  local phase7_burst_window_ms_value=${14}
+  local run_root=${15}
+  local status_file=${16}
   local remote_repo_root
 
   remote_repo_root=$(resolve_remote_repo_root "${worker}")
@@ -463,6 +476,7 @@ MODE=$(printf '%q' "${mode}") \
 REPEAT_LABEL=$(printf '%q' "${repeat_label}") \
 PHASE4_ENABLE_VALUE=$(printf '%q' "${phase4_enable_value}") \
 PHASE4_POST_RECEIVE_W_VALUE=$(printf '%q' "${phase4_post_receive_w_value}") \
+NET_BURST_VALUE=$(printf '%q' "${net_burst_value}") \
 PHASE6_ENABLE_VALUE=$(printf '%q' "${phase6_enable_value}") \
 PHASE6_POST_RATE_VALUE=$(printf '%q' "${phase6_post_rate_value}") \
 PHASE6_POST_BURST_VALUE=$(printf '%q' "${phase6_post_burst_value}") \
@@ -522,15 +536,16 @@ launch_worker_mode() {
   local repeat_label=$4
   local phase4_enable_value=$5
   local phase4_post_receive_w_value=$6
-  local phase6_enable_value=$7
-  local phase6_post_rate_value=$8
-  local phase6_post_burst_value=$9
-  local phase7_enable_value=${10}
-  local phase7_ratio_pct_value=${11}
-  local phase7_observe_ms_value=${12}
-  local phase7_burst_window_ms_value=${13}
-  local run_root=${14}
-  local status_file=${15}
+  local net_burst_value=$7
+  local phase6_enable_value=$8
+  local phase6_post_rate_value=$9
+  local phase6_post_burst_value=${10}
+  local phase7_enable_value=${11}
+  local phase7_ratio_pct_value=${12}
+  local phase7_observe_ms_value=${13}
+  local phase7_burst_window_ms_value=${14}
+  local run_root=${15}
+  local status_file=${16}
   local mode_upper_value
   mode_upper_value=$(echo "${mode}" | tr '[:lower:]' '[:upper:]')
   local worker_log_root="${run_root}/${worker}"
@@ -538,7 +553,7 @@ launch_worker_mode() {
   mkdir -p "${worker_log_root}"
   write_pending_status "${status_file}" "${worker}" "${rank}" "${mode_upper_value}"
   local host_cmd
-  host_cmd=$(build_worker_host_command "${worker}" "${rank}" "${mode}" "${repeat_label}" "${phase4_enable_value}" "${phase4_post_receive_w_value}" "${phase6_enable_value}" "${phase6_post_rate_value}" "${phase6_post_burst_value}" "${phase7_enable_value}" "${phase7_ratio_pct_value}" "${phase7_observe_ms_value}" "${phase7_burst_window_ms_value}" "${run_root}" "${status_file}")
+  host_cmd=$(build_worker_host_command "${worker}" "${rank}" "${mode}" "${repeat_label}" "${phase4_enable_value}" "${phase4_post_receive_w_value}" "${net_burst_value}" "${phase6_enable_value}" "${phase6_post_rate_value}" "${phase6_post_burst_value}" "${phase7_enable_value}" "${phase7_ratio_pct_value}" "${phase7_observe_ms_value}" "${phase7_burst_window_ms_value}" "${run_root}" "${status_file}")
 
   echo "[phase4-matrix] launch worker=${worker} rank=${rank} mode=${mode_upper_value}"
   if [[ "${worker}" == "${MASTER_SERVER}" ]]; then
@@ -718,6 +733,7 @@ for repeat_idx in $(seq 1 "${REPEATS}"); do
     mode_upper_value=$(echo "${mode}" | tr '[:lower:]' '[:upper:]')
     phase4_enable_value=$(mode_field "${mode}" "phase4_enable" "0")
     phase4_post_receive_w_value=$(mode_field "${mode}" "post_receive_w" "0")
+    net_burst_value=${NET_BURST}
     phase6_enable_value=$(mode_field "${mode}" "phase6_enable" "0")
     phase6_post_rate_value=$(mode_field "${mode}" "post_rate" "0")
     phase6_post_burst_value=$(mode_field "${mode}" "post_burst" "0")
@@ -730,7 +746,7 @@ for repeat_idx in $(seq 1 "${REPEATS}"); do
     mkdir -p "${run_root}" "${status_dir}"
 
     echo "[phase4-matrix] ------------------------------------------------------------"
-    echo "[phase4-matrix] start repeat=${repeat_label} mode=${mode_upper_value} port=${MASTER_PORT} phase4_enable=${phase4_enable_value} phase4_post_receive_w=${phase4_post_receive_w_value} phase6_enable=${phase6_enable_value} phase6_post_rate=${phase6_post_rate_value} phase6_post_burst=${phase6_post_burst_value} phase7_enable=${phase7_enable_value} phase7_ratio_pct=${phase7_ratio_pct_value} phase7_observe_ms=${phase7_observe_ms_value} phase7_burst_window_ms=${phase7_burst_window_ms_value}"
+    echo "[phase4-matrix] start repeat=${repeat_label} mode=${mode_upper_value} port=${MASTER_PORT} phase4_enable=${phase4_enable_value} phase4_post_receive_w=${phase4_post_receive_w_value} net_burst=${net_burst_value} phase6_enable=${phase6_enable_value} phase6_post_rate=${phase6_post_rate_value} phase6_post_burst=${phase6_post_burst_value} phase7_enable=${phase7_enable_value} phase7_ratio_pct=${phase7_ratio_pct_value} phase7_observe_ms=${phase7_observe_ms_value} phase7_burst_window_ms=${phase7_burst_window_ms_value}"
 
     cleanup_all_workers
     wait_for_master_port_free 10
@@ -740,7 +756,7 @@ for repeat_idx in $(seq 1 "${REPEATS}"); do
     declare -A LAUNCH_PIDS=()
     declare -A LAUNCH_LOGS=()
 
-    launch_worker_mode "${ALL_WORKER_ARRAY[0]}" 0 "${mode}" "${repeat_label}" "${phase4_enable_value}" "${phase4_post_receive_w_value}" "${phase6_enable_value}" "${phase6_post_rate_value}" "${phase6_post_burst_value}" "${phase7_enable_value}" "${phase7_ratio_pct_value}" "${phase7_observe_ms_value}" "${phase7_burst_window_ms_value}" "${run_root}" "${status_dir}/${ALL_WORKER_ARRAY[0]}.status"
+    launch_worker_mode "${ALL_WORKER_ARRAY[0]}" 0 "${mode}" "${repeat_label}" "${phase4_enable_value}" "${phase4_post_receive_w_value}" "${net_burst_value}" "${phase6_enable_value}" "${phase6_post_rate_value}" "${phase6_post_burst_value}" "${phase7_enable_value}" "${phase7_ratio_pct_value}" "${phase7_observe_ms_value}" "${phase7_burst_window_ms_value}" "${run_root}" "${status_dir}/${ALL_WORKER_ARRAY[0]}.status"
 
     rank0_pid="${LAUNCH_PIDS[${ALL_WORKER_ARRAY[0]}]}"
     if ! wait_for_master_port_listen "${rank0_pid}"; then
@@ -754,7 +770,7 @@ for repeat_idx in $(seq 1 "${REPEATS}"); do
         continue
       fi
       worker="${ALL_WORKER_ARRAY[$idx]}"
-      launch_worker_mode "${worker}" "${idx}" "${mode}" "${repeat_label}" "${phase4_enable_value}" "${phase4_post_receive_w_value}" "${phase6_enable_value}" "${phase6_post_rate_value}" "${phase6_post_burst_value}" "${phase7_enable_value}" "${phase7_ratio_pct_value}" "${phase7_observe_ms_value}" "${phase7_burst_window_ms_value}" "${run_root}" "${status_dir}/${worker}.status"
+      launch_worker_mode "${worker}" "${idx}" "${mode}" "${repeat_label}" "${phase4_enable_value}" "${phase4_post_receive_w_value}" "${net_burst_value}" "${phase6_enable_value}" "${phase6_post_rate_value}" "${phase6_post_burst_value}" "${phase7_enable_value}" "${phase7_ratio_pct_value}" "${phase7_observe_ms_value}" "${phase7_burst_window_ms_value}" "${run_root}" "${status_dir}/${worker}.status"
     done
 
     mode_start_ts=$(date +%s)

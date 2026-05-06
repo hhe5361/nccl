@@ -27,6 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bucket-cap-mb", type=int, default=1)
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--model-seed", type=int, default=20260504)
+    parser.add_argument("--net-burst", type=float, default=0.0)
     return parser.parse_args()
 
 
@@ -110,6 +111,7 @@ def main() -> None:
     repeat_label = os.environ.get("PHASE4_REPEAT_LABEL", "repeat_01")
     phase4_enable = int(os.environ.get("NCCL_PHASE4_ENABLE", "0"))
     phase4_post_receive_w = float(os.environ.get("NCCL_PHASE4_POST_RECEIVE_W", "0"))
+    net_burst = float(args.net_burst)
 
     if rank == 0 and output_dir is not None:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -135,6 +137,7 @@ def main() -> None:
             "phase4_mode": phase4_mode,
             "phase4_enable": phase4_enable,
             "phase4_post_receive_w": phase4_post_receive_w,
+            "net_burst": net_burst,
             "stage": stage,
         }
         row.update(extra)
@@ -166,7 +169,7 @@ def main() -> None:
             f"hidden_dim={args.hidden_dim} num_layers={args.num_layers} batch_size={args.batch_size} "
             f"bucket_cap_mb={args.bucket_cap_mb} dtype={args.dtype} world_size={world_size} "
             f"phase4_mode={phase4_mode} phase4_enable={phase4_enable} phase4_post_receive_w={phase4_post_receive_w} "
-            f"repeat_label={repeat_label} param_mb={total_param_mb:.6f}"
+            f"net_burst={net_burst} repeat_label={repeat_label} param_mb={total_param_mb:.6f}"
         )
 
     records = []
@@ -233,6 +236,7 @@ def main() -> None:
                 "phase4_mode": phase4_mode,
                 "phase4_enable": phase4_enable,
                 "phase4_post_receive_w": phase4_post_receive_w,
+                "net_burst": net_burst,
                 "world_size": world_size,
                 "batch_size": args.batch_size,
                 "global_batch_size": global_batch_size,
@@ -278,6 +282,7 @@ def main() -> None:
                     "phase4_mode": phase4_mode,
                     "phase4_enable": phase4_enable,
                     "phase4_post_receive_w": phase4_post_receive_w,
+                    "net_burst": net_burst,
                     "model_seed": args.model_seed,
                     "warmup": step < args.warmup_steps,
                     "start_ns": step_start_ns,
@@ -309,6 +314,7 @@ def main() -> None:
             "phase4_mode": phase4_mode,
             "phase4_enable": phase4_enable,
             "phase4_post_receive_w": phase4_post_receive_w,
+            "net_burst": net_burst,
             "world_size": world_size,
             "dtype": args.dtype,
             "model_seed": args.model_seed,
@@ -337,6 +343,7 @@ def main() -> None:
             "phase4_mode": phase4_mode,
             "phase4_enable": phase4_enable,
             "phase4_post_receive_w": phase4_post_receive_w,
+            "net_burst": net_burst,
             "world_size": world_size,
             "steps": args.steps,
             "warmup_steps": args.warmup_steps,

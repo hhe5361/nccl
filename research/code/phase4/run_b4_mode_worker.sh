@@ -34,7 +34,15 @@ MODEL_SEED=${MODEL_SEED:-20260504}
 REPEAT_LABEL=${REPEAT_LABEL:-repeat_01}
 PHASE4_ENABLE_VALUE=${PHASE4_ENABLE_VALUE:-}
 PHASE4_POST_RECEIVE_W_VALUE=${PHASE4_POST_RECEIVE_W_VALUE:-}
+NET_BURST_VALUE=${NET_BURST_VALUE:-0}
 PYTHON_BIN=${PYTHON_BIN:-python}
+PHASE4_NETWORK_TOPOLOGY_FILE=${PHASE4_NETWORK_TOPOLOGY_FILE:-${REPO_ROOT}/research/env/network_topology_internal_ips.txt}
+PHASE4_LOAD_DURATION_SEC=${PHASE4_LOAD_DURATION_SEC:-240}
+PHASE4_LOAD_LEADIN_SEC=${PHASE4_LOAD_LEADIN_SEC:-5}
+PHASE4_IB_DEVICE=${PHASE4_IB_DEVICE:-mlx5_0}
+PHASE4_IB_GID_INDEX=${PHASE4_IB_GID_INDEX:-3}
+PHASE4_PAIR_PORT_BASE=${PHASE4_PAIR_PORT_BASE:-18600}
+PHASE4_FULL_PAIR_GBPS=${PHASE4_FULL_PAIR_GBPS:-26.0}
 
 mkdir -p "${RUN_ROOT}" "${RUN_ROOT}/${WORKER_NAME}" "${STATUS_DIR}"
 
@@ -110,6 +118,7 @@ RUN_RC=1
 RUN_STATE=failed
 STATUS_MESSAGE=init
 STARTED_AT=$(date +%s)
+LOAD_PIDS=()
 
 write_status() {
   cat > "${STATUS_FILE}" <<EOF
@@ -156,11 +165,109 @@ mark_failure() {
 }
 
 cleanup() {
+  local pid
+  for pid in "${LOAD_PIDS[@]:-}"; do
+    kill "${pid}" >/dev/null 2>&1 || true
+  done
   if [[ "${RUN_STATE}" != "success" ]]; then
     mark_failure "${RUN_RC:-1}" "${STATUS_MESSAGE:-failed}"
   fi
 }
 trap cleanup EXIT INT TERM
+
+resolve_worker_ip() {
+  local worker=$1
+  awk -v target="${worker}" '
+    /^\[Workers\]/ { in_workers=1; next }
+    /^\[/ && $0 !~ /^\[Workers\]/ { in_workers=0 }
+    in_workers && $1 == "-" {
+      gsub(":", "", $2)
+      if ($2 == target) {
+        print $3
+        exit
+      }
+    }
+  ' "${PHASE4_NETWORK_TOPOLOGY_FILE}"
+}
+
+pair_worker_names() {
+  local pair_index=$1
+  case "${pair_index}" in
+    0) echo "worker01 worker02" ;;
+    1) echo "worker03 worker04" ;;
+    2) echo "worker05 worker06" ;;
+    3) echo "worker07 worker08" ;;
+    *) return 1 ;;
+  esac
+}
+
+launch_phase4_load() {
+  local load_pct=$1
+  if (( load_pct <= 0 )); then
+    return 0
+  fi
+  if ! command -v ib_write_bw >/dev/null 2>&1; then
+    echo "[phase4-worker] ib_write_bw not found; skip background load" >&2
+    return 0
+  fi
+  if [[ ! -f "${PHASE4_NETWORK_TOPOLOGY_FILE}" ]]; then
+    echo "[phase4-worker] topology file not found: ${PHASE4_NETWORK_TOPOLOGY_FILE}" >&2
+    return 0
+  fi
+
+  local worker_num pair_index pair_role active_pairs
+  worker_num=${WORKER_NAME#worker}
+  worker_num=$((10#${worker_num}))
+  pair_index=$(((worker_num - 1) / 2))
+  if (( worker_num % 2 == 1 )); then
+    pair_role=client
+  else
+    pair_role=server
+  fi
+
+  active_pairs=$(((load_pct + 24) / 25))
+  (( active_pairs < 1 )) && active_pairs=1
+  (( active_pairs > 4 )) && active_pairs=4
+  if (( pair_index >= active_pairs )); then
+    return 0
+  fi
+
+  read -r src_worker dst_worker <<< "$(pair_worker_names "${pair_index}")"
+  local src_ip dst_ip port pair_rate_gbps load_dir
+  src_ip=$(resolve_worker_ip "${src_worker}")
+  dst_ip=$(resolve_worker_ip "${dst_worker}")
+  port=$((PHASE4_PAIR_PORT_BASE + pair_index))
+  pair_rate_gbps=$(python3 - <<PY
+full_pair = float(${PHASE4_FULL_PAIR_GBPS})
+load_pct = float(${load_pct})
+active_pairs = float(${active_pairs})
+target_total = full_pair * 4.0 * load_pct / 100.0
+pair_rate = target_total / active_pairs if active_pairs > 0 else 0.0
+pair_rate = min(pair_rate, full_pair)
+print(f"{pair_rate:.3f}")
+PY
+)
+  load_dir="${RUN_ROOT}/${WORKER_NAME}/phase4_load"
+  mkdir -p "${load_dir}"
+
+  if [[ "${pair_role}" == "server" ]]; then
+    timeout --signal=TERM --kill-after=5 "${PHASE4_LOAD_DURATION_SEC}" \
+      ib_write_bw -R -d "${PHASE4_IB_DEVICE}" -x "${PHASE4_IB_GID_INDEX}" -F \
+      -q 1 -p "${port}" -D "${PHASE4_LOAD_DURATION_SEC}" --report_gbits \
+      > "${load_dir}/server.log" 2>&1 &
+    LOAD_PIDS+=($!)
+  else
+    (
+      sleep 3
+      timeout --signal=TERM --kill-after=5 "${PHASE4_LOAD_DURATION_SEC}" \
+        ib_write_bw "${dst_ip}" -R -d "${PHASE4_IB_DEVICE}" -x "${PHASE4_IB_GID_INDEX}" -F \
+        -q 1 -p "${port}" -D "${PHASE4_LOAD_DURATION_SEC}" --report_gbits \
+        --rate_limit "${pair_rate_gbps}" --rate_units=gbps \
+        > "${load_dir}/client.log" 2>&1
+    ) &
+    LOAD_PIDS+=($!)
+  fi
+}
 
 echo "[phase4-worker] RUN_ID=${RUN_ID} EXPERIMENT=${EXPERIMENT_LABEL}"
 echo "[phase4-worker] REPEAT_LABEL=${REPEAT_LABEL}"
@@ -170,11 +277,16 @@ echo "[phase4-worker] PHASE4_ENABLE=${NCCL_PHASE4_ENABLE} PHASE4_POST_RECEIVE_W=
 echo "[phase4-worker] APPENDIX2_GROUP_LOG=${NCCL_APPENDIX2_GROUP_LOG}"
 echo "[phase4-worker] HIDDEN_DIM=${HIDDEN_DIM} NUM_LAYERS=${NUM_LAYERS} BATCH_SIZE=${BATCH_SIZE} BUCKET_CAP_MB=${BUCKET_CAP_MB} LR=${LR}"
 echo "[phase4-worker] MODEL_SEED=${MODEL_SEED}"
+echo "[phase4-worker] NET_BURST=${NET_BURST_VALUE}"
 echo "[phase4-worker] PYTHON_BIN=${PYTHON_BIN} RANK=${RANK} WORLD_SIZE=${WORLD_SIZE} LOCAL_RANK=${LOCAL_RANK}"
 echo "[phase4-worker] NCCL_ALGO=${ALGO_SETTING} NCCL_PROTO=${PROTO_SETTING} STATUS_FILE=${STATUS_FILE}"
 echo "[phase4-worker] NCCL_DEBUG_FILE=${NCCL_DEBUG_FILE}"
 
 mark_running
+launch_phase4_load "${NET_BURST_VALUE}"
+if (( NET_BURST_VALUE > 0 )); then
+  sleep "${PHASE4_LOAD_LEADIN_SEC}"
+fi
 
 set +e
 timeout --signal=TERM --kill-after=30 "${MODE_TIMEOUT_SEC}" \
@@ -189,7 +301,8 @@ timeout --signal=TERM --kill-after=30 "${MODE_TIMEOUT_SEC}" \
     --batch-size "${BATCH_SIZE}" \
     --bucket-cap-mb "${BUCKET_CAP_MB}" \
     --lr "${LR}" \
-    --model-seed "${MODEL_SEED}"
+    --model-seed "${MODEL_SEED}" \
+    --net-burst "${NET_BURST_VALUE}"
 RUN_RC=$?
 set -e
 

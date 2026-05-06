@@ -1,7 +1,7 @@
 {
   "phase": "phase10",
   "name": "phase4_post_received_with_rdma_load",
-  "description": "Phase10: phase4 posted-received<W gate under background RDMA load sweep with switch logger enabled.",
+  "description": "Phase10: phase4 posted-received<W gate under background RDMA load sweep.",
   "run": {
     "run_id_prefix": "phase10_phase4_congestion",
     "master_server": "worker01",
@@ -43,7 +43,8 @@
     "worker_script": "research/code/phase10/run_p10_mode_worker.sh",
     "compare_script": "research/code/phase4/compare_b4_vs_stock.py",
     "summary_script": "research/code/phase10/phase10_diag_summary.py",
-    "summary_output_name": "phase10_diag_summary.json"
+    "summary_output_name": "phase10_diag_summary.json",
+    "load_transition_pause_sec": 300
   },
   "paths": {
     "log_root_base": "/mnt/nfs_share/cts_experiments",
@@ -61,7 +62,7 @@
   "ssh": {
     "worker_ssh_user": "",
     "worker_ssh_user_map": "",
-    "worker_ssh_port": 14750,
+    "worker_ssh_port": 14760,
     "worker_ssh_port_map": "",
     "ssh_connect_timeout_sec": 10
   },
@@ -86,7 +87,7 @@
     "net_gdr_level": 0
   },
   "switch_logging": {
-    "enable": 1,
+    "enable": 0,
     "switch_logger_root": "/home/ubuntu/hyoeun/switch_setup_task/switch_congestion_logger",
     "switch_log_interval_sec": 1,
     "switch_log_shared_root": "/mnt/nfs_share/cts_experiments/switch_log",
