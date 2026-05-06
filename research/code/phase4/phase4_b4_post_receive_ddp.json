@@ -18,18 +18,9 @@
       "worker08"
     ],
     "run_modes": [
-      "b4_w2",
-      "b4_w2_5",
+      "stock",
       "b4_w3",
-      "b4_w3_5",
-      "b4_w4",
-      "b4_w4_5",
-      "b4_w5",
-      "b4_w5_5",
       "b4_w6",
-      "b4_w6_5",
-      "b4_w7",
-      "b4_w7_5",
       "b4_w8"
     ],
     "repeats": 1,
@@ -81,6 +72,12 @@
     "net_gdr_level": 0
   },
   "mode_matrix": [
+    {
+      "mode_id": "stock",
+      "label": "STOCK",
+      "phase4_enable": 0,
+      "post_receive_w": null
+    },
     {
       "mode_id": "b4_w2",
       "label": "B4_W2",
