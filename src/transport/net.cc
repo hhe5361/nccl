@@ -832,20 +832,29 @@ static inline double phase7RateRatioRaw() {
 
 static inline double phase7ObserveMsRaw() {
   const char* env = getenv("NCCL_PHASE7_OBSERVE_MS");
-  if (env == NULL || env[0] == '\0') return 10.0;
+  if (env == NULL || env[0] == '\0') return 50.0;
   char* end = NULL;
   double value = strtod(env, &end);
-  if (end == env) return 10.0;
-  return value > 0.0 ? value : 10.0;
+  if (end == env) return 50.0;
+  return value > 0.0 ? value : 50.0;
 }
 
 static inline double phase7BurstWindowMsRaw() {
   const char* env = getenv("NCCL_PHASE7_BURST_WINDOW_MS");
-  if (env == NULL || env[0] == '\0') return 2.0;
+  if (env == NULL || env[0] == '\0') return 4.0;
   char* end = NULL;
   double value = strtod(env, &end);
-  if (end == env) return 2.0;
-  return value > 0.0 ? value : 2.0;
+  if (end == env) return 4.0;
+  return value > 0.0 ? value : 4.0;
+}
+
+static inline double phase7BurstFloorPostsRaw() {
+  const char* env = getenv("NCCL_PHASE7_BURST_FLOOR_POSTS");
+  if (env == NULL || env[0] == '\0') return 4.0;
+  char* end = NULL;
+  double value = strtod(env, &end);
+  if (end == env) return 4.0;
+  return value > 0.0 ? value : 4.0;
 }
 
 static inline int phase7Enabled() {
@@ -912,10 +921,11 @@ static inline void phase7RateCfgLog(
     struct ncclProxySubArgs* sub,
     double ratioPct,
     double observeMs,
-    double burstWindowMs) {
+    double burstWindowMs,
+    double burstFloorPosts) {
   if (ncclParamPhase7Log() == 0) return;
   INFO(NCCL_NET,
-      "PHASE7 event=RATE_CFG tNs=%llu rank=%d peer=%d channel=%d groupSize=%d coll=%s collApi=%s algo=%s proto=%s ratioPct=%.3f observeMs=%.3f burstWindowMs=%.3f",
+      "PHASE7 event=RATE_CFG tNs=%llu rank=%d peer=%d channel=%d groupSize=%d coll=%s collApi=%s algo=%s proto=%s ratioPct=%.3f observeMs=%.3f burstWindowMs=%.3f burstFloorPosts=%.3f",
       (unsigned long long)clockNano(),
       proxyState->tpRank,
       sub->peer,
@@ -927,7 +937,8 @@ static inline void phase7RateCfgLog(
       ncclProtoToString(args->protocol),
       ratioPct,
       observeMs,
-      burstWindowMs);
+      burstWindowMs,
+      burstFloorPosts);
 }
 
 static inline void phase7BaselineLog(
@@ -2468,6 +2479,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
     double phase7RatioPct = phase7RateRatioRaw();
     double phase7ObserveMs = phase7ObserveMsRaw();
     double phase7BurstWindowMs = phase7BurstWindowMsRaw();
+    double phase7BurstFloorPosts = phase7BurstFloorPostsRaw();
     if (ncclParamPhase5Log() != 0) {
       uint64_t nowNs = clockNano();
       uint64_t deltaNs = args->phase5LastRecvProxyNs ? nowNs - args->phase5LastRecvProxyNs : 0;
@@ -2580,7 +2592,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
           uint64_t nowNs = clockNano();
           if (!leader->phase7RateCfgLogged) {
             leader->phase7ObserveStartNs = nowNs;
-            phase7RateCfgLog(proxyState, args, leader, phase7RatioPct, phase7ObserveMs, phase7BurstWindowMs);
+            phase7RateCfgLog(proxyState, args, leader, phase7RatioPct, phase7ObserveMs, phase7BurstWindowMs, phase7BurstFloorPosts);
             leader->phase7RateCfgLogged = 1;
           }
           int postCost = subCount;
@@ -2591,7 +2603,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
               double observedElapsedMs = (double)observedElapsedNs / 1000000.0;
               leader->phase7BaselineRatePerMs = observedElapsedMs > 0.0 ? (leader->phase7ObservedPosts / observedElapsedMs) : 0.0;
               leader->phase7TargetRatePerMs = leader->phase7BaselineRatePerMs * (phase7RatioPct * 0.01);
-              leader->phase7TargetBurst = std::max((double)leader->groupSize, leader->phase7TargetRatePerMs * phase7BurstWindowMs);
+              leader->phase7TargetBurst = std::max(std::max((double)leader->groupSize, phase7BurstFloorPosts), leader->phase7TargetRatePerMs * phase7BurstWindowMs);
               leader->phase7Tokens = leader->phase7TargetBurst;
               leader->phase7LastRefillNs = nowNs;
               leader->phase7ControlActive = 1;
