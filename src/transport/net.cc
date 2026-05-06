@@ -183,6 +183,7 @@ NCCL_PARAM(Phase6Enable, "PHASE6_ENABLE", 0);
 NCCL_PARAM(Phase6Log, "PHASE6_LOG", 0);
 NCCL_PARAM(Phase7Enable, "PHASE7_ENABLE", 0);
 NCCL_PARAM(Phase7Log, "PHASE7_LOG", 0);
+NCCL_PARAM(Phase9Log, "PHASE9_LOG", 0);
 NCCL_PARAM(Appendix2GroupLog, "APPENDIX2_GROUP_LOG", 0);
 NCCL_PARAM(Appendix2DisableWstallLog, "APPENDIX2_DISABLE_WSTALL_LOG", 0);
 NCCL_PARAM(Phase3WarmupIntervals, "PHASE3_WARMUP_INTERVALS", 4);
@@ -1003,6 +1004,35 @@ static inline void phase7RateDecisionLog(
       targetBurst,
       tokensBefore,
       tokensAfter);
+}
+
+static inline void phase9PostRateLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* leader,
+    uint64_t nowNs,
+    int postCost,
+    uint64_t deltaNs,
+    double instPostRatePerMs) {
+  if (ncclParamPhase9Log() == 0) return;
+  INFO(NCCL_NET,
+      "PHASE9 event=RECVCOMM_POST_RATE tNs=%llu rank=%d peer=%d channel=%d groupSize=%d coll=%s collApi=%s algo=%s proto=%s postSeq=%llu postCost=%d deltaNs=%llu instPostRatePerMs=%.6f posted=%llu received=%llu done=%llu",
+      (unsigned long long)nowNs,
+      proxyState->tpRank,
+      leader->peer,
+      leader->channelId,
+      leader->groupSize,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol),
+      (unsigned long long)leader->phase9PostSeq,
+      postCost,
+      (unsigned long long)deltaNs,
+      instPostRatePerMs,
+      (unsigned long long)leader->posted,
+      (unsigned long long)leader->received,
+      (unsigned long long)leader->done);
 }
 
 static inline uint64_t phase4Mix64(uint64_t x) {
@@ -2443,6 +2473,8 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
       sub->phase7BaselineRatePerMs = 0.0;
       sub->phase7TargetRatePerMs = 0.0;
       sub->phase7TargetBurst = 0.0;
+      sub->phase9LastPostNs = 0;
+      sub->phase9PostSeq = 0;
       sub->phase3CurrentW = 0;
       sub->phase3LastLoggedW = 0;
       sub->phase3HiCount = 0;
@@ -2659,6 +2691,13 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
         if (ignoreCompletion) *requestPtr = (void *)NCCL_NET_OPTIONAL_RECV_COMPLETION;
         NCCLCHECK(proxyState->ncclNet->irecv(resources->netRecvComm, subCount, ptrs, sizes, tags, mhandles, phandles, requestPtr));
         if (*requestPtr) {
+          struct ncclProxySubArgs* leader = subGroup;
+          uint64_t phase9NowNs = clockNano();
+          uint64_t phase9DeltaNs = leader->phase9LastPostNs ? (phase9NowNs - leader->phase9LastPostNs) : 0;
+          double phase9InstRatePerMs = (phase9DeltaNs > 0) ? ((double)subCount / ((double)phase9DeltaNs / 1000000.0)) : 0.0;
+          leader->phase9PostSeq += 1;
+          phase9PostRateLog(proxyState, args, leader, phase9NowNs, subCount, phase9DeltaNs, phase9InstRatePerMs);
+          leader->phase9LastPostNs = phase9NowNs;
           subGroup->recvRequestsCache[step%NCCL_STEPS] = *requestPtr;
           subGroup->recvRequestsSubCount = subCount;
           for (int i=0; i<subGroup->groupSize; i++) {
