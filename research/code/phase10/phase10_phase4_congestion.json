@@ -32,12 +32,7 @@
       "b4_w2_l50",
       "b4_w4_l50",
       "b4_w6_l50",
-      "b4_w8_l50",
-      "stock_l70",
-      "b4_w2_l70",
-      "b4_w4_l70",
-      "b4_w6_l70",
-      "b4_w8_l70"
+      "b4_w8_l50"
     ],
     "repeats": 1,
     "steps": 100,
@@ -112,11 +107,6 @@
     {"mode_id": "b4_w2_l50", "label": "B4_W2_L50", "phase4_enable": 1, "post_receive_w": 2, "load_pct": 50},
     {"mode_id": "b4_w4_l50", "label": "B4_W4_L50", "phase4_enable": 1, "post_receive_w": 4, "load_pct": 50},
     {"mode_id": "b4_w6_l50", "label": "B4_W6_L50", "phase4_enable": 1, "post_receive_w": 6, "load_pct": 50},
-    {"mode_id": "b4_w8_l50", "label": "B4_W8_L50", "phase4_enable": 1, "post_receive_w": 8, "load_pct": 50},
-    {"mode_id": "stock_l70", "label": "STOCK_L70", "phase4_enable": 0, "post_receive_w": 0, "load_pct": 70},
-    {"mode_id": "b4_w2_l70", "label": "B4_W2_L70", "phase4_enable": 1, "post_receive_w": 2, "load_pct": 70},
-    {"mode_id": "b4_w4_l70", "label": "B4_W4_L70", "phase4_enable": 1, "post_receive_w": 4, "load_pct": 70},
-    {"mode_id": "b4_w6_l70", "label": "B4_W6_L70", "phase4_enable": 1, "post_receive_w": 6, "load_pct": 70},
-    {"mode_id": "b4_w8_l70", "label": "B4_W8_L70", "phase4_enable": 1, "post_receive_w": 8, "load_pct": 70}
+    {"mode_id": "b4_w8_l50", "label": "B4_W8_L50", "phase4_enable": 1, "post_receive_w": 8, "load_pct": 50}
   ]
 }
