@@ -290,6 +290,7 @@ static inline void phase5RecvEventLog(
     uint64_t postToNetDoneNs,
     uint64_t progressCallsSincePost) {
   if (ncclParamPhase5Log() == 0) return;
+  if (ncclParamAppendix2DisableWstallLog() && strcmp(event, "PROXY_RECV_WSTALL") == 0) return;
   INFO(NCCL_NET,
       "PHASE5 event=%s tNs=%llu rank=%d peer=%d channel=%d slot=%d coll=%s collApi=%s algo=%s proto=%s size=%lld base=%llu posted=%llu received=%llu transmitted=%llu done=%llu nsteps=%d maxDepth=%d wCfgRaw=%.3f wEff=%d postTsNs=%llu postToNetDoneNs=%llu progressCallsSincePost=%llu occPr=%llu occPd=%llu",
       event,
