@@ -181,6 +181,8 @@ NCCL_PARAM(Phase5Log, "PHASE5_LOG", 0);
 NCCL_PARAM(Phase5ProgressLogEvery, "PHASE5_PROGRESS_LOG_EVERY", 128);
 NCCL_PARAM(Phase6Enable, "PHASE6_ENABLE", 0);
 NCCL_PARAM(Phase6Log, "PHASE6_LOG", 0);
+NCCL_PARAM(Phase7Enable, "PHASE7_ENABLE", 0);
+NCCL_PARAM(Phase7Log, "PHASE7_LOG", 0);
 NCCL_PARAM(Appendix2GroupLog, "APPENDIX2_GROUP_LOG", 0);
 NCCL_PARAM(Appendix2DisableWstallLog, "APPENDIX2_DISABLE_WSTALL_LOG", 0);
 NCCL_PARAM(Phase3WarmupIntervals, "PHASE3_WARMUP_INTERVALS", 4);
@@ -818,6 +820,38 @@ static inline int phase6Enabled() {
   return ncclParamPhase6Enable() != 0 || phase6PostRateRaw() > 0.0;
 }
 
+static inline double phase7RateRatioRaw() {
+  const char* env = getenv("NCCL_PHASE7_POST_RATE_RATIO_PCT");
+  if (env == NULL || env[0] == '\0') return 0.0;
+  char* end = NULL;
+  double value = strtod(env, &end);
+  if (end == env) return 0.0;
+  if (value < 0.0) return 0.0;
+  return value;
+}
+
+static inline double phase7ObserveMsRaw() {
+  const char* env = getenv("NCCL_PHASE7_OBSERVE_MS");
+  if (env == NULL || env[0] == '\0') return 10.0;
+  char* end = NULL;
+  double value = strtod(env, &end);
+  if (end == env) return 10.0;
+  return value > 0.0 ? value : 10.0;
+}
+
+static inline double phase7BurstWindowMsRaw() {
+  const char* env = getenv("NCCL_PHASE7_BURST_WINDOW_MS");
+  if (env == NULL || env[0] == '\0') return 2.0;
+  char* end = NULL;
+  double value = strtod(env, &end);
+  if (end == env) return 2.0;
+  return value > 0.0 ? value : 2.0;
+}
+
+static inline int phase7Enabled() {
+  return ncclParamPhase7Enable() != 0 || phase7RateRatioRaw() > 0.0;
+}
+
 static inline void phase6RateCfgLog(
     struct ncclProxyState* proxyState,
     struct ncclProxyArgs* args,
@@ -868,6 +902,94 @@ static inline void phase6RateDecisionLog(
       postCost,
       rateRaw,
       burstRaw,
+      tokensBefore,
+      tokensAfter);
+}
+
+static inline void phase7RateCfgLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    double ratioPct,
+    double observeMs,
+    double burstWindowMs) {
+  if (ncclParamPhase7Log() == 0) return;
+  INFO(NCCL_NET,
+      "PHASE7 event=RATE_CFG tNs=%llu rank=%d peer=%d channel=%d groupSize=%d coll=%s collApi=%s algo=%s proto=%s ratioPct=%.3f observeMs=%.3f burstWindowMs=%.3f",
+      (unsigned long long)clockNano(),
+      proxyState->tpRank,
+      sub->peer,
+      sub->channelId,
+      sub->groupSize,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol),
+      ratioPct,
+      observeMs,
+      burstWindowMs);
+}
+
+static inline void phase7BaselineLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    uint64_t observedElapsedNs,
+    double observedPosts,
+    double baselineRatePerMs,
+    double targetRatePerMs,
+    double targetBurst) {
+  if (ncclParamPhase7Log() == 0) return;
+  INFO(NCCL_NET,
+      "PHASE7 event=RATE_BASELINE tNs=%llu rank=%d peer=%d channel=%d groupSize=%d coll=%s collApi=%s algo=%s proto=%s observedElapsedNs=%llu observedPosts=%.3f baselineRatePerMs=%.6f targetRatePerMs=%.6f targetBurst=%.6f",
+      (unsigned long long)clockNano(),
+      proxyState->tpRank,
+      sub->peer,
+      sub->channelId,
+      sub->groupSize,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol),
+      (unsigned long long)observedElapsedNs,
+      observedPosts,
+      baselineRatePerMs,
+      targetRatePerMs,
+      targetBurst);
+}
+
+static inline void phase7RateDecisionLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    const char* event,
+    uint64_t elapsedNs,
+    int postCost,
+    double ratioPct,
+    double baselineRatePerMs,
+    double targetRatePerMs,
+    double targetBurst,
+    double tokensBefore,
+    double tokensAfter) {
+  if (ncclParamPhase7Log() == 0) return;
+  INFO(NCCL_NET,
+      "PHASE7 event=%s tNs=%llu rank=%d peer=%d channel=%d groupSize=%d coll=%s collApi=%s algo=%s proto=%s elapsedNs=%llu postCost=%d ratioPct=%.3f baselineRatePerMs=%.6f targetRatePerMs=%.6f targetBurst=%.6f tokensBefore=%.6f tokensAfter=%.6f",
+      event,
+      (unsigned long long)clockNano(),
+      proxyState->tpRank,
+      sub->peer,
+      sub->channelId,
+      sub->groupSize,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol),
+      (unsigned long long)elapsedNs,
+      postCost,
+      ratioPct,
+      baselineRatePerMs,
+      targetRatePerMs,
+      targetBurst,
       tokensBefore,
       tokensAfter);
 }
@@ -2296,6 +2418,20 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
       sub->phase3RecvWstall = 0;
       sub->phase4WindowCfgLogged = 0;
       sub->phase4RecvWstall = 0;
+      sub->phase6RateCfgLogged = 0;
+      sub->phase6RateStall = 0;
+      sub->phase6Tokens = 0.0;
+      sub->phase6LastRefillNs = 0;
+      sub->phase7RateCfgLogged = 0;
+      sub->phase7RateStall = 0;
+      sub->phase7ControlActive = 0;
+      sub->phase7Tokens = 0.0;
+      sub->phase7LastRefillNs = 0;
+      sub->phase7ObserveStartNs = 0;
+      sub->phase7ObservedPosts = 0.0;
+      sub->phase7BaselineRatePerMs = 0.0;
+      sub->phase7TargetRatePerMs = 0.0;
+      sub->phase7TargetBurst = 0.0;
       sub->phase3CurrentW = 0;
       sub->phase3LastLoggedW = 0;
       sub->phase3HiCount = 0;
@@ -2328,6 +2464,10 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
     int phase6RateEnabled = phase6Enabled();
     double phase6RateRaw = phase6PostRateRaw();
     double phase6BurstRaw = phase6PostBurstRaw();
+    int phase7RateEnabled = phase7Enabled();
+    double phase7RatioPct = phase7RateRatioRaw();
+    double phase7ObserveMs = phase7ObserveMsRaw();
+    double phase7BurstWindowMs = phase7BurstWindowMsRaw();
     if (ncclParamPhase5Log() != 0) {
       uint64_t nowNs = clockNano();
       uint64_t deltaNs = args->phase5LastRecvProxyNs ? nowNs - args->phase5LastRecvProxyNs : 0;
@@ -2435,7 +2575,48 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
         uint64_t step = subGroup->posted;
         struct recvNetResources* resources = (struct recvNetResources*) (subGroup->connection->transportResources);
         void** requestPtr = subGroup->requests+(step%NCCL_STEPS);
-        if (phase6RateEnabled && phase6RateRaw > 0.0 && phase6BurstRaw > 0.0) {
+        if (phase7RateEnabled && phase7RatioPct > 0.0) {
+          struct ncclProxySubArgs* leader = subGroup;
+          uint64_t nowNs = clockNano();
+          if (!leader->phase7RateCfgLogged) {
+            leader->phase7ObserveStartNs = nowNs;
+            phase7RateCfgLog(proxyState, args, leader, phase7RatioPct, phase7ObserveMs, phase7BurstWindowMs);
+            leader->phase7RateCfgLogged = 1;
+          }
+          int postCost = subCount;
+          if (!leader->phase7ControlActive) {
+            if (leader->phase7ObserveStartNs == 0) leader->phase7ObserveStartNs = nowNs;
+            uint64_t observedElapsedNs = nowNs - leader->phase7ObserveStartNs;
+            if (observedElapsedNs >= (uint64_t)(phase7ObserveMs * 1000000.0) && leader->phase7ObservedPosts > 0.0) {
+              double observedElapsedMs = (double)observedElapsedNs / 1000000.0;
+              leader->phase7BaselineRatePerMs = observedElapsedMs > 0.0 ? (leader->phase7ObservedPosts / observedElapsedMs) : 0.0;
+              leader->phase7TargetRatePerMs = leader->phase7BaselineRatePerMs * (phase7RatioPct * 0.01);
+              leader->phase7TargetBurst = std::max((double)leader->groupSize, leader->phase7TargetRatePerMs * phase7BurstWindowMs);
+              leader->phase7Tokens = leader->phase7TargetBurst;
+              leader->phase7LastRefillNs = nowNs;
+              leader->phase7ControlActive = 1;
+              phase7BaselineLog(proxyState, args, leader, observedElapsedNs, leader->phase7ObservedPosts, leader->phase7BaselineRatePerMs, leader->phase7TargetRatePerMs, leader->phase7TargetBurst);
+            }
+          }
+          if (!leader->phase7ControlActive) {
+            leader->phase7ObservedPosts += (double)postCost;
+          } else {
+            uint64_t elapsedNs = leader->phase7LastRefillNs ? (nowNs - leader->phase7LastRefillNs) : 0;
+            double tokensBefore = leader->phase7Tokens;
+            if (elapsedNs > 0) {
+              leader->phase7Tokens = std::min(leader->phase7TargetBurst, leader->phase7Tokens + leader->phase7TargetRatePerMs * ((double)elapsedNs / 1000000.0));
+            }
+            leader->phase7LastRefillNs = nowNs;
+            if (leader->phase7Tokens + 1.0e-12 < (double)postCost) {
+              phase7RateDecisionLog(proxyState, args, leader, "RATE_STALL", elapsedNs, postCost, phase7RatioPct, leader->phase7BaselineRatePerMs, leader->phase7TargetRatePerMs, leader->phase7TargetBurst, tokensBefore, leader->phase7Tokens);
+              leader->phase7RateStall = 1;
+              continue;
+            }
+            leader->phase7RateStall = 0;
+            leader->phase7Tokens -= (double)postCost;
+            phase7RateDecisionLog(proxyState, args, leader, "RATE_ALLOW", elapsedNs, postCost, phase7RatioPct, leader->phase7BaselineRatePerMs, leader->phase7TargetRatePerMs, leader->phase7TargetBurst, tokensBefore, leader->phase7Tokens);
+          }
+        } else if (phase6RateEnabled && phase6RateRaw > 0.0 && phase6BurstRaw > 0.0) {
           struct ncclProxySubArgs* leader = subGroup;
           uint64_t nowNs = clockNano();
           if (!leader->phase6RateCfgLogged) {
