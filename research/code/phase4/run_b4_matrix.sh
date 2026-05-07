@@ -240,11 +240,8 @@ remote_dpu_bash() {
 }
 
 start_switch_logger() {
-  if (( NET_BURST <= 0 )); then
-    return 0
-  fi
   if [[ -z "${NETWORK_NODE_PASSWORD:-}" || -z "${SWITCH_PASSWORD:-}" ]]; then
-    echo "[phase4-matrix] NETWORK_NODE_PASSWORD and SWITCH_PASSWORD must be set when --net-burst > 0." >&2
+    echo "[phase4-matrix] NETWORK_NODE_PASSWORD and SWITCH_PASSWORD must be set when switch logging is enabled." >&2
     exit 1
   fi
   local cmd output
@@ -288,6 +285,15 @@ stop_switch_logger() {
   remote_dpu_bash "cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && ./log_run_marker.sh --run-id $(printf '%q' "${SWITCH_LOG_RUN_ID}") --marker matrix_end --source phase4_matrix --message $(printf '%q' "run_id=${RUN_ID} net_burst=${NET_BURST}")" || true
   remote_dpu_bash "cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && ./stop_switch_congestion_loggers.sh --pid-file $(printf '%q' "${SWITCH_LOG_PID_FILE}")" || true
   echo "[phase4-matrix] switch logger stopped run_id=${SWITCH_LOG_RUN_ID}"
+}
+
+emit_switch_marker() {
+  local marker=$1
+  local message=$2
+  if [[ "${SWITCH_LOG_STARTED}" != "1" ]]; then
+    return 0
+  fi
+  remote_dpu_bash "cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && ./log_run_marker.sh --run-id $(printf '%q' "${SWITCH_LOG_RUN_ID}") --marker $(printf '%q' "${marker}") --source phase4_matrix --message $(printf '%q' "${message}")" || true
 }
 
 resolve_worker_ssh_user() {
@@ -840,6 +846,7 @@ for repeat_idx in $(seq 1 "${REPEATS}"); do
 
     echo "[phase4-matrix] ------------------------------------------------------------"
     echo "[phase4-matrix] start repeat=${repeat_label} mode=${mode_upper_value} port=${MASTER_PORT} phase4_enable=${phase4_enable_value} phase4_post_receive_w=${phase4_post_receive_w_value} net_burst=${net_burst_value} phase6_enable=${phase6_enable_value} phase6_post_rate=${phase6_post_rate_value} phase6_post_burst=${phase6_post_burst_value} phase7_enable=${phase7_enable_value} phase7_ratio_pct=${phase7_ratio_pct_value} phase7_observe_ms=${phase7_observe_ms_value} phase7_burst_window_ms=${phase7_burst_window_ms_value}"
+    emit_switch_marker "mode_start" "run_id=${RUN_ID} repeat=${repeat_label} mode=${mode_upper_value} net_burst=${net_burst_value}"
 
     cleanup_all_workers
     wait_for_master_port_free 10
@@ -884,6 +891,7 @@ for repeat_idx in $(seq 1 "${REPEATS}"); do
     fi
 
     echo "[phase4-matrix] complete repeat=${repeat_label} mode=${mode_upper_value}"
+    emit_switch_marker "mode_end" "run_id=${RUN_ID} repeat=${repeat_label} mode=${mode_upper_value} net_burst=${net_burst_value}"
   done
 
   compare_outputs "${repeat_root}" "${repeat_root}/final_output_validation.json"
