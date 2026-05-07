@@ -28,6 +28,20 @@ if [[ ! -f "${CONFIG_PATH}" ]]; then
   exit 1
 fi
 
+SWITCH_LOGGER_ROOT=${SWITCH_LOGGER_ROOT:-/home/ubuntu/hyoeun/switch_setup_task/switch_congestion_logger}
+SWITCH_LOG_INTERVAL_SEC=${SWITCH_LOG_INTERVAL_SEC:-1}
+SWITCH_LOG_SHARED_ROOT=${SWITCH_LOG_SHARED_ROOT:-/mnt/nfs_share/cts_experiments/switch_log}
+DPU_NODE_HOST=${DPU_NODE_HOST:-172.16.0.100}
+DPU_NODE_USER=${DPU_NODE_USER:-ubuntu}
+DPU_NODE_PORT=${DPU_NODE_PORT:-22}
+NETWORK_NODE_PORT=${NETWORK_NODE_PORT:-}
+SWITCH_LOG_RUN_ID=
+SWITCH_LOG_DIR=
+SWITCH_LOG_LOCAL_DIR=
+SWITCH_LOG_PID_FILE=
+SWITCH_LOG_MARKERS_JSONL=
+SWITCH_LOG_STARTED=0
+
 eval "$(
 python3 - "${CONFIG_PATH}" <<'PY'
 import json, shlex, sys
@@ -203,6 +217,77 @@ require_sshpass() {
     echo "[phase4-matrix] sshpass is required when WORKER_SSH_PASSWORD is set." >&2
     exit 1
   fi
+}
+
+require_switch_sshpass() {
+  if ! command -v sshpass >/dev/null 2>&1; then
+    echo "[phase4-matrix] sshpass is required for switch logging." >&2
+    exit 1
+  fi
+}
+
+remote_dpu_bash() {
+  local cmd=$1
+  require_switch_sshpass
+  if [[ -z "${DPU_NODE_PWD:-}" ]]; then
+    echo "[phase4-matrix] DPU_NODE_PWD must be set when switch logging is enabled." >&2
+    exit 1
+  fi
+  sshpass -p "${DPU_NODE_PWD}" \
+    ssh -p "${DPU_NODE_PORT}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    "${DPU_NODE_USER}@${DPU_NODE_HOST}" \
+    "bash -lc $(printf '%q' "${cmd}")"
+}
+
+start_switch_logger() {
+  if (( NET_BURST <= 0 )); then
+    return 0
+  fi
+  if [[ -z "${NETWORK_NODE_PASSWORD:-}" || -z "${SWITCH_PASSWORD:-}" ]]; then
+    echo "[phase4-matrix] NETWORK_NODE_PASSWORD and SWITCH_PASSWORD must be set when --net-burst > 0." >&2
+    exit 1
+  fi
+  local cmd output
+  cmd="cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && "
+  if [[ -n "${NETWORK_NODE_PORT}" ]]; then
+    cmd+="export NETWORK_NODE_PORT=$(printf '%q' "${NETWORK_NODE_PORT}") && "
+  fi
+  cmd+="./start_switch_congestion_loggers.sh --interval-sec $(printf '%q' "${SWITCH_LOG_INTERVAL_SEC}") --network-node-password $(printf '%q' "${NETWORK_NODE_PASSWORD}") --switch-password $(printf '%q' "${SWITCH_PASSWORD}")"
+  output=$(remote_dpu_bash "${cmd}")
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      RUN_ID) SWITCH_LOG_RUN_ID=${value} ;;
+      LOG_DIR) SWITCH_LOG_DIR=${value} ;;
+      PID_FILE) SWITCH_LOG_PID_FILE=${value} ;;
+      MARKERS_JSONL) SWITCH_LOG_MARKERS_JSONL=${value} ;;
+    esac
+  done <<< "${output}"
+  if [[ -z "${SWITCH_LOG_RUN_ID}" || -z "${SWITCH_LOG_PID_FILE}" ]]; then
+    echo "[phase4-matrix] failed to parse switch logger metadata" >&2
+    echo "${output}" >&2
+    exit 1
+  fi
+  SWITCH_LOG_LOCAL_DIR="${SWITCH_LOG_SHARED_ROOT}/${SWITCH_LOG_RUN_ID}"
+  SWITCH_LOG_STARTED=1
+  echo "[phase4-matrix] switch logger started run_id=${SWITCH_LOG_RUN_ID} local_dir=${SWITCH_LOG_LOCAL_DIR}"
+  remote_dpu_bash "cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && ./log_run_marker.sh --run-id $(printf '%q' "${SWITCH_LOG_RUN_ID}") --marker matrix_start --source phase4_matrix --message $(printf '%q' "run_id=${RUN_ID} net_burst=${NET_BURST}")" || true
+  cat > "${LOG_ROOT}/switch_logger.env" <<EOF
+SWITCH_LOG_RUN_ID=${SWITCH_LOG_RUN_ID}
+SWITCH_LOG_DIR=${SWITCH_LOG_DIR}
+SWITCH_LOG_LOCAL_DIR=${SWITCH_LOG_LOCAL_DIR}
+SWITCH_LOG_PID_FILE=${SWITCH_LOG_PID_FILE}
+SWITCH_LOG_MARKERS_JSONL=${SWITCH_LOG_MARKERS_JSONL}
+NET_BURST=${NET_BURST}
+EOF
+}
+
+stop_switch_logger() {
+  if [[ "${SWITCH_LOG_STARTED}" != "1" ]]; then
+    return 0
+  fi
+  remote_dpu_bash "cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && ./log_run_marker.sh --run-id $(printf '%q' "${SWITCH_LOG_RUN_ID}") --marker matrix_end --source phase4_matrix --message $(printf '%q' "run_id=${RUN_ID} net_burst=${NET_BURST}")" || true
+  remote_dpu_bash "cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && ./stop_switch_congestion_loggers.sh --pid-file $(printf '%q' "${SWITCH_LOG_PID_FILE}")" || true
+  echo "[phase4-matrix] switch logger stopped run_id=${SWITCH_LOG_RUN_ID}"
 }
 
 resolve_worker_ssh_user() {
@@ -679,6 +764,11 @@ summarize_nccl_events() {
     --output-json "${output_json}" || true
 }
 
+cleanup() {
+  stop_switch_logger
+}
+trap cleanup EXIT INT TERM
+
 MANIFEST_JSON="${LOG_ROOT}/${PHASE_NAME}_manifest.json"
 cat > "${MANIFEST_JSON}" <<EOF
 {
@@ -710,6 +800,9 @@ echo "[phase4-matrix] MODES=${RUN_MODES}"
 echo "[phase4-matrix] REPEATS=${REPEATS}"
 echo "[phase4-matrix] MODEL hidden_dim=${HIDDEN_DIM} num_layers=${NUM_LAYERS} batch_size=${BATCH_SIZE} bucket_cap_mb=${BUCKET_CAP_MB} lr=${LR}"
 echo "[phase4-matrix] LOG_ROOT=${LOG_ROOT}"
+echo "[phase4-matrix] NET_BURST=${NET_BURST}"
+
+start_switch_logger
 
 wait_for_master_port_free 5
 
