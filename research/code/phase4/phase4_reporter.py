@@ -870,7 +870,7 @@ def load_grouped_sum_series(path: Path, field_names: Sequence[str]) -> list[tupl
 
 
 def load_congestion_bundle(run_root: Path) -> Optional[dict]:
-    switch_bundle = load_switch_bundle(run_root)
+    congestion_bundle = load_congestion_bundle(run_root)
     log_dir = switch_bundle["log_dir"] if switch_bundle else resolve_switch_log_dir(run_root)
     if log_dir is None or not log_dir.exists():
         return switch_bundle
