@@ -269,6 +269,10 @@ def filter_events_to_measured_steps(events: Sequence[Phase0Event], records: Sequ
     return kept
 
 
+def select_netdone_events_from_phase0(events: Sequence[Phase0Event]) -> list[Phase0Event]:
+    return [event for event in events if event.event == "PROXY_RECV_NET_DONE" and event.size > 0]
+
+
 def plot_metric_overlay(
     records_by_mode: dict[str, list[StepRecord]],
     output_path: Path,
@@ -289,15 +293,11 @@ def plot_metric_overlay(
         xs: list[float] = []
         ys: list[float] = []
         for record in records:
-            start_s = elapsed_seconds(base_ns, record.ts_start_unix_ns)
-            end_s = elapsed_seconds(base_ns, record.ts_end_unix_ns)
             mid_s = elapsed_seconds(base_ns, record.ts_mid_unix_ns)
             metric_value = getattr(record, metric_key)
-            ax.hlines(metric_value, start_s, end_s, color=palette[mode], linewidth=2.0, alpha=0.9)
-            ax.scatter([start_s], [metric_value], color=palette[mode], s=14, marker="o", alpha=0.9)
             xs.append(mid_s)
             ys.append(metric_value)
-        ax.plot(xs, ys, color=palette[mode], linewidth=1.6, alpha=0.9, label=mode)
+        ax.plot(xs, ys, color=palette[mode], linewidth=1.6, alpha=0.9, marker="o", markersize=2.2, label=mode)
     ax.set_title(title)
     ax.set_xlabel("Time Since Mode Start (s)")
     ax.set_ylabel(ylabel)
@@ -358,13 +358,11 @@ def plot_repeat_metric_overlay(
         xs: list[float] = []
         ys: list[float] = []
         for record in records:
-            start_s = elapsed_seconds(base_ns, record.ts_start_unix_ns)
             mid_s = elapsed_seconds(base_ns, record.ts_mid_unix_ns)
             metric_value = getattr(record, metric_key)
-            ax.scatter([start_s], [metric_value], color=palette[repeat], s=14, marker="o", alpha=0.9)
             xs.append(mid_s)
             ys.append(metric_value)
-        ax.plot(xs, ys, color=palette[repeat], linewidth=1.8, alpha=0.9, label=repeat)
+        ax.plot(xs, ys, color=palette[repeat], linewidth=1.8, alpha=0.9, marker="o", markersize=2.0, label=repeat)
     ax.set_title(title)
     ax.set_xlabel("Time Since Mode Start (s)")
     ax.set_ylabel(ylabel)
@@ -576,7 +574,16 @@ def load_jsonl(path: Path) -> list[dict]:
 
 
 def extract_record_ts_ns(row: dict) -> Optional[int]:
-    for key in ("ts_unix_ns", "timestamp_ns", "time_ns", "ts_ns", "tNs"):
+    for key in (
+        "ts_unix_ns",
+        "ts_mid_unix_ns",
+        "ts_start_unix_ns",
+        "ts_end_unix_ns",
+        "timestamp_ns",
+        "time_ns",
+        "ts_ns",
+        "tNs",
+    ):
         value = row.get(key)
         if isinstance(value, int):
             return value
@@ -870,7 +877,7 @@ def load_grouped_sum_series(path: Path, field_names: Sequence[str]) -> list[tupl
 
 
 def load_congestion_bundle(run_root: Path) -> Optional[dict]:
-    congestion_bundle = load_congestion_bundle(run_root)
+    switch_bundle = load_switch_bundle(run_root)
     log_dir = switch_bundle["log_dir"] if switch_bundle else resolve_switch_log_dir(run_root)
     if log_dir is None or not log_dir.exists():
         return switch_bundle
@@ -895,10 +902,15 @@ def load_congestion_bundle(run_root: Path) -> Optional[dict]:
     bundle["worker_tx_pause_rate_series"] = compute_counter_rate_series(worker_tx_pause_total)
     bundle["worker_tx_pause_duration_rate_series"] = compute_counter_rate_series(worker_tx_pause_duration_total)
     bundle["spine_ecn_rate_series"] = compute_counter_rate_series(spine_ecn_total)
-    if bundle.get("snapshots") or bundle["worker_total_gbps_series"] or bundle["worker_cnp_rate_series"] or bundle["worker_tx_pause_rate_series"] or bundle["spine_ecn_rate_series"]:
+    if (
+        bundle.get("snapshots")
+        or bundle["worker_total_gbps_series"]
+        or bundle["worker_cnp_rate_series"]
+        or bundle["worker_tx_pause_rate_series"]
+        or bundle["spine_ecn_rate_series"]
+    ):
         return bundle
     return None
-
 
 def compute_switch_metrics_for_modes(
     switch_bundle: Optional[dict],
@@ -1242,10 +1254,11 @@ def main() -> None:
     if not filtered_records_by_repeat_mode:
         raise FileNotFoundError(f"no *_step_metrics.jsonl found under {run_root}")
 
-    switch_bundle = load_switch_bundle(run_root)
+    congestion_bundle = load_congestion_bundle(run_root)
 
     repeat_sections: list[tuple[str, list[tuple[str, str]]]] = []
     for repeat_name, records_by_mode in filtered_records_by_repeat_mode.items():
+        print(f"[phase4-reporter] render repeat={repeat_name} start", flush=True)
         raw_records_by_mode = raw_records_by_repeat_mode[repeat_name]
         images: list[tuple[str, str]] = []
         latency_raw_png = f"{repeat_name}_latency_over_time_raw.png"
@@ -1350,12 +1363,16 @@ def main() -> None:
         )
 
         repeat_dir = run_root / repeat_name if (run_root / repeat_name).exists() else run_root
-        post_ms_by_mode = {mode: load_post_timestamps_ms(repeat_dir / mode) for mode in records_by_mode.keys()}
         phase0_events_by_mode = {mode: load_phase0_events(repeat_dir / mode) for mode in records_by_mode.keys()}
-        measured_netdone_by_mode = {
-            mode: filter_events_to_measured_steps(load_netdone_events(repeat_dir / mode), records_by_mode[mode])
+        post_ms_by_mode = {
+            mode: [event.t_ms for event in phase0_events_by_mode[mode] if event.event == "PROXY_RECV_POST"]
             for mode in records_by_mode.keys()
         }
+        measured_netdone_by_mode = {}
+        for mode in records_by_mode.keys():
+            all_netdone = select_netdone_events_from_phase0(phase0_events_by_mode[mode])
+            measured_netdone = filter_events_to_measured_steps(all_netdone, records_by_mode[mode])
+            measured_netdone_by_mode[mode] = measured_netdone if measured_netdone else all_netdone
         plot_post_cumulative_overlay(
             post_ms_by_mode,
             output_dir / post_overlay_png,
@@ -1487,6 +1504,7 @@ def main() -> None:
                 ("Worker NIC Throughput Overlay", worker_nic_tput_png),
             ])
         repeat_sections.append((f"Repeat {repeat_name}", images))
+        print(f"[phase4-reporter] render repeat={repeat_name} done", flush=True)
 
     mode_to_repeat_records_raw: dict[str, dict[str, list[StepRecord]]] = {}
     mode_to_repeat_records: dict[str, dict[str, list[StepRecord]]] = {}
@@ -1503,6 +1521,7 @@ def main() -> None:
     all_latency_values_by_mode: dict[str, list[float]] = {}
     all_throughput_values_by_mode: dict[str, list[float]] = {}
     for mode in sorted(mode_to_repeat_records.keys()):
+        print(f"[phase4-reporter] render mode-summary mode={mode} start", flush=True)
         raw_records_by_repeat = mode_to_repeat_records_raw.get(mode, {})
         records_by_repeat = mode_to_repeat_records[mode]
         latency_raw_png = f"{mode}_repeat_latency_overlay_raw.png"
@@ -1567,11 +1586,13 @@ def main() -> None:
             ("Stepwise Latency Percentiles Across Repeats", latency_pct_png),
             ("Stepwise Throughput Percentiles Across Repeats", throughput_pct_png),
         ]))
+        print(f"[phase4-reporter] render mode-summary mode={mode} done", flush=True)
 
     box_latency_raw_png = "all_repeats_latency_boxplot_raw.png"
     box_latency_png = "all_repeats_latency_boxplot.png"
     box_throughput_raw_png = "all_repeats_throughput_boxplot_raw.png"
     box_throughput_png = "all_repeats_throughput_boxplot.png"
+    print("[phase4-reporter] render boxplots start", flush=True)
     plot_boxplot_by_mode(
         all_latency_values_by_mode_raw,
         output_dir / box_latency_raw_png,
@@ -1596,6 +1617,7 @@ def main() -> None:
         title="Training Throughput Distribution Across Repeats (filtered)",
         ylabel="Samples / sec",
     )
+    print("[phase4-reporter] render boxplots done", flush=True)
     mode_sections.append(("All Repeats Summary", [
         ("Latency Distribution Across Repeats Raw", box_latency_raw_png),
         ("Latency Distribution Across Repeats Filtered", box_latency_png),
