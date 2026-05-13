@@ -72,6 +72,7 @@ pairs = {
     "CFG_WARMUP_STEPS": run.get("warmup_steps", 5),
     "CFG_REPEATS": run.get("repeats", 1),
     "CFG_MODE_TIMEOUT_SEC": run.get("mode_timeout_sec", 600),
+    "CFG_MODE_DELAY_SEC": run.get("mode_delay_sec", 180),
     "CFG_TORCH_ENV": run.get("torch_env", "/workspace/venvs/torch-cu121-custom/bin/activate"),
     "CFG_TARGET_SCRIPT": run.get("target_script", "research/code/phase4/ddp_b4.py"),
     "CFG_WORKER_SCRIPT": run.get("worker_script", "research/code/phase4/run_b4_mode_worker.sh"),
@@ -131,6 +132,7 @@ STEPS=${STEPS:-${CFG_STEPS}}
 WARMUP_STEPS=${WARMUP_STEPS:-${CFG_WARMUP_STEPS}}
 REPEATS=${REPEATS:-${CFG_REPEATS}}
 MODE_TIMEOUT_SEC=${MODE_TIMEOUT_SEC:-${CFG_MODE_TIMEOUT_SEC}}
+MODE_DELAY_SEC=${MODE_DELAY_SEC:-${CFG_MODE_DELAY_SEC}}
 TORCH_ENV=${TORCH_ENV:-${CFG_TORCH_ENV}}
 TARGET_SCRIPT=${TARGET_SCRIPT:-${CFG_TARGET_SCRIPT}}
 WORKER_SCRIPT=${WORKER_SCRIPT:-${CFG_WORKER_SCRIPT}}
@@ -821,6 +823,7 @@ echo "[phase4-matrix] REPEATS=${REPEATS}"
 echo "[phase4-matrix] MODEL hidden_dim=${HIDDEN_DIM} num_layers=${NUM_LAYERS} batch_size=${BATCH_SIZE} bucket_cap_mb=${BUCKET_CAP_MB} lr=${LR}"
 echo "[phase4-matrix] LOG_ROOT=${LOG_ROOT}"
 echo "[phase4-matrix] NET_BURST=${NET_BURST}"
+echo "[phase4-matrix] MODE_DELAY_SEC=${MODE_DELAY_SEC}"
 
 start_switch_logger
 
@@ -842,7 +845,12 @@ for repeat_idx in $(seq 1 "${REPEATS}"); do
   echo "[phase4-matrix] ============================================================"
   echo "[phase4-matrix] start repeat=${repeat_label}"
 
+  mode_index=0
   for mode in "${MODE_VALUES[@]}"; do
+    if (( mode_index > 0 && MODE_DELAY_SEC > 0 )); then
+      echo "[phase4-matrix] sleep before next mode repeat=${repeat_label} delay_sec=${MODE_DELAY_SEC}"
+      sleep "${MODE_DELAY_SEC}"
+    fi
     mode_upper_value=$(echo "${mode}" | tr '[:lower:]' '[:upper:]')
     phase4_enable_value=$(mode_field "${mode}" "phase4_enable" "0")
     phase4_post_receive_w_value=$(mode_field "${mode}" "post_receive_w" "0")
@@ -906,6 +914,7 @@ for repeat_idx in $(seq 1 "${REPEATS}"); do
 
     echo "[phase4-matrix] complete repeat=${repeat_label} mode=${mode_upper_value}"
     emit_switch_marker "mode_end" "run_id=${RUN_ID} repeat=${repeat_label} mode=${mode_upper_value} net_burst=${net_burst_value}"
+    mode_index=$((mode_index + 1))
   done
 
   compare_outputs "${repeat_root}" "${repeat_root}/final_output_validation.json"
