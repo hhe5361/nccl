@@ -28,7 +28,7 @@ if [[ ! -f "${CONFIG_PATH}" ]]; then
   exit 1
 fi
 
-SWITCH_LOGGER_ROOT=${SWITCH_LOGGER_ROOT:-/home/ubuntu/hyoeun/switch_setup_task/switch_congestion_logger}
+SWITCH_LOGGER_ROOT=${SWITCH_LOGGER_ROOT:-/home/ubuntu/hyoeun/switch_setup_task}
 SWITCH_LOGGER_V2_SUBDIR=${SWITCH_LOGGER_V2_SUBDIR:-switch_congestion_logger_v2}
 SWITCH_LOG_INTERVAL_SEC=${SWITCH_LOG_INTERVAL_SEC:-1}
 SWITCH_LOG_SHARED_ROOT=${SWITCH_LOG_SHARED_ROOT:-/mnt/nfs_share/cts_experiments/switch_log}

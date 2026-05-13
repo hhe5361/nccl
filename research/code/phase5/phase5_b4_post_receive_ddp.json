@@ -16,9 +16,8 @@
     "run_modes": [
       "stock",
       "b4_w2",
-      "b4_w2_3",
-      "b4_w2_6",
-      "b4_w3"
+      "b4_w4",
+      "b4_w6"
     ],
     "repeats": 5,
     "steps": 200,
@@ -83,22 +82,16 @@
       "post_receive_w": 2.0
     },
     {
-      "mode_id": "b4_w2_3",
-      "label": "B4_W2_3",
+      "mode_id": "b4_w4",
+      "label": "B4_W4",
       "phase4_enable": 1,
-      "post_receive_w": 2.3
+      "post_receive_w": 4.0
     },
     {
-      "mode_id": "b4_w2_6",
-      "label": "B4_W2_6",
+      "mode_id": "b4_w6",
+      "label": "B4_W6",
       "phase4_enable": 1,
-      "post_receive_w": 2.6
-    },
-    {
-      "mode_id": "b4_w3",
-      "label": "B4_W3",
-      "phase4_enable": 1,
-      "post_receive_w": 3.0
+      "post_receive_w": 6.0
     }
   ]
 }
