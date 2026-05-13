@@ -365,6 +365,29 @@ def bucketize_event_percentile(
     return points
 
 
+def bucketize_event_mean(
+    events: list[NetDoneEvent],
+    start_ns: int,
+    end_ns: int,
+    bucket_ms: float,
+) -> list[tuple[float, float]]:
+    bucket_ns = max(1, int(bucket_ms * 1_000_000.0))
+    buckets: list[list[float]] = []
+    nbuckets = max(1, int(math.ceil((end_ns - start_ns) / bucket_ns)))
+    for _ in range(nbuckets):
+        buckets.append([])
+    for event in events:
+        if event.t_ns < start_ns or event.t_ns > end_ns:
+            continue
+        idx = min(int((event.t_ns - start_ns) // bucket_ns), nbuckets - 1)
+        buckets[idx].append(event.post_to_net_done_us / 1000.0)
+    points: list[tuple[float, float]] = []
+    for idx, values in enumerate(buckets):
+        rel_ms = ((idx + 1) * bucket_ns) / 1_000_000.0
+        points.append((rel_ms, mean(values)))
+    return points
+
+
 def compute_step_et_stats(steps: list[StepRecord], events: list[NetDoneEvent]) -> list[dict]:
     rows: list[dict] = []
     event_index = 0
@@ -510,6 +533,65 @@ def plot_scatter(
     plt.close(fig)
 
 
+def plot_repeat_mode_dual_overlay(
+    left_series_by_mode: dict[str, list[tuple[float, float]]],
+    right_series_by_mode: dict[str, list[tuple[float, float]]],
+    *,
+    title: str,
+    left_label: str,
+    right_label: str,
+    output_path: Path,
+) -> None:
+    modes = [mode for mode, values in left_series_by_mode.items() if values or right_series_by_mode.get(mode)]
+    if not modes:
+        return
+    palette = build_palette(modes)
+    fig, axes = plt.subplots(len(modes), 1, figsize=(14, 3.2 * len(modes)), sharex=False)
+    if len(modes) == 1:
+        axes = [axes]
+
+    for ax, mode in zip(axes, modes):
+        left_points = left_series_by_mode.get(mode, [])
+        right_points = right_series_by_mode.get(mode, [])
+        left_color = palette[mode]
+        if left_points:
+            ax.plot(
+                [x / 1000.0 for x, _ in left_points],
+                [y for _, y in left_points],
+                color=left_color,
+                linewidth=1.8,
+                label=f"{mode} internal",
+            )
+        ax.set_ylabel(left_label, color=left_color)
+        ax.tick_params(axis="y", labelcolor=left_color)
+        ax.grid(True, alpha=0.25)
+        ax.set_title(mode)
+
+        ax_right = ax.twinx()
+        if right_points:
+            ax_right.plot(
+                [x / 1000.0 for x, _ in right_points],
+                [y for _, y in right_points],
+                color="#444444",
+                linewidth=1.6,
+                linestyle="--",
+                label=f"{mode} PFC",
+            )
+        ax_right.set_ylabel(right_label, color="#444444")
+        ax_right.tick_params(axis="y", labelcolor="#444444")
+
+        handles = ax.get_lines() + ax_right.get_lines()
+        labels = [line.get_label() for line in handles]
+        if handles:
+            ax.legend(handles, labels, loc="upper right")
+        ax.set_xlabel("Time Since Measured-Phase Start (s)")
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
 def plot_switch_overview(switch_bundle: Optional[dict], output_path: Path) -> None:
     if switch_bundle is None:
         return
@@ -582,6 +664,9 @@ def main() -> None:
         step_overlay_ecn_cum: dict[str, list[tuple[int, float]]] = {}
         pfc_scatter: dict[str, list[tuple[float, float]]] = {}
         ecn_scatter: dict[str, list[tuple[float, float]]] = {}
+        bucket_overlay_et_mean: dict[str, list[tuple[float, float]]] = {}
+        bucket_overlay_et_p99: dict[str, list[tuple[float, float]]] = {}
+        bucket_overlay_pfc: dict[str, list[tuple[float, float]]] = {}
         repeat_summary_rows: list[dict[str, float | str]] = []
 
         post_to_net_done_plot = output_dir / f"{repeat_dir.name}_post_to_net_done_ecdf.png"
@@ -662,6 +747,7 @@ def main() -> None:
             if steps:
                 mode_start_ns = min(step.ts_start_unix_ns for step in steps)
                 mode_end_ns = max(step.ts_end_unix_ns for step in steps)
+                bucket_et_mean = bucketize_event_mean(events, mode_start_ns, mode_end_ns, args.bucket_ms)
                 bucket_et = bucketize_event_percentile(events, mode_start_ns, mode_end_ns, args.bucket_ms, 0.99)
                 total_pfc_samples = combine_cumulative_series(
                     [switch_bundle["rackA_pfc"], switch_bundle["rackB_pfc"], switch_bundle["spine_pfc"]]
@@ -669,6 +755,11 @@ def main() -> None:
                 spine_ecn_samples = switch_bundle["spine_ecn"] if switch_bundle else []
                 bucket_pfc = bucketize_counter_delta(total_pfc_samples, mode_start_ns, mode_end_ns, args.bucket_ms)
                 bucket_ecn = bucketize_counter_delta(spine_ecn_samples, mode_start_ns, mode_end_ns, args.bucket_ms)
+                if bucket_et_mean and bucket_pfc:
+                    bucket_overlay_et_mean[mode] = bucket_et_mean
+                    bucket_overlay_pfc[mode] = bucket_pfc
+                if bucket_et and bucket_pfc:
+                    bucket_overlay_et_p99[mode] = bucket_et
                 if bucket_et and bucket_pfc:
                     plot_dual_axis_stepwise(
                         [int(x) for x, _ in bucket_et],
@@ -729,6 +820,22 @@ def main() -> None:
             ylabel="E(t) p99 (ms)",
             output_path=output_dir / f"{repeat_dir.name}_et_p99_vs_ecn_scatter.png",
         )
+        plot_repeat_mode_dual_overlay(
+            bucket_overlay_et_mean,
+            bucket_overlay_pfc,
+            title=f"{repeat_dir.name} E(t) Mean vs Switch PFC",
+            left_label="E(t) mean (ms)",
+            right_label="PFC delta / bucket",
+            output_path=output_dir / f"{repeat_dir.name}_et_mean_vs_pfc_modes.png",
+        )
+        plot_repeat_mode_dual_overlay(
+            bucket_overlay_et_p99,
+            bucket_overlay_pfc,
+            title=f"{repeat_dir.name} E(t) p99 vs Switch PFC",
+            left_label="E(t) p99 (ms)",
+            right_label="PFC delta / bucket",
+            output_path=output_dir / f"{repeat_dir.name}_et_p99_vs_pfc_modes.png",
+        )
 
         (output_dir / f"{repeat_dir.name}_phase5_report_summary.json").write_text(
             json.dumps(repeat_summary_rows, indent=2),
@@ -749,6 +856,8 @@ def main() -> None:
               <img src="{post_to_net_done_plot.name}" style="max-width: 100%;"><br>
               <img src="{repeat_dir.name}_mode_et_p99_overlay.png" style="max-width: 100%;"><br>
               <img src="{repeat_dir.name}_mode_pfc_overlay.png" style="max-width: 100%;"><br>
+              <img src="{repeat_dir.name}_et_mean_vs_pfc_modes.png" style="max-width: 100%;"><br>
+              <img src="{repeat_dir.name}_et_p99_vs_pfc_modes.png" style="max-width: 100%;"><br>
               <img src="{repeat_dir.name}_mode_ecn_overlay.png" style="max-width: 100%;"><br>
               <img src="{repeat_dir.name}_et_p99_vs_pfc_scatter.png" style="max-width: 48%;">
               <img src="{repeat_dir.name}_et_p99_vs_ecn_scatter.png" style="max-width: 48%;">

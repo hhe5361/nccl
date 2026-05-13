@@ -22,6 +22,12 @@ class ModeWindow:
     end_ns: int
 
 
+@dataclass(frozen=True)
+class PostDoneEvent:
+    t_ns: int
+    post_to_net_done_ms: float
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -66,6 +72,37 @@ def read_jsonl(path: Path) -> list[dict]:
                     rows.append(row)
                 index = next_index
     return rows
+
+
+def mean(values: Sequence[float]) -> float:
+    if not values:
+        return 0.0
+    return float(sum(values) / len(values))
+
+
+def percentile(values: Sequence[float], q: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = (len(ordered) - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, len(ordered) - 1)
+    frac = pos - lo
+    return ordered[lo] * (1.0 - frac) + ordered[hi] * frac
+
+
+def parse_phase5_line(line: str) -> dict[str, str] | None:
+    if "PHASE5 event=" not in line:
+        return None
+    row: dict[str, str] = {}
+    for token in line.strip().split():
+        if "=" not in token:
+            continue
+        key, value = token.split("=", 1)
+        row[key] = value
+    return row if "event" in row else None
 
 
 def load_counter_records(log_dir: Path) -> list[dict]:
@@ -189,6 +226,49 @@ def build_internal_net_series(
         rel_sec = ((idx + 0.5) * bucket_ms) / 1000.0
         gbps = (total_bytes * 8.0) / (bucket_ms * 1_000_000.0)
         points.append((rel_sec, gbps))
+    return points
+
+
+def load_post_done_events(run_root: Path, repeat_name: str, mode_name: str) -> list[PostDoneEvent]:
+    repeat_dir = run_root / repeat_name if (run_root / repeat_name).exists() else run_root
+    mode_dir = repeat_dir / mode_name
+    events: list[PostDoneEvent] = []
+    for log_path in sorted(mode_dir.glob("worker*/nccl.*.log")):
+        for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+            row = parse_phase5_line(line)
+            if row is None or row.get("event") != "PROXY_RECV_NET_DONE":
+                continue
+            try:
+                t_ns = int(row.get("tNs", "0"))
+                delay_ns = int(row.get("postToNetDoneNs", "0"))
+            except ValueError:
+                continue
+            if t_ns > 0 and delay_ns >= 0:
+                events.append(PostDoneEvent(t_ns=t_ns, post_to_net_done_ms=delay_ns / 1_000_000.0))
+    events.sort(key=lambda item: item.t_ns)
+    return events
+
+
+def bucketize_post_done_events(
+    events: Sequence[PostDoneEvent],
+    bucket_ms: float,
+    reducer: str,
+) -> list[tuple[float, float]]:
+    if not events:
+        return []
+    bucket_ns = max(1, int(bucket_ms * 1_000_000.0))
+    base_ns = min(event.t_ns for event in events)
+    max_t_ns = max(event.t_ns for event in events)
+    nbuckets = max(1, int(math.ceil((max_t_ns - base_ns + 1) / bucket_ns)))
+    buckets: list[list[float]] = [[] for _ in range(nbuckets)]
+    for event in events:
+        idx = min(int((event.t_ns - base_ns) // bucket_ns), nbuckets - 1)
+        buckets[idx].append(event.post_to_net_done_ms)
+    points: list[tuple[float, float]] = []
+    for idx, values in enumerate(buckets):
+        rel_sec = ((idx + 0.5) * bucket_ms) / 1000.0
+        value = mean(values) if reducer == "mean" else percentile(values, 0.99)
+        points.append((rel_sec, value))
     return points
 
 
@@ -326,6 +406,66 @@ def plot_mode_overlay_figure(
     plt.close(fig)
 
 
+def plot_delay_vs_pfc_figure(
+    repeat_name: str,
+    windows: list[ModeWindow],
+    delay_series_by_mode: dict[str, list[tuple[float, float]]],
+    pfc_series_by_mode: dict[str, list[tuple[float, float]]],
+    output_path: Path,
+    *,
+    left_label: str,
+    title_suffix: str,
+) -> None:
+    modes = [window.mode_name for window in windows if delay_series_by_mode.get(window.mode_name) or pfc_series_by_mode.get(window.mode_name)]
+    if not modes:
+        return
+    palette = p4.build_palette(modes)
+    fig, axes = plt.subplots(len(modes), 1, figsize=(13, 3.2 * len(modes)), sharex=False)
+    if len(modes) == 1:
+        axes = [axes]
+
+    for ax, mode in zip(axes, modes):
+        left_points = delay_series_by_mode.get(mode, [])
+        right_points = pfc_series_by_mode.get(mode, [])
+        left_color = palette[mode]
+        if left_points:
+            ax.plot(
+                [x for x, _ in left_points],
+                [y for _, y in left_points],
+                color=left_color,
+                linewidth=1.8,
+                label=f"{mode} delay",
+            )
+        ax.set_ylabel(left_label, color=left_color)
+        ax.tick_params(axis="y", labelcolor=left_color)
+        ax.grid(True, alpha=0.25)
+        ax.set_title(mode)
+
+        twin = ax.twinx()
+        if right_points:
+            twin.plot(
+                [x for x, _ in right_points],
+                [y for _, y in right_points],
+                color="#444444",
+                linewidth=1.6,
+                linestyle="--",
+                label=f"{mode} PFC",
+            )
+        twin.set_ylabel("PFC delta / bucket", color="#444444")
+        twin.tick_params(axis="y", labelcolor="#444444")
+
+        handles, labels = ax.get_legend_handles_labels()
+        twin_handles, twin_labels = twin.get_legend_handles_labels()
+        if handles or twin_handles:
+            ax.legend(handles + twin_handles, labels + twin_labels, loc="upper right")
+        ax.set_xlabel("Time Since Measured-Phase Start (s)")
+
+    fig.suptitle(f"{repeat_name} {title_suffix}")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+
+
 def write_html(output_dir: Path, repeat_sections: list[tuple[str, list[tuple[str, str]]]]) -> None:
     html = [
         "<!doctype html>",
@@ -333,7 +473,7 @@ def write_html(output_dir: Path, repeat_sections: list[tuple[str, list[tuple[str
         "<style>body{font-family:Arial,sans-serif;margin:24px;} img{max-width:100%;border:1px solid #ddd;margin-bottom:16px;} code{background:#f4f4f4;padding:2px 4px;}</style>",
         "</head><body>",
         "<h1>Phase4 Network Report</h1>",
-        "<p>Internal network metric uses measured-phase <code>PROXY_RECV_NET_DONE size</code> aggregated into throughput buckets. Switch metrics use switch_congestion_logger_v2 raw PFC / ECN counters bucketed into relative-mode time.</p>",
+        "<p>Internal network metric uses measured-phase <code>PROXY_RECV_NET_DONE size</code> aggregated into throughput buckets. When <code>NCCL_PHASE5_LOG=1</code> is enabled, the report also includes <code>POST-&gt;NET_DONE</code> mean / p99 delay overlays against switch PFC. Switch metrics use switch_congestion_logger_v2 raw PFC / ECN counters bucketed into relative-mode time.</p>",
     ]
     for section_title, images in repeat_sections:
         html.append(f"<h2>{section_title}</h2>")
@@ -366,6 +506,8 @@ def main() -> None:
         internal_by_mode: dict[str, list[tuple[float, float]]] = {}
         pfc_by_mode: dict[str, list[tuple[float, float]]] = {}
         ecn_by_mode: dict[str, list[tuple[float, float]]] = {}
+        post_done_mean_by_mode: dict[str, list[tuple[float, float]]] = {}
+        post_done_p99_by_mode: dict[str, list[tuple[float, float]]] = {}
         summary[repeat_name] = {}
         images: list[tuple[str, str]] = []
 
@@ -375,6 +517,9 @@ def main() -> None:
             if not records:
                 continue
             internal_points = build_internal_net_series(run_root, repeat_name, mode, records, args.net_bucket_ms)
+            post_done_events = load_post_done_events(run_root, repeat_name, mode)
+            post_done_mean_points = bucketize_post_done_events(post_done_events, args.net_bucket_ms, "mean")
+            post_done_p99_points = bucketize_post_done_events(post_done_events, args.net_bucket_ms, "p99")
             pfc_points = bucketize_relative_events(
                 switch_events.get("rackA:pause", []) + switch_events.get("rackB:pause", []) + switch_events.get("spine:pause", []),
                 window.start_ns,
@@ -390,8 +535,12 @@ def main() -> None:
             internal_by_mode[mode] = internal_points
             pfc_by_mode[mode] = pfc_points
             ecn_by_mode[mode] = ecn_points
+            post_done_mean_by_mode[mode] = post_done_mean_points
+            post_done_p99_by_mode[mode] = post_done_p99_points
             summary[repeat_name][mode] = {
                 "internal_peak_gbps": max((y for _, y in internal_points), default=0.0),
+                "post_done_mean_peak_ms": max((y for _, y in post_done_mean_points), default=0.0),
+                "post_done_p99_peak_ms": max((y for _, y in post_done_p99_points), default=0.0),
                 "pfc_total_delta": sum(y for _, y in pfc_points),
                 "pfc_peak_bucket_delta": max((y for _, y in pfc_points), default=0.0),
                 "ecn_total_delta": sum(y for _, y in ecn_points),
@@ -402,6 +551,8 @@ def main() -> None:
         internal_png = f"{repeat_name}_internal_network_metric_overlay.png"
         pfc_overlay_png = f"{repeat_name}_internal_vs_switch_pfc.png"
         ecn_overlay_png = f"{repeat_name}_internal_vs_spine_ecn.png"
+        post_done_mean_png = f"{repeat_name}_post_done_mean_vs_switch_pfc.png"
+        post_done_p99_png = f"{repeat_name}_post_done_p99_vs_switch_pfc.png"
 
         plot_switch_overview(repeat_name, windows, switch_events, args.switch_bucket_sec, output_dir / switch_png)
         plot_internal_network_overlay(repeat_name, internal_by_mode, output_dir / internal_png)
@@ -423,6 +574,24 @@ def main() -> None:
             right_label="ECN delta / bucket",
             title_suffix="Spine ECN",
         )
+        plot_delay_vs_pfc_figure(
+            repeat_name,
+            windows,
+            post_done_mean_by_mode,
+            pfc_by_mode,
+            output_dir / post_done_mean_png,
+            left_label="POST-DONE mean (ms)",
+            title_suffix="POST-DONE Mean vs Switch PFC",
+        )
+        plot_delay_vs_pfc_figure(
+            repeat_name,
+            windows,
+            post_done_p99_by_mode,
+            pfc_by_mode,
+            output_dir / post_done_p99_png,
+            left_label="POST-DONE p99 (ms)",
+            title_suffix="POST-DONE p99 vs Switch PFC",
+        )
 
         images.extend(
             [
@@ -430,6 +599,8 @@ def main() -> None:
                 ("Internal Network Metric Overlay", internal_png),
                 ("Internal Metric vs Switch PFC", pfc_overlay_png),
                 ("Internal Metric vs Spine ECN", ecn_overlay_png),
+                ("POST-DONE Mean vs Switch PFC", post_done_mean_png),
+                ("POST-DONE p99 vs Switch PFC", post_done_p99_png),
             ]
         )
         repeat_sections.append((repeat_name, images))
