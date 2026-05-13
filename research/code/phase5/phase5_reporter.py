@@ -40,6 +40,13 @@ class DelayEvent:
     size_bytes: int
 
 
+@dataclass
+class MarkerEvent:
+    t_ns: int
+    marker: str
+    message: str
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Phase5 E(t) congestion reporter")
     parser.add_argument("--input", required=True, help="phase5 run root")
@@ -67,6 +74,31 @@ def load_jsonl(path: Path) -> list[dict]:
                 continue
             if isinstance(row, dict):
                 rows.append(row)
+    return rows
+
+
+def read_jsonl_decoder(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    rows: list[dict] = []
+    decoder = json.JSONDecoder()
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            index = 0
+            while index < len(line):
+                while index < len(line) and line[index].isspace():
+                    index += 1
+                if index >= len(line):
+                    break
+                try:
+                    record, next_index = decoder.raw_decode(line, index)
+                except json.JSONDecodeError:
+                    break
+                if isinstance(record, dict):
+                    rows.append(record)
+                index = next_index
     return rows
 
 
@@ -231,6 +263,189 @@ def resolve_switch_log_dir(run_root: Path) -> Optional[Path]:
         if candidate.exists():
             return candidate
     return None
+
+
+def load_markers(log_dir: Path) -> list[MarkerEvent]:
+    markers: list[MarkerEvent] = []
+    for row in read_jsonl_decoder(log_dir / "markers.jsonl"):
+        ts_ns = extract_record_ts_ns(row)
+        marker = row.get("marker")
+        if ts_ns is None or not isinstance(marker, str):
+            continue
+        markers.append(MarkerEvent(t_ns=ts_ns, marker=marker, message=str(row.get("message", ""))))
+    markers.sort(key=lambda item: item.t_ns)
+    return markers
+
+
+def load_raw_switch_counter_records(log_dir: Path) -> list[dict]:
+    records: list[dict] = []
+    for name in ("spine_pfc_ecn.jsonl", "rackA_pfc_statistics.jsonl", "rackB_pfc_statistics.jsonl"):
+        records.extend(read_jsonl_decoder(log_dir / name))
+    return records
+
+
+def build_switch_events(records: Iterable[dict]) -> tuple[dict[str, list[tuple[int, int]]], Optional[int]]:
+    by_key: dict[tuple[str, str, str], list[tuple[int, int]]] = {}
+    min_ts_ns: Optional[int] = None
+    for record in records:
+        kind = record.get("kind")
+        switch = record.get("switch")
+        port = record.get("port")
+        ts_ns = record.get("ts_mid_unix_ns")
+        if kind is None or switch is None or port is None or ts_ns is None:
+            continue
+        metrics: list[tuple[str, Optional[int]]] = []
+        if kind == "fsos_pfc_statistics":
+            rx = record.get("rx_pause")
+            tx = record.get("tx_pause")
+            metrics.append(("pause", None if rx is None or tx is None else int(rx) + int(tx)))
+        elif kind == "onyx_pfc_ecn":
+            rx_pause = record.get("rx_pause_packets")
+            tx_pause = record.get("tx_pause_packets")
+            ecn = record.get("rx_ecn_marked_packets")
+            metrics.append(("pause", None if rx_pause is None or tx_pause is None else int(rx_pause) + int(tx_pause)))
+            metrics.append(("ecn", None if ecn is None else int(ecn)))
+        else:
+            continue
+        ts_i = int(ts_ns)
+        if min_ts_ns is None or ts_i < min_ts_ns:
+            min_ts_ns = ts_i
+        for metric, value in metrics:
+            if value is None:
+                continue
+            key = (str(switch), str(port), metric)
+            by_key.setdefault(key, []).append((ts_i, value))
+
+    events: dict[str, list[tuple[int, int]]] = {}
+    for (switch, _port, metric), samples in by_key.items():
+        samples.sort(key=lambda item: item[0])
+        prev: Optional[int] = None
+        series: list[tuple[int, int]] = []
+        for ts_i, cur in samples:
+            delta = 0 if prev is None else max(0, cur - prev)
+            series.append((ts_i, delta))
+            prev = cur
+        key = f"{switch}:{metric}"
+        events.setdefault(key, []).extend(series)
+    for key in events:
+        events[key].sort(key=lambda item: item[0])
+    return events, min_ts_ns
+
+
+def bucketize_switch_events(
+    events_by_series: dict[str, list[tuple[int, int]]],
+    bucket_sec: float,
+    *,
+    start_ns: int,
+    end_ns: int,
+) -> dict[str, list[tuple[float, int]]]:
+    bucket_ns = int(bucket_sec * 1_000_000_000.0)
+    if bucket_ns <= 0:
+        return {}
+    bucketed: dict[str, dict[int, int]] = {}
+    for series_name, events in events_by_series.items():
+        for ts_ns, delta in events:
+            if ts_ns < start_ns or ts_ns > end_ns:
+                continue
+            bucket_idx = int((ts_ns - start_ns) // bucket_ns)
+            bucketed.setdefault(series_name, {})
+            bucketed[series_name][bucket_idx] = bucketed[series_name].get(bucket_idx, 0) + int(delta)
+    out: dict[str, list[tuple[float, int]]] = {}
+    for name, buckets in bucketed.items():
+        out[name] = [((idx * bucket_sec), value) for idx, value in sorted(buckets.items())]
+    return out
+
+
+def parse_marker_repeat_mode(message: str) -> tuple[Optional[str], Optional[str]]:
+    repeat = None
+    mode = None
+    for token in message.split():
+        if token.startswith("repeat="):
+            repeat = token.split("=", 1)[1]
+        elif token.startswith("mode="):
+            mode = token.split("=", 1)[1]
+    return repeat, mode
+
+
+def compute_repeat_time_bounds(records_by_mode: dict[str, list[StepRecord]]) -> Optional[tuple[int, int]]:
+    starts: list[int] = []
+    ends: list[int] = []
+    for records in records_by_mode.values():
+        bounds = measured_window_bounds(records)
+        if bounds is None:
+            continue
+        starts.append(bounds[0])
+        ends.append(bounds[1])
+    if not starts or not ends:
+        return None
+    return min(starts), max(ends)
+
+
+def plot_switch_overview(
+    bucketed: dict[str, list[tuple[float, int]]],
+    markers: list[tuple[float, str]],
+    output_path: Path,
+    *,
+    title: str,
+) -> None:
+    layout = [
+        ("spine:pause", "spine PFC delta/bucket", "#1f77b4"),
+        ("spine:ecn", "spine ECN delta/bucket", "#ff7f0e"),
+        ("rackA:pause", "rackA PFC delta/bucket", "#d62728"),
+        ("rackB:pause", "rackB PFC delta/bucket", "#2ca02c"),
+    ]
+    active = [item for item in layout if bucketed.get(item[0])]
+    if not active:
+        return
+    fig, axes = plt.subplots(len(active), 1, figsize=(14, 9), sharex=True)
+    if len(active) == 1:
+        axes = [axes]
+    all_x: list[float] = []
+    for ax, (series_name, ylabel, color) in zip(axes, active):
+        xs = [x for x, _ in bucketed[series_name]]
+        ys = [y for _, y in bucketed[series_name]]
+        all_x.extend(xs)
+        ax.plot(xs, ys, linewidth=1.6, color=color)
+        ax.fill_between(xs, ys, step="pre", alpha=0.18, color=color)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, linestyle="--", alpha=0.3)
+        y_top = max(ys) if ys else 1.0
+        for marker_x, marker_name in markers:
+            ax.axvline(marker_x, color="#555555", linestyle=":", alpha=0.45, linewidth=1.0)
+            ax.text(marker_x, y_top if y_top > 0 else 1.0, marker_name, rotation=90, va="top", ha="right", fontsize=8, color="#555555")
+    if all_x:
+        axes[-1].set_xlim(0, max(all_x))
+    axes[-1].set_xlabel("Elapsed time since repeat start (seconds)")
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+
+
+def plot_mode_overlay(
+    series_by_mode: dict[str, list[tuple[float, int]]],
+    output_path: Path,
+    *,
+    title: str,
+    ylabel: str,
+) -> None:
+    if not any(series_by_mode.values()):
+        return
+    fig, ax = plt.subplots(figsize=(12, 5.5))
+    for mode_name, series in sorted(series_by_mode.items()):
+        if not series:
+            continue
+        xs = [x for x, _ in series]
+        ys = [y for _, y in series]
+        ax.plot(xs, ys, linewidth=1.7, marker="o", markersize=2.8, label=mode_name)
+    ax.set_title(title)
+    ax.set_xlabel("Relative mode time (seconds)")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.25)
+    ax.legend(loc="upper left", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
 
 
 def load_total_series_from_jsonl(path: Path, total_field: str) -> list[tuple[int, float]]:
@@ -568,16 +783,22 @@ def main() -> None:
 
     repeats = discover_repeat_dirs(run_root)
     congestion_bundle = load_congestion_bundle(run_root)
+    switch_log_dir = resolve_switch_log_dir(run_root)
+    raw_switch_records = load_raw_switch_counter_records(switch_log_dir) if switch_log_dir else []
+    switch_events, _ = build_switch_events(raw_switch_records) if raw_switch_records else ({}, None)
+    switch_markers = load_markers(switch_log_dir) if switch_log_dir else []
     summary: dict[str, dict] = {"bucket_ms": args.bucket_ms, "repeats": {}}
     html_images: list[tuple[str, str]] = []
 
     for repeat_dir in repeats:
         repeat_name = repeat_dir.name
         summary["repeats"][repeat_name] = {}
+        records_by_mode: dict[str, list[StepRecord]] = {}
         for mode_dir in iter_mode_dirs(repeat_dir):
             records = load_step_metrics(repeat_name, mode_dir)
             if not records:
                 continue
+            records_by_mode[mode_dir.name] = records
             events = load_phase5_delay_events(mode_dir)
             if not events:
                 continue
@@ -668,6 +889,61 @@ def main() -> None:
                 "step_corr_spine_ecn_rate": pearson_corr(step_et_p99[: min(len(step_et_p99), len(ecn_vals))], ecn_vals[: min(len(step_et_p99), len(ecn_vals))]) if ecn_vals else 0.0,
                 "step_pfc_total_delta": pfc_cum_step[-1][1] if pfc_cum_step else 0.0
             }
+
+        repeat_bounds = compute_repeat_time_bounds(records_by_mode)
+        if repeat_bounds and switch_events:
+            rep_start_ns, rep_end_ns = repeat_bounds
+            repeat_bucketed = bucketize_switch_events(switch_events, 1.0, start_ns=rep_start_ns, end_ns=rep_end_ns)
+            repeat_marker_points: list[tuple[float, str]] = []
+            for marker in switch_markers:
+                if marker.t_ns < rep_start_ns or marker.t_ns > rep_end_ns:
+                    continue
+                marker_repeat, marker_mode = parse_marker_repeat_mode(marker.message)
+                if marker_repeat != repeat_name:
+                    continue
+                label = marker.marker if not marker_mode else f"{marker.marker}:{marker_mode}"
+                repeat_marker_points.append(((marker.t_ns - rep_start_ns) / 1_000_000_000.0, label))
+            overview_name = f"{repeat_name}_switch_pfc_ecn_overview.png"
+            plot_switch_overview(
+                repeat_bucketed,
+                repeat_marker_points,
+                output_dir / overview_name,
+                title=f"{repeat_name} Switch PFC / ECN Overview",
+            )
+            html_images.append((f"{repeat_name} Switch PFC / ECN Overview", overview_name))
+
+            mode_pfc_series: dict[str, list[tuple[float, int]]] = {}
+            mode_ecn_series: dict[str, list[tuple[float, int]]] = {}
+            for mode_name, records in records_by_mode.items():
+                bounds = measured_window_bounds(records)
+                if bounds is None:
+                    continue
+                mode_start_ns, mode_end_ns = bounds
+                mode_bucketed = bucketize_switch_events(switch_events, 1.0, start_ns=mode_start_ns, end_ns=mode_end_ns)
+                pfc_map: dict[float, int] = {}
+                for key in ("rackA:pause", "rackB:pause", "spine:pause"):
+                    for x, value in mode_bucketed.get(key, []):
+                        pfc_map[x] = pfc_map.get(x, 0) + value
+                mode_pfc_series[mode_name] = sorted(pfc_map.items())
+                mode_ecn_series[mode_name] = mode_bucketed.get("spine:ecn", [])
+
+            pfc_overlay_name = f"{repeat_name}_mode_pfc_overlay.png"
+            plot_mode_overlay(
+                mode_pfc_series,
+                output_dir / pfc_overlay_name,
+                title=f"{repeat_name} Mode Overlay: Switch PFC Delta",
+                ylabel="Switch PFC delta / 1s bucket",
+            )
+            html_images.append((f"{repeat_name} Mode Overlay: Switch PFC Delta", pfc_overlay_name))
+
+            ecn_overlay_name = f"{repeat_name}_mode_spine_ecn_overlay.png"
+            plot_mode_overlay(
+                mode_ecn_series,
+                output_dir / ecn_overlay_name,
+                title=f"{repeat_name} Mode Overlay: Spine ECN Delta",
+                ylabel="Spine ECN delta / 1s bucket",
+            )
+            html_images.append((f"{repeat_name} Mode Overlay: Spine ECN Delta", ecn_overlay_name))
 
     (output_dir / "phase5_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     write_html(output_dir, html_images)

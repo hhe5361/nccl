@@ -32,6 +32,8 @@ BUCKET_CAP_MB=${BUCKET_CAP_MB:-1}
 LR=${LR:-0.01}
 MODEL_SEED=${MODEL_SEED:-20260504}
 REPEAT_LABEL=${REPEAT_LABEL:-repeat_01}
+WORKER_TEMP_ROOT=${WORKER_TEMP_ROOT:-${HOME}/hyoeun/temp}
+LOCAL_RUN_ROOT=${LOCAL_RUN_ROOT:-${WORKER_TEMP_ROOT}/${RUN_ID}/${REPEAT_LABEL}/${MODE_UPPER:-${MODE^^}}}
 PHASE4_ENABLE_VALUE=${PHASE4_ENABLE_VALUE:-}
 PHASE4_POST_RECEIVE_W_VALUE=${PHASE4_POST_RECEIVE_W_VALUE:-}
 NET_BURST_VALUE=${NET_BURST_VALUE:-0}
@@ -44,7 +46,7 @@ PHASE4_IB_GID_INDEX=${PHASE4_IB_GID_INDEX:-3}
 PHASE4_PAIR_PORT_BASE=${PHASE4_PAIR_PORT_BASE:-18600}
 PHASE4_FULL_PAIR_GBPS=${PHASE4_FULL_PAIR_GBPS:-26.0}
 
-mkdir -p "${RUN_ROOT}" "${RUN_ROOT}/${WORKER_NAME}" "${STATUS_DIR}"
+mkdir -p "${RUN_ROOT}" "${STATUS_DIR}" "${LOCAL_RUN_ROOT}" "${LOCAL_RUN_ROOT}/${WORKER_NAME}"
 
 # shellcheck disable=SC1090
 source "${TORCH_ENV}"
@@ -122,7 +124,8 @@ STARTED_AT=$(date +%s)
 LOAD_PIDS=()
 
 write_status() {
-  cat > "${STATUS_FILE}" <<EOF
+  local status_tmp="${STATUS_FILE}.$$.$RANDOM.tmp"
+  cat > "${status_tmp}" <<EOF
 status=${STATUS_DDP}
 state=${RUN_STATE}
 worker=${WORKER_NAME}
@@ -137,6 +140,7 @@ updated_at=$(date +%s)
 started_at=${STARTED_AT}
 message=${STATUS_MESSAGE}
 EOF
+  mv -f "${status_tmp}" "${STATUS_FILE}"
 }
 
 mark_running() {
@@ -279,6 +283,7 @@ echo "[phase4-worker] APPENDIX2_GROUP_LOG=${NCCL_APPENDIX2_GROUP_LOG}"
 echo "[phase4-worker] HIDDEN_DIM=${HIDDEN_DIM} NUM_LAYERS=${NUM_LAYERS} BATCH_SIZE=${BATCH_SIZE} BUCKET_CAP_MB=${BUCKET_CAP_MB} LR=${LR}"
 echo "[phase4-worker] MODEL_SEED=${MODEL_SEED}"
 echo "[phase4-worker] NET_BURST=${NET_BURST_VALUE}"
+echo "[phase4-worker] LOCAL_RUN_ROOT=${LOCAL_RUN_ROOT}"
 echo "[phase4-worker] PYTHON_BIN=${PYTHON_BIN} RANK=${RANK} WORLD_SIZE=${WORLD_SIZE} LOCAL_RANK=${LOCAL_RANK}"
 echo "[phase4-worker] NCCL_ALGO=${ALGO_SETTING} NCCL_PROTO=${PROTO_SETTING} STATUS_FILE=${STATUS_FILE}"
 echo "[phase4-worker] NCCL_DEBUG_FILE=${NCCL_DEBUG_FILE}"
@@ -295,7 +300,7 @@ timeout --signal=TERM --kill-after=30 "${MODE_TIMEOUT_SEC}" \
     --steps "${STEPS}" \
     --warmup-steps "${WARMUP_STEPS}" \
     --dtype "${DTYPE}" \
-    --output-dir "${RUN_ROOT}" \
+    --output-dir "${LOCAL_RUN_ROOT}" \
     --tag "${MODE_UPPER}" \
     --hidden-dim "${HIDDEN_DIM}" \
     --num-layers "${NUM_LAYERS}" \

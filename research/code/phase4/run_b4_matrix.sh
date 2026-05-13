@@ -490,8 +490,10 @@ write_pending_status() {
   local worker=$2
   local rank=$3
   local mode=$4
+  local status_tmp
   mkdir -p "$(dirname "${status_file}")"
-  cat > "${status_file}" <<EOF
+  status_tmp="${status_file}.$$.$RANDOM.tmp"
+  cat > "${status_tmp}" <<EOF
 status=9
 state=pending
 worker=${worker}
@@ -505,6 +507,7 @@ pid=
 updated_at=$(date +%s)
 message=pending
 EOF
+  mv -f "${status_tmp}" "${status_file}"
 }
 
 read_status_field() {
@@ -621,6 +624,54 @@ EOF
   cat <<EOF
 cd $(printf '%q' "${remote_repo_root}") && bash ./research/code/deploy/run_dev_container.sh bash -lc $(printf '%q' "${inner}")
 EOF
+}
+
+collect_worker_mode_outputs() {
+  local worker=$1
+  local repeat_label=$2
+  local mode_upper_value=$3
+  local mode_output_root=$4
+  local remote_repo_root
+  local inner
+  remote_repo_root=$(resolve_remote_repo_root "${worker}")
+  inner=$(cat <<EOF
+cd $(printf '%q' "${CONTAINER_REPO_ROOT}") && \
+RUN_ID=$(printf '%q' "${RUN_ID}") \
+REPEAT_LABEL=$(printf '%q' "${repeat_label}") \
+MODE_UPPER=$(printf '%q' "${mode_upper_value}") \
+MODE_OUTPUT_ROOT=$(printf '%q' "${mode_output_root}") \
+bash -lc $(printf '%q' '
+set -euo pipefail
+src="$HOME/hyoeun/temp/${RUN_ID}/${REPEAT_LABEL}/${MODE_UPPER}"
+dst="${MODE_OUTPUT_ROOT}"
+if [[ -d "${src}" ]]; then
+  mkdir -p "${dst}"
+  cp -a "${src}/." "${dst}/"
+  rm -rf "${src}"
+fi
+')
+EOF
+)
+  echo "[phase4-matrix] collect worker=${worker} repeat=${repeat_label} mode=${mode_upper_value}"
+  if [[ "${worker}" == "${MASTER_SERVER}" ]]; then
+    bash -lc "cd $(printf '%q' "${remote_repo_root}") && bash ./research/code/deploy/run_dev_container.sh bash -lc $(printf '%q' "${inner}")"
+  else
+    remote_worker_bash "${worker}" "cd $(printf '%q' "${remote_repo_root}") && bash ./research/code/deploy/run_dev_container.sh bash -lc $(printf '%q' "${inner}")"
+  fi
+}
+
+collect_repeat_outputs() {
+  local repeat_label=$1
+  local repeat_root=$2
+  local worker
+  local mode
+  local mode_upper_value
+  for worker in "${ALL_WORKER_ARRAY[@]}"; do
+    for mode in "${MODE_VALUES[@]}"; do
+      mode_upper_value=$(echo "${mode}" | tr '[:lower:]' '[:upper:]')
+      collect_worker_mode_outputs "${worker}" "${repeat_label}" "${mode_upper_value}" "${repeat_root}/${mode_upper_value}"
+    done
+  done
 }
 
 declare -A LAUNCH_PIDS=()
@@ -900,6 +951,7 @@ for repeat_idx in $(seq 1 "${REPEATS}"); do
     emit_switch_marker "mode_end" "run_id=${RUN_ID} repeat=${repeat_label} mode=${mode_upper_value} net_burst=${net_burst_value}"
   done
 
+  collect_repeat_outputs "${repeat_label}" "${repeat_root}"
   compare_outputs "${repeat_root}" "${repeat_root}/final_output_validation.json"
   summarize_nccl_events "${repeat_root}" "${repeat_root}/${SUMMARY_OUTPUT_NAME}"
 done
