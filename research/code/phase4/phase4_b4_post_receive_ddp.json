@@ -21,9 +21,9 @@
       "b4_w8"
     ],
     "repeats": 1,
-    "steps": 100,
+    "steps": 200,
     "warmup_steps": 5,
-    "mode_timeout_sec": 600,
+    "mode_timeout_sec": 1000,
     "torch_env": "/workspace/venvs/torch-cu121-custom/bin/activate",
     "target_script": "research/code/phase4/ddp_b4.py",
     "worker_script": "research/code/phase4/run_b4_mode_worker.sh",
