@@ -10,12 +10,8 @@
     "all_workers": [
       "worker01",
       "worker02",
-      "worker03",
-      "worker04",
-      "worker05",
       "worker06",
-      "worker07",
-      "worker08"
+      "worker07"
     ],
     "run_modes": [
       "stock",
