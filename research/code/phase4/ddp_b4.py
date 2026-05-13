@@ -87,6 +87,12 @@ def flatten_params(model: nn.Module) -> torch.Tensor:
     return torch.cat([p.detach().view(-1) for p in model.parameters()])
 
 
+def atomic_write_json(path: Path, payload: dict) -> None:
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
+
+
 def main() -> None:
     args = parse_args()
     dist.init_process_group(backend="nccl")
@@ -121,6 +127,7 @@ def main() -> None:
     step_timing_path = worker_dir / f"{run_tag}_worker_step_timing.jsonl" if worker_dir is not None else None
     validation_path = worker_dir / f"{run_tag}_rank_validation.json" if worker_dir is not None else None
     final_stage_path = worker_dir / f"{run_tag}_final_stage.json" if worker_dir is not None else None
+    progress_path = worker_dir / f"{run_tag}_progress.json" if worker_dir is not None else None
 
     if worker_dir is not None:
         worker_dir.mkdir(parents=True, exist_ok=True)
@@ -143,9 +150,33 @@ def main() -> None:
         row.update(extra)
         print(f"[phase4-ddp] {json.dumps(row, sort_keys=True)}", file=sys.stderr, flush=True)
         if final_stage_path is not None:
-            final_stage_path.write_text(json.dumps(row, indent=2, sort_keys=True), encoding="utf-8")
+            atomic_write_json(final_stage_path, row)
+
+    def progress_log(phase: str, step: int | None = None, **extra: object) -> None:
+        row = {
+            "ts_unix_ns": time.time_ns(),
+            "rank": rank,
+            "local_rank": local_rank,
+            "world_size": world_size,
+            "worker": worker_name,
+            "tag": run_tag,
+            "repeat_label": repeat_label,
+            "phase4_mode": phase4_mode,
+            "phase4_enable": phase4_enable,
+            "phase4_post_receive_w": phase4_post_receive_w,
+            "net_burst": net_burst,
+            "phase": phase,
+        }
+        if step is not None:
+            row["step"] = step
+            row["warmup"] = step < args.warmup_steps
+        row.update(extra)
+        print(f"[phase4-progress] {json.dumps(row, sort_keys=True)}", file=sys.stderr, flush=True)
+        if progress_path is not None:
+            atomic_write_json(progress_path, row)
 
     stage_log("startup")
+    progress_log("startup")
 
     model = TinyStack(hidden_dim=args.hidden_dim, num_layers=args.num_layers).to(device=device, dtype=dtype)
     ddp_model = DDP(
@@ -174,8 +205,10 @@ def main() -> None:
 
     records = []
     stage_log("before_startup_barrier")
+    progress_log("before_startup_barrier")
     dist.barrier()
     stage_log("after_startup_barrier")
+    progress_log("after_startup_barrier")
     handle = step_metrics_path.open("w", encoding="utf-8") if step_metrics_path is not None else None
     timing_handle = None
     if worker_dir is not None:
@@ -183,6 +216,7 @@ def main() -> None:
 
     try:
         for step in range(args.steps):
+            progress_log("step_begin", step=step)
             step_seed = 20260504 + step
             gen = torch.Generator(device=device)
             gen.manual_seed(step_seed)
@@ -195,21 +229,27 @@ def main() -> None:
             ts_start_unix_ns = time.time_ns()
             t0 = time.perf_counter()
 
+            progress_log("before_forward", step=step)
             fwd_t0 = time.perf_counter()
             outputs = ddp_model(inputs)
             loss = criterion(outputs, targets)
             torch.cuda.synchronize(device)
             fwd_t1 = time.perf_counter()
+            progress_log("after_forward", step=step, local_forward_ms=(fwd_t1 - fwd_t0) * 1000.0)
 
+            progress_log("before_backward", step=step)
             bwd_t0 = time.perf_counter()
             loss.backward()
             torch.cuda.synchronize(device)
             bwd_t1 = time.perf_counter()
+            progress_log("after_backward", step=step, local_backward_ms=(bwd_t1 - bwd_t0) * 1000.0)
 
+            progress_log("before_optimizer", step=step)
             opt_t0 = time.perf_counter()
             optimizer.step()
             torch.cuda.synchronize(device)
             opt_t1 = time.perf_counter()
+            progress_log("after_optimizer", step=step, local_optimizer_ms=(opt_t1 - opt_t0) * 1000.0)
 
             t1 = time.perf_counter()
             ts_end_unix_ns = time.time_ns()
@@ -294,6 +334,7 @@ def main() -> None:
                 }
                 timing_handle.write(json.dumps(timing_row, sort_keys=True) + "\n")
                 timing_handle.flush()
+            progress_log("step_complete", step=step, local_step_ms=local_ms)
     finally:
         if handle is not None:
             handle.close()
@@ -301,9 +342,11 @@ def main() -> None:
             timing_handle.close()
 
     stage_log("step_loop_complete", records=len(records))
+    progress_log("step_loop_complete", step=args.steps - 1 if args.steps > 0 else None, records=len(records))
 
     if validation_path is not None:
         stage_log("before_validation_write")
+        progress_log("before_validation_write")
         cpu_tensor = flatten_params(ddp_model.module).contiguous().cpu()
         tensor_bytes = cpu_tensor.numpy().tobytes()
         validation_row = {
@@ -333,9 +376,15 @@ def main() -> None:
             final_sha256=validation_row["final_sha256"],
             local_validation_passed=validation_row["local_validation_passed"],
         )
+        progress_log(
+            "after_validation_write",
+            final_sha256=validation_row["final_sha256"],
+            local_validation_passed=validation_row["local_validation_passed"],
+        )
 
     if rank == 0 and output_dir is not None:
         stage_log("before_summary_write")
+        progress_log("before_summary_write")
         effective = [r for r in records if not r["warmup"]]
         summary = {
             "run_tag": run_tag,
@@ -382,25 +431,33 @@ def main() -> None:
             "loss_p95": percentile([r["loss"] for r in effective], 0.95),
         }
         summary_path = output_dir / f"{run_tag}_summary.json"
-        summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+        atomic_write_json(summary_path, summary)
         stage_log("after_summary_write", summary_path=str(summary_path), effective_steps=len(effective))
+        progress_log("after_summary_write", summary_path=str(summary_path), effective_steps=len(effective))
 
     stage_log("before_final_barrier")
+    progress_log("before_final_barrier")
     try:
         dist.barrier()
     except Exception as exc:
         stage_log("final_barrier_failed", error=repr(exc))
+        progress_log("final_barrier_failed", error=repr(exc))
         raise
     stage_log("after_final_barrier")
+    progress_log("after_final_barrier")
 
     stage_log("before_destroy_process_group")
+    progress_log("before_destroy_process_group")
     try:
         dist.destroy_process_group()
     except Exception as exc:
         stage_log("destroy_process_group_failed", error=repr(exc))
+        progress_log("destroy_process_group_failed", error=repr(exc))
         raise
     stage_log("after_destroy_process_group")
+    progress_log("after_destroy_process_group")
     stage_log("before_python_exit")
+    progress_log("before_python_exit")
 
 
 if __name__ == "__main__":

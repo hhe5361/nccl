@@ -180,6 +180,30 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+progress_status_suffix() {
+  local progress_file="${LOCAL_RUN_ROOT}/${WORKER_NAME}/${MODE_UPPER}_progress.json"
+  if [[ ! -f "${progress_file}" ]]; then
+    return 0
+  fi
+  "${PYTHON_BIN}" - "${progress_file}" <<'PY' 2>/dev/null || true
+import json, sys
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+    row = json.load(f)
+parts = []
+phase = row.get("phase")
+step = row.get("step")
+if step is not None:
+    parts.append(f"step={step}")
+if phase:
+    parts.append(f"phase={phase}")
+local_step_ms = row.get("local_step_ms")
+if local_step_ms is not None:
+    parts.append(f"local_step_ms={local_step_ms:.3f}")
+print(" ".join(parts))
+PY
+}
+
 resolve_worker_ip() {
   local worker=$1
   awk -v target="${worker}" '
@@ -322,6 +346,10 @@ if (( RUN_RC == 124 )); then
   STATUS_MESSAGE=timeout
 else
   STATUS_MESSAGE=launcher_failed
+fi
+progress_suffix=$(progress_status_suffix)
+if [[ -n "${progress_suffix}" ]]; then
+  STATUS_MESSAGE="${STATUS_MESSAGE} ${progress_suffix}"
 fi
 echo "[phase4-worker] failure worker=${WORKER_NAME} mode=${MODE_UPPER} rc=${RUN_RC} message=${STATUS_MESSAGE}" >&2
 exit "${RUN_RC}"
