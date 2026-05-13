@@ -1,9 +1,9 @@
 {
-  "phase": "phase4",
-  "name": "b4_post_received_ddp_tiny",
-  "description": "Appendix-1 phase4 experiment with grouped recv path preserved, repeat support, and a probabilistic real-valued post-received < W gate.",
+  "phase": "phase5",
+  "name": "b4_post_received_delay_probe",
+  "description": "Phase5 experiment for validating E(t)=ts_net_done_ns-ts_data_post_ns against switch/NIC congestion signals.",
   "run": {
-    "run_id_prefix": "phase4_b4_ddp",
+    "run_id_prefix": "phase5_b4_ddp",
     "master_server": "worker01",
     "master_addr": "172.16.0.101",
     "master_port": 40100,
@@ -63,6 +63,7 @@
     "proto": "auto",
     "phase0_log": 1,
     "phase4_log": 0,
+    "phase5_log": 1,
     "appendix2_group_log": 0,
     "debug": "INFO",
     "debug_subsys": "NET",

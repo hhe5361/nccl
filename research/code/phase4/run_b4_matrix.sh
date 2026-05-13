@@ -29,6 +29,7 @@ if [[ ! -f "${CONFIG_PATH}" ]]; then
 fi
 
 SWITCH_LOGGER_ROOT=${SWITCH_LOGGER_ROOT:-/home/ubuntu/hyoeun/switch_setup_task/switch_congestion_logger}
+SWITCH_LOGGER_V2_SUBDIR=${SWITCH_LOGGER_V2_SUBDIR:-switch_congestion_logger_v2}
 SWITCH_LOG_INTERVAL_SEC=${SWITCH_LOG_INTERVAL_SEC:-1}
 SWITCH_LOG_SHARED_ROOT=${SWITCH_LOG_SHARED_ROOT:-/mnt/nfs_share/cts_experiments/switch_log}
 DPU_NODE_HOST=${DPU_NODE_HOST:-172.16.0.100}
@@ -101,6 +102,7 @@ pairs = {
     "CFG_NCCL_PROTO": nccl.get("proto", "auto"),
     "CFG_NCCL_PHASE0_LOG": nccl.get("phase0_log", 1),
     "CFG_NCCL_PHASE4_LOG": nccl.get("phase4_log", 0),
+    "CFG_NCCL_PHASE5_LOG": nccl.get("phase5_log", 0),
     "CFG_NCCL_PHASE6_LOG": nccl.get("phase6_log", 0),
     "CFG_NCCL_PHASE7_LOG": nccl.get("phase7_log", 0),
     "CFG_NCCL_PHASE7_BURST_FLOOR_POSTS": nccl.get("phase7_burst_floor_posts", 4),
@@ -160,6 +162,7 @@ NCCL_ALGO=${NCCL_ALGO:-${CFG_NCCL_ALGO}}
 NCCL_PROTO=${NCCL_PROTO:-${CFG_NCCL_PROTO}}
 NCCL_PHASE0_LOG=${NCCL_PHASE0_LOG:-${CFG_NCCL_PHASE0_LOG}}
 NCCL_PHASE4_LOG=${NCCL_PHASE4_LOG:-${CFG_NCCL_PHASE4_LOG}}
+NCCL_PHASE5_LOG=${NCCL_PHASE5_LOG:-${CFG_NCCL_PHASE5_LOG}}
 NCCL_PHASE6_LOG=${NCCL_PHASE6_LOG:-${CFG_NCCL_PHASE6_LOG}}
 NCCL_PHASE7_LOG=${NCCL_PHASE7_LOG:-${CFG_NCCL_PHASE7_LOG}}
 NCCL_PHASE7_BURST_FLOOR_POSTS=${NCCL_PHASE7_BURST_FLOOR_POSTS:-${CFG_NCCL_PHASE7_BURST_FLOOR_POSTS}}
@@ -244,12 +247,14 @@ start_switch_logger() {
     echo "[phase4-matrix] NETWORK_NODE_PASSWORD and SWITCH_PASSWORD must be set when switch logging is enabled." >&2
     exit 1
   fi
-  local cmd output
+  local cmd output switch_run_id switch_log_dir
+  switch_run_id=$(date -u +%Y%m%dT%H%M%SZ)
+  switch_log_dir="${SWITCH_LOG_SHARED_ROOT}/${switch_run_id}"
   cmd="cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && "
   if [[ -n "${NETWORK_NODE_PORT}" ]]; then
     cmd+="export NETWORK_NODE_PORT=$(printf '%q' "${NETWORK_NODE_PORT}") && "
   fi
-  cmd+="./start_switch_congestion_loggers.sh --interval-sec $(printf '%q' "${SWITCH_LOG_INTERVAL_SEC}") --network-node-password $(printf '%q' "${NETWORK_NODE_PASSWORD}") --switch-password $(printf '%q' "${SWITCH_PASSWORD}")"
+  cmd+="./${SWITCH_LOGGER_V2_SUBDIR}/start_switch_congestion_loggers.sh --interval-sec $(printf '%q' "${SWITCH_LOG_INTERVAL_SEC}") --network-node-password $(printf '%q' "${NETWORK_NODE_PASSWORD}") --switch-password $(printf '%q' "${SWITCH_PASSWORD}") --run-id $(printf '%q' "${switch_run_id}") --log-dir $(printf '%q' "${switch_log_dir}")"
   output=$(remote_dpu_bash "${cmd}")
   while IFS='=' read -r key value; do
     case "${key}" in
@@ -267,7 +272,7 @@ start_switch_logger() {
   SWITCH_LOG_LOCAL_DIR="${SWITCH_LOG_SHARED_ROOT}/${SWITCH_LOG_RUN_ID}"
   SWITCH_LOG_STARTED=1
   echo "[phase4-matrix] switch logger started run_id=${SWITCH_LOG_RUN_ID} local_dir=${SWITCH_LOG_LOCAL_DIR}"
-  remote_dpu_bash "cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && ./log_run_marker.sh --run-id $(printf '%q' "${SWITCH_LOG_RUN_ID}") --marker matrix_start --source phase4_matrix --message $(printf '%q' "run_id=${RUN_ID} net_burst=${NET_BURST}")" || true
+  remote_dpu_bash "cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && ./${SWITCH_LOGGER_V2_SUBDIR}/log_run_marker.sh --run-id $(printf '%q' "${SWITCH_LOG_RUN_ID}") --marker matrix_start --source phase4_matrix --message $(printf '%q' "run_id=${RUN_ID} net_burst=${NET_BURST}") --output-jsonl $(printf '%q' "${SWITCH_LOG_DIR}/markers.jsonl")" || true
   cat > "${LOG_ROOT}/switch_logger.env" <<EOF
 SWITCH_LOG_RUN_ID=${SWITCH_LOG_RUN_ID}
 SWITCH_LOG_DIR=${SWITCH_LOG_DIR}
@@ -282,8 +287,8 @@ stop_switch_logger() {
   if [[ "${SWITCH_LOG_STARTED}" != "1" ]]; then
     return 0
   fi
-  remote_dpu_bash "cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && ./log_run_marker.sh --run-id $(printf '%q' "${SWITCH_LOG_RUN_ID}") --marker matrix_end --source phase4_matrix --message $(printf '%q' "run_id=${RUN_ID} net_burst=${NET_BURST}")" || true
-  remote_dpu_bash "cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && ./stop_switch_congestion_loggers.sh --pid-file $(printf '%q' "${SWITCH_LOG_PID_FILE}")" || true
+  remote_dpu_bash "cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && ./${SWITCH_LOGGER_V2_SUBDIR}/log_run_marker.sh --run-id $(printf '%q' "${SWITCH_LOG_RUN_ID}") --marker matrix_end --source phase4_matrix --message $(printf '%q' "run_id=${RUN_ID} net_burst=${NET_BURST}") --output-jsonl $(printf '%q' "${SWITCH_LOG_DIR}/markers.jsonl")" || true
+  remote_dpu_bash "cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && ./${SWITCH_LOGGER_V2_SUBDIR}/stop_switch_congestion_loggers.sh --log-dir $(printf '%q' "${SWITCH_LOG_DIR}")" || true
   echo "[phase4-matrix] switch logger stopped run_id=${SWITCH_LOG_RUN_ID}"
 }
 
@@ -293,7 +298,7 @@ emit_switch_marker() {
   if [[ "${SWITCH_LOG_STARTED}" != "1" ]]; then
     return 0
   fi
-  remote_dpu_bash "cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && ./log_run_marker.sh --run-id $(printf '%q' "${SWITCH_LOG_RUN_ID}") --marker $(printf '%q' "${marker}") --source phase4_matrix --message $(printf '%q' "${message}")" || true
+  remote_dpu_bash "cd $(printf '%q' "${SWITCH_LOGGER_ROOT}") && ./${SWITCH_LOGGER_V2_SUBDIR}/log_run_marker.sh --run-id $(printf '%q' "${SWITCH_LOG_RUN_ID}") --marker $(printf '%q' "${marker}") --source phase4_matrix --message $(printf '%q' "${message}") --output-jsonl $(printf '%q' "${SWITCH_LOG_DIR}/markers.jsonl")" || true
 }
 
 resolve_worker_ssh_user() {
@@ -595,6 +600,7 @@ NCCL_ALGO=$(printf '%q' "${NCCL_ALGO}") \
 NCCL_PROTO=$(printf '%q' "${NCCL_PROTO}") \
 NCCL_PHASE0_LOG=$(printf '%q' "${NCCL_PHASE0_LOG}") \
 NCCL_PHASE4_LOG=$(printf '%q' "${NCCL_PHASE4_LOG}") \
+NCCL_PHASE5_LOG=$(printf '%q' "${NCCL_PHASE5_LOG}") \
 NCCL_PHASE6_LOG=$(printf '%q' "${NCCL_PHASE6_LOG}") \
 NCCL_PHASE7_LOG=$(printf '%q' "${NCCL_PHASE7_LOG}") \
 NCCL_PHASE7_BURST_FLOOR_POSTS=$(printf '%q' "${NCCL_PHASE7_BURST_FLOOR_POSTS}") \
