@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
@@ -14,12 +13,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-
-KV_RE = re.compile(r"([A-Za-z0-9_]+)=([^ ]+)")
 SWITCH_SHARED_ROOT_DEFAULT = Path("/mnt/nfs/cts_experiments/switch_log")
 SWITCH_SHARED_ROOT_FALLBACK = Path("/mnt/nfs_share/cts_experiments/switch_log")
 SWITCH_LABELS = ("rackA", "rackB", "spine")
 SWITCH_BUCKET_NS = 1_000_000_000
+PHASE0_EVENT_CACHE: dict[str, list["Phase0Event"]] = {}
 
 
 @dataclass
@@ -59,8 +57,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def parse_kv(line: str) -> dict[str, str]:
-    return {m.group(1): m.group(2) for m in KV_RE.finditer(line)}
+def _extract_field(line: str, key: str) -> Optional[str]:
+    needle = f"{key}="
+    start = line.find(needle)
+    if start < 0:
+        return None
+    start += len(needle)
+    end = line.find(" ", start)
+    if end < 0:
+        end = len(line)
+    return line[start:end]
 
 
 def discover_repeat_dirs(run_root: Path) -> list[Path]:
@@ -152,36 +158,42 @@ def _discover_nccl_logs(mode_dir: Path) -> list[Path]:
 
 
 def load_phase0_events(mode_dir: Path) -> list[Phase0Event]:
-    raw_rows: list[dict[str, str]] = []
+    cache_key = mode_dir.as_posix()
+    cached = PHASE0_EVENT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    events: list[Phase0Event] = []
+    base_ns: Optional[int] = None
     for log_path in _discover_nccl_logs(mode_dir):
         with log_path.open("r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
                 if "PHASE0 event=PROXY_RECV_" not in line:
                     continue
-                row = parse_kv(line)
-                event = row.get("event", "")
-                if row.get("tNs") is None or not event.startswith("PROXY_RECV_"):
+                event = _extract_field(line, "event")
+                t_ns_raw = _extract_field(line, "tNs")
+                if event is None or t_ns_raw is None or not event.startswith("PROXY_RECV_"):
                     continue
-                raw_rows.append(row)
-    if not raw_rows:
-        return []
-    base_ns = min(int(row["tNs"]) for row in raw_rows)
-    events: list[Phase0Event] = []
-    for row in sorted(raw_rows, key=lambda item: int(item["tNs"])):
-        t_ns = int(row["tNs"])
-        events.append(
-            Phase0Event(
-                event=row["event"],
-                t_ns=t_ns,
-                t_ms=(t_ns - base_ns) / 1e6,
-                size=int(row.get("size", "0")),
-                posted=int(row.get("posted", "0")),
-                received=int(row.get("received", "0")),
-                transmitted=int(row.get("transmitted", "0")),
-                done=int(row.get("done", "0")),
-                channel=int(row.get("channel", "0")),
-            )
-        )
+                try:
+                    t_ns = int(t_ns_raw)
+                except ValueError:
+                    continue
+                if base_ns is None:
+                    base_ns = t_ns
+                events.append(
+                    Phase0Event(
+                        event=event,
+                        t_ns=t_ns,
+                        t_ms=(t_ns - base_ns) / 1e6,
+                        size=int(_extract_field(line, "size") or "0"),
+                        posted=int(_extract_field(line, "posted") or "0"),
+                        received=int(_extract_field(line, "received") or "0"),
+                        transmitted=int(_extract_field(line, "transmitted") or "0"),
+                        done=int(_extract_field(line, "done") or "0"),
+                        channel=int(_extract_field(line, "channel") or "0"),
+                    )
+                )
+    PHASE0_EVENT_CACHE[cache_key] = events
     return events
 
 
