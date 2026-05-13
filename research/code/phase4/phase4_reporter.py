@@ -870,7 +870,7 @@ def load_grouped_sum_series(path: Path, field_names: Sequence[str]) -> list[tupl
 
 
 def load_congestion_bundle(run_root: Path) -> Optional[dict]:
-    congestion_bundle = load_congestion_bundle(run_root)
+    switch_bundle = load_switch_bundle(run_root)
     log_dir = switch_bundle["log_dir"] if switch_bundle else resolve_switch_log_dir(run_root)
     if log_dir is None or not log_dir.exists():
         return switch_bundle
@@ -1242,7 +1242,7 @@ def main() -> None:
     if not filtered_records_by_repeat_mode:
         raise FileNotFoundError(f"no *_step_metrics.jsonl found under {run_root}")
 
-    switch_bundle = load_switch_bundle(run_root)
+    congestion_bundle = load_congestion_bundle(run_root)
 
     repeat_sections: list[tuple[str, list[tuple[str, str]]]] = []
     for repeat_name, records_by_mode in filtered_records_by_repeat_mode.items():
@@ -1350,10 +1350,16 @@ def main() -> None:
         )
 
         repeat_dir = run_root / repeat_name if (run_root / repeat_name).exists() else run_root
-        post_ms_by_mode = {mode: load_post_timestamps_ms(repeat_dir / mode) for mode in records_by_mode.keys()}
         phase0_events_by_mode = {mode: load_phase0_events(repeat_dir / mode) for mode in records_by_mode.keys()}
+        post_ms_by_mode = {
+            mode: [event.t_ms for event in phase0_events_by_mode[mode] if event.event == "PROXY_RECV_POST"]
+            for mode in records_by_mode.keys()
+        }
         measured_netdone_by_mode = {
-            mode: filter_events_to_measured_steps(load_netdone_events(repeat_dir / mode), records_by_mode[mode])
+            mode: filter_events_to_measured_steps(
+                [event for event in phase0_events_by_mode[mode] if event.event == "PROXY_RECV_NET_DONE" and event.size > 0],
+                records_by_mode[mode],
+            )
             for mode in records_by_mode.keys()
         }
         plot_post_cumulative_overlay(

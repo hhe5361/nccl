@@ -277,7 +277,7 @@ start_switch_logger() {
   SWITCH_LOG_LOCAL_DIR="${SWITCH_LOG_SHARED_ROOT}/${SWITCH_LOG_RUN_ID}"
   SWITCH_LOG_STARTED=1
   echo "[phase4-matrix] switch logger started run_id=${SWITCH_LOG_RUN_ID} local_dir=${SWITCH_LOG_LOCAL_DIR}"
-  remote_dpu_bash "cd $(printf '%q' "${switch_logger_dir}") && ./log_run_marker.sh --output-jsonl $(printf '%q' "${SWITCH_LOG_MARKERS_JSONL}") --marker matrix_start --source phase4_matrix --message $(printf '%q' "run_id=${RUN_ID} net_burst=${NET_BURST}")" || true
+  remote_dpu_bash "cd $(printf '%q' "${switch_logger_dir}") && ./log_run_marker.sh --run-id $(printf '%q' "${SWITCH_LOG_RUN_ID}") --output-jsonl $(printf '%q' "${SWITCH_LOG_MARKERS_JSONL}") --marker matrix_start --source phase4_matrix --message $(printf '%q' "run_id=${RUN_ID} net_burst=${NET_BURST}")" || true
   cat > "${LOG_ROOT}/switch_logger.env" <<EOF
 SWITCH_LOG_RUN_ID=${SWITCH_LOG_RUN_ID}
 SWITCH_LOG_DIR=${SWITCH_LOG_DIR}
@@ -296,7 +296,7 @@ stop_switch_logger() {
   fi
   local switch_logger_dir
   switch_logger_dir=$(switch_logger_dir_on_dpu)
-  remote_dpu_bash "cd $(printf '%q' "${switch_logger_dir}") && ./log_run_marker.sh --output-jsonl $(printf '%q' "${SWITCH_LOG_MARKERS_JSONL}") --marker matrix_end --source phase4_matrix --message $(printf '%q' "run_id=${RUN_ID} net_burst=${NET_BURST}")" || true
+  remote_dpu_bash "cd $(printf '%q' "${switch_logger_dir}") && ./log_run_marker.sh --run-id $(printf '%q' "${SWITCH_LOG_RUN_ID}") --output-jsonl $(printf '%q' "${SWITCH_LOG_MARKERS_JSONL}") --marker matrix_end --source phase4_matrix --message $(printf '%q' "run_id=${RUN_ID} net_burst=${NET_BURST}")" || true
   remote_dpu_bash "cd $(printf '%q' "${switch_logger_dir}") && ./stop_switch_congestion_loggers.sh --pid-file $(printf '%q' "${SWITCH_LOG_PID_FILE}")" || true
   echo "[phase4-matrix] switch logger stopped run_id=${SWITCH_LOG_RUN_ID}"
 }
@@ -309,7 +309,7 @@ emit_switch_marker() {
     return 0
   fi
   switch_logger_dir=$(switch_logger_dir_on_dpu)
-  remote_dpu_bash "cd $(printf '%q' "${switch_logger_dir}") && ./log_run_marker.sh --output-jsonl $(printf '%q' "${SWITCH_LOG_MARKERS_JSONL}") --marker $(printf '%q' "${marker}") --source phase4_matrix --message $(printf '%q' "${message}")" || true
+  remote_dpu_bash "cd $(printf '%q' "${switch_logger_dir}") && ./log_run_marker.sh --run-id $(printf '%q' "${SWITCH_LOG_RUN_ID}") --output-jsonl $(printf '%q' "${SWITCH_LOG_MARKERS_JSONL}") --marker $(printf '%q' "${marker}") --source phase4_matrix --message $(printf '%q' "${message}")" || true
 }
 
 resolve_worker_ssh_user() {
