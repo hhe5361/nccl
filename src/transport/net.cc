@@ -184,9 +184,9 @@ NCCL_PARAM(Phase6Log, "PHASE6_LOG", 0);
 NCCL_PARAM(Phase6EpochMs, "PHASE6_EPOCH_MS", 5);
 NCCL_PARAM(Phase6MinSamples, "PHASE6_MIN_SAMPLES", 4);
 NCCL_PARAM(Phase6WarmupEpochs, "PHASE6_WARMUP_EPOCHS", 1);
-NCCL_PARAM(Phase6CooldownEpochs, "PHASE6_COOLDOWN_EPOCHS", 1);
-NCCL_PARAM(Phase6StableEpochs, "PHASE6_STABLE_EPOCHS", 3);
-NCCL_PARAM(Phase6ThresholdHighPct, "PHASE6_THRESHOLD_HIGH_PCT", 50);
+NCCL_PARAM(Phase6CooldownEpochs, "PHASE6_COOLDOWN_EPOCHS", 2);
+NCCL_PARAM(Phase6StableEpochs, "PHASE6_STABLE_EPOCHS", 5);
+NCCL_PARAM(Phase6ThresholdHighPct, "PHASE6_THRESHOLD_HIGH_PCT", 100);
 NCCL_PARAM(Phase6ThresholdLowPct, "PHASE6_THRESHOLD_LOW_PCT", 15);
 NCCL_PARAM(Phase6ThroughputLowPct, "PHASE6_THROUGHPUT_LOW_PCT", 85);
 NCCL_PARAM(Phase6WstallHighPct, "PHASE6_WSTALL_HIGH_PCT", 20);
@@ -874,7 +874,7 @@ static inline double phase6CtrlWMax(int wBase) {
 }
 
 static inline double phase6CtrlWStep() {
-  return phase6EnvDouble("NCCL_PHASE6_W_STEP", 0.2, 0.001);
+  return phase6EnvDouble("NCCL_PHASE6_W_STEP", 0.4, 0.001);
 }
 
 static inline double phase6CtrlKp() {

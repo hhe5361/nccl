@@ -4,6 +4,7 @@ import csv
 import html
 import math
 import re
+import subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -70,24 +71,63 @@ def finite(values):
 
 def load_ctrl_epochs(input_dir: Path) -> list[dict]:
     rows = []
-    for log_path in sorted(input_dir.glob("repeat_*/*/*/nccl.*.log")):
+    matches = load_ctrl_epoch_lines_with_rg(input_dir)
+    if matches is None:
+        matches = load_ctrl_epoch_lines_with_python(input_dir)
+
+    for log_path, line in matches:
         parts = log_path.relative_to(input_dir).parts
         if len(parts) < 4:
             continue
         repeat, mode, worker = parts[:3]
-        with log_path.open("r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if "PHASE6 event=CTRL_EPOCH" not in line:
-                    continue
-                row = parse_pairs(line)
-                row["repeat"] = repeat
-                row["mode"] = mode
-                row["worker"] = worker
-                row["source"] = str(log_path)
-                rows.append(row)
+        row = parse_pairs(line)
+        row["repeat"] = repeat
+        row["mode"] = mode
+        row["worker"] = worker
+        row["source"] = str(log_path)
+        rows.append(row)
     rows.sort(key=lambda r: (r["repeat"], r["mode"], r["worker"], to_float(r.get("tNs"), 0.0)))
     add_relative_times(rows)
     return rows
+
+
+def load_ctrl_epoch_lines_with_rg(input_dir: Path) -> list[tuple[Path, str]] | None:
+    log_paths = sorted(input_dir.glob("repeat_*/P6*/*/nccl.*.log"))
+    if not log_paths:
+        log_paths = sorted(input_dir.glob("repeat_*/*/*/nccl.*.log"))
+    cmd = [
+        "rg",
+        "--fixed-strings",
+        "--no-heading",
+        "--with-filename",
+        "--line-number",
+        "--threads",
+        "4",
+        "PHASE6 event=CTRL_EPOCH",
+        *[str(p) for p in log_paths],
+    ]
+    try:
+        proc = subprocess.run(cmd, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        return None
+    if proc.returncode not in (0, 1):
+        return None
+
+    matches = []
+    for out_line in proc.stdout.splitlines():
+        path_str, _line_no, line = out_line.split(":", 2)
+        matches.append((Path(path_str), line))
+    return matches
+
+
+def load_ctrl_epoch_lines_with_python(input_dir: Path) -> list[tuple[Path, str]]:
+    matches = []
+    for log_path in sorted(input_dir.glob("repeat_*/*/*/nccl.*.log")):
+        with log_path.open("r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if "PHASE6 event=CTRL_EPOCH" in line:
+                    matches.append((log_path, line))
+    return matches
 
 
 def add_relative_times(rows: list[dict]) -> None:
@@ -237,10 +277,31 @@ def action_marks(ax, rows: list[dict], y_min=None, y_max=None):
     colors = {"decrease": "#d62728", "increase": "#2ca02c", "baseline_ready": "#9467bd"}
     for action, color in colors.items():
         xs = [r["modeRelTimeS"] for r in rows if r.get("action") == action]
+        xs = downsample_values(xs, 200)
         for x in xs:
             ax.axvline(x, color=color, alpha=0.18, linewidth=1)
     if y_min is not None and y_max is not None:
         ax.set_ylim(y_min, y_max)
+
+
+def downsample_rows(rows: list[dict], limit: int = 5000) -> list[dict]:
+    if len(rows) <= limit:
+        return rows
+    step = max(1, len(rows) // limit)
+    sampled = rows[::step]
+    if sampled[-1] is not rows[-1]:
+        sampled.append(rows[-1])
+    return sampled
+
+
+def downsample_values(values: list[float], limit: int = 5000) -> list[float]:
+    if len(values) <= limit:
+        return values
+    step = max(1, len(values) // limit)
+    sampled = values[::step]
+    if sampled[-1] != values[-1]:
+        sampled.append(values[-1])
+    return sampled
 
 
 def plot_repeat_panel(rows: list[dict], repeat: str, output_dir: Path) -> Path | None:
@@ -252,17 +313,18 @@ def plot_repeat_panel(rows: list[dict], repeat: str, output_dir: Path) -> Path |
     fig, axes = plt.subplots(5, 1, figsize=(18, 16), sharex=False)
     for mode in modes:
         mode_rows = sorted([r for r in repeat_rows if r["mode"] == mode], key=lambda r: r["modeRelTimeS"])
-        xs = [r["modeRelTimeS"] for r in mode_rows]
-        axes[0].plot(xs, [r.get("wAfter") for r in mode_rows], marker="o", markersize=2, linewidth=1, label=mode)
-        axes[1].plot(xs, [to_float(r.get("delayMeanNs")) / 1e6 for r in mode_rows], linewidth=1, label=f"{mode} mean")
-        axes[1].plot(xs, [to_float(r.get("delayMaxNs")) / 1e6 for r in mode_rows], linestyle="--", linewidth=1, label=f"{mode} max")
-        axes[2].plot(xs, [r.get("eDelay") for r in mode_rows], linewidth=1, label=f"{mode} eDelay")
-        axes[2].plot(xs, [r.get("eTrend") for r in mode_rows], linestyle="--", linewidth=1, label=f"{mode} eTrend")
-        axes[2].plot(xs, [r.get("eThroughput") for r in mode_rows], linestyle=":", linewidth=1, label=f"{mode} eThroughput")
-        axes[3].plot(xs, [r.get("gbpsFast") for r in mode_rows], linewidth=1, label=f"{mode} fast")
-        axes[3].plot(xs, [r.get("gbpsBaseline") for r in mode_rows], linestyle="--", linewidth=1, label=f"{mode} baseline")
-        axes[4].plot(xs, [r.get("u") for r in mode_rows], linewidth=1, label=f"{mode} u")
-        axes[4].plot(xs, [r.get("wstallRatio") for r in mode_rows], linestyle="--", linewidth=1, label=f"{mode} wstallRatio")
+        plot_rows = downsample_rows(mode_rows)
+        xs = [r["modeRelTimeS"] for r in plot_rows]
+        axes[0].plot(xs, [r.get("wAfter") for r in plot_rows], marker="o", markersize=2, linewidth=1, label=mode)
+        axes[1].plot(xs, [to_float(r.get("delayMeanNs")) / 1e6 for r in plot_rows], linewidth=1, label=f"{mode} mean")
+        axes[1].plot(xs, [to_float(r.get("delayMaxNs")) / 1e6 for r in plot_rows], linestyle="--", linewidth=1, label=f"{mode} max")
+        axes[2].plot(xs, [r.get("eDelay") for r in plot_rows], linewidth=1, label=f"{mode} eDelay")
+        axes[2].plot(xs, [r.get("eTrend") for r in plot_rows], linestyle="--", linewidth=1, label=f"{mode} eTrend")
+        axes[2].plot(xs, [r.get("eThroughput") for r in plot_rows], linestyle=":", linewidth=1, label=f"{mode} eThroughput")
+        axes[3].plot(xs, [r.get("gbpsFast") for r in plot_rows], linewidth=1, label=f"{mode} fast")
+        axes[3].plot(xs, [r.get("gbpsBaseline") for r in plot_rows], linestyle="--", linewidth=1, label=f"{mode} baseline")
+        axes[4].plot(xs, [r.get("u") for r in plot_rows], linewidth=1, label=f"{mode} u")
+        axes[4].plot(xs, [r.get("wstallRatio") for r in plot_rows], linestyle="--", linewidth=1, label=f"{mode} wstallRatio")
         for ax in axes:
             action_marks(ax, mode_rows)
 
@@ -294,6 +356,7 @@ def plot_repeat_overlay(rows: list[dict], output_dir: Path) -> list[Path]:
         fig, axes = plt.subplots(3, 1, figsize=(18, 12), sharex=False)
         for repeat in repeats:
             group = sorted([r for r in mode_rows if r["repeat"] == repeat], key=lambda r: r["modeRelTimeS"])
+            group = downsample_rows(group)
             xs = [r["modeRelTimeS"] for r in group]
             axes[0].plot(xs, [r.get("wAfter") for r in group], linewidth=1, label=repeat)
             axes[1].plot(xs, [to_float(r.get("delayMeanNs")) / 1e6 for r in group], linewidth=1, label=repeat)
