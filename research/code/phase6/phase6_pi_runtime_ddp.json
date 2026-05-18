@@ -17,8 +17,8 @@
       "stock",
       "p6_spike"
     ],
-    "repeats": 3,
-    "steps": 200,
+    "repeats": 2,
+    "steps": 300,
     "warmup_steps": 20,
     "mode_timeout_sec": 1000,
     "mode_delay_sec": 180,

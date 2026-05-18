@@ -64,6 +64,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--bucket-ms", type=float, default=1000.0, help="Network bucket width in ms")
     parser.add_argument("--event-window-sec", type=float, default=2.0, help="Before/after window around W adjustment events")
     parser.add_argument(
+        "--event-plot-window-sec",
+        type=float,
+        default=5.0,
+        help="Event-centered plot window on each side of a W adjustment event",
+    )
+    parser.add_argument("--max-event-plots", type=int, default=80, help="Maximum number of event-centered plots to write")
+    parser.add_argument(
         "--workers",
         default="worker01",
         help="Comma-separated worker directory names to scan for NCCL logs. Default: worker01",
@@ -102,6 +109,18 @@ def to_float(value, default=math.nan) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def finite(values: Iterable[float]) -> list[float]:
+    return [value for value in values if isinstance(value, (int, float)) and math.isfinite(value)]
+
+
+def percentile(values: Iterable[float], pct: float) -> float:
+    vals = sorted(finite(values))
+    if not vals:
+        return math.nan
+    idx = min(len(vals) - 1, max(0, int(round((pct / 100.0) * (len(vals) - 1)))))
+    return vals[idx]
 
 
 def parse_pairs(line: str) -> dict:
@@ -391,6 +410,97 @@ def downsample(rows: list[dict], limit: int = 6000) -> list[dict]:
     return sampled
 
 
+def bucket_ctrl_rows(rows: list[dict], start_ns: int, end_ns: int, bucket_ms: float) -> list[dict]:
+    if not rows or end_ns <= start_ns:
+        return []
+    bucket_ns = max(1, int(bucket_ms * 1_000_000.0))
+    buckets: dict[int, list[dict]] = defaultdict(list)
+    for row in rows:
+        t_ns = int(to_float(row.get("tNs")))
+        if t_ns < start_ns or t_ns > end_ns:
+            continue
+        bucket_idx = max(0, int((t_ns - start_ns) // bucket_ns))
+        buckets[bucket_idx].append(row)
+
+    out: list[dict] = []
+    last_idx = max(0, int(math.ceil((end_ns - start_ns) / bucket_ns)))
+    for idx in range(last_idx):
+        group = buckets.get(idx, [])
+        bucket_start_ns = start_ns + idx * bucket_ns
+        bucket_end_ns = min(end_ns, bucket_start_ns + bucket_ns)
+        rel_mid_s = ((bucket_start_ns + bucket_end_ns) / 2.0 - start_ns) / 1_000_000_000.0
+        delays = [to_float(r.get("delayMeanNs")) / 1e6 for r in group]
+        delay_max = [to_float(r.get("delayMaxNs")) / 1e6 for r in group]
+        w_vals = [to_float(r.get("wAfter")) for r in group]
+        e_vals = [to_float(r.get("e")) for r in group]
+        wstall_vals = [to_float(r.get("wstallRatio")) for r in group]
+        out.append(
+            {
+                "rel_mid_s": rel_mid_s,
+                "bucket_start_ns": bucket_start_ns,
+                "bucket_end_ns": bucket_end_ns,
+                "samples": len(group),
+                "delay_p50_ms": percentile(delays, 50),
+                "delay_p95_ms": percentile(delays, 95),
+                "delay_p99_ms": percentile(delays, 99),
+                "delay_mean_max_ms": max(finite(delays), default=math.nan),
+                "delay_max_peak_ms": max(finite(delay_max), default=math.nan),
+                "w_min": min(finite(w_vals), default=math.nan),
+                "w_max": max(finite(w_vals), default=math.nan),
+                "e_max": max(finite(e_vals), default=math.nan),
+                "wstall_max": max(finite(wstall_vals), default=math.nan),
+                "decrease_count": sum(1 for r in group if r.get("action") == "decrease"),
+                "increase_count": sum(1 for r in group if r.get("action") == "increase"),
+            }
+        )
+    return out
+
+
+def write_bucket_csv(
+    groups: dict[tuple[str, str], list[dict]],
+    switch: Optional[dict],
+    output_dir: Path,
+    bucket_ms: float,
+) -> Path:
+    path = output_dir / "phase6_bucket_metrics.csv"
+    fields = [
+        "repeat",
+        "mode",
+        "rel_mid_s",
+        "samples",
+        "delay_p50_ms",
+        "delay_p95_ms",
+        "delay_p99_ms",
+        "delay_mean_max_ms",
+        "delay_max_peak_ms",
+        "w_min",
+        "w_max",
+        "e_max",
+        "wstall_max",
+        "decrease_count",
+        "increase_count",
+        "pfc_delta",
+        "ecn_delta",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        for (repeat, mode), rows in sorted(groups.items()):
+            ctrl_start_ns, switch_start_ns, switch_end_ns, _marker_aligned = aligned_switch_window(repeat, mode, rows, switch)
+            ctrl_end_ns = int(max(to_float(r.get("tNs")) for r in rows))
+            buckets = bucket_ctrl_rows(rows, ctrl_start_ns, ctrl_end_ns, bucket_ms)
+            switch_pfc = bucket_delta(switch["total_pfc"], switch_start_ns, switch_end_ns, bucket_ms) if switch else []
+            switch_ecn = bucket_delta(switch["spine_ecn"], switch_start_ns, switch_end_ns, bucket_ms) if switch else []
+            for idx, bucket in enumerate(buckets):
+                out = {key: bucket.get(key, "") for key in fields}
+                out["repeat"] = repeat
+                out["mode"] = mode
+                out["pfc_delta"] = switch_pfc[idx][1] if idx < len(switch_pfc) else 0.0
+                out["ecn_delta"] = switch_ecn[idx][1] if idx < len(switch_ecn) else 0.0
+                writer.writerow(out)
+    return path
+
+
 def plot_group(repeat: str, mode: str, rows: list[dict], switch: Optional[dict], output_dir: Path, bucket_ms: float) -> str:
     start_ns, switch_start_ns, switch_end_ns, marker_aligned = aligned_switch_window(repeat, mode, rows, switch)
     plot_rows = downsample(rows)
@@ -443,6 +553,151 @@ def plot_group(repeat: str, mode: str, rows: list[dict], switch: Optional[dict],
     fig.suptitle(f"{repeat} {mode}: Phase6 W Adjustment vs Network Congestion ({alignment})")
     fig.tight_layout()
     name = f"{repeat}_{mode}_w_network_overlay.png"
+    fig.savefig(output_dir / name, dpi=150)
+    plt.close(fig)
+    return name
+
+
+def plot_bucket_group(
+    repeat: str,
+    mode: str,
+    rows: list[dict],
+    switch: Optional[dict],
+    output_dir: Path,
+    bucket_ms: float,
+) -> str:
+    start_ns, switch_start_ns, switch_end_ns, marker_aligned = aligned_switch_window(repeat, mode, rows, switch)
+    end_ns = int(max(to_float(r.get("tNs")) for r in rows))
+    buckets = bucket_ctrl_rows(rows, start_ns, end_ns, bucket_ms)
+    if not buckets:
+        return ""
+    xs = [b["rel_mid_s"] for b in buckets]
+    decrease_rows = [r for r in rows if r.get("action") == "decrease"]
+    increase_rows = [r for r in rows if r.get("action") == "increase"]
+
+    fig, axes = plt.subplots(5, 1, figsize=(18, 16), sharex=False)
+    axes[0].plot(xs, [b["delay_p50_ms"] for b in buckets], label="POST-DONE p50", color="#9ca3af", linewidth=1.0)
+    axes[0].plot(xs, [b["delay_p95_ms"] for b in buckets], label="POST-DONE p95", color="#f97316", linewidth=1.0)
+    axes[0].plot(xs, [b["delay_p99_ms"] for b in buckets], label="POST-DONE p99", color="#dc2626", linewidth=1.2)
+    axes[0].plot(xs, [b["delay_mean_max_ms"] for b in buckets], label="POST-DONE mean max", color="#7f1d1d", linewidth=0.9, alpha=0.75)
+    axes[0].set_ylabel("POST-DONE ms")
+    axes[0].legend(loc="upper right")
+
+    axes[1].plot(xs, [b["w_min"] for b in buckets], label="W min", color="#1d4ed8")
+    axes[1].plot(xs, [b["w_max"] for b in buckets], label="W max", color="#60a5fa", alpha=0.8)
+    axes[1].bar(xs, [b["decrease_count"] for b in buckets], width=bucket_ms / 1000.0 * 0.8, label="W decrease count", color="#ef4444", alpha=0.35)
+    axes[1].set_ylabel("W / events")
+    axes[1].legend(loc="upper right")
+
+    axes[2].plot(xs, [b["e_max"] for b in buckets], label="spike e max", color="#f59e0b")
+    axes[2].plot(xs, [b["wstall_max"] for b in buckets], label="wstallRatio max", color="#16a34a")
+    axes[2].set_ylabel("Controller signal")
+    axes[2].legend(loc="upper right")
+
+    if switch:
+        total_pfc = bucket_delta(switch["total_pfc"], switch_start_ns, switch_end_ns, bucket_ms)
+        spine_ecn = bucket_delta(switch["spine_ecn"], switch_start_ns, switch_end_ns, bucket_ms)
+        if total_pfc:
+            axes[3].plot([x for x, _ in total_pfc], [y for _, y in total_pfc], label="total PFC delta/bucket", color="#111827")
+        if spine_ecn:
+            axes[3].plot([x for x, _ in spine_ecn], [y for _, y in spine_ecn], label="spine ECN delta/bucket", color="#8c564b")
+    axes[3].set_ylabel("Switch delta")
+    axes[3].legend(loc="upper right")
+
+    if switch:
+        total_pfc = bucket_delta(switch["total_pfc"], switch_start_ns, switch_end_ns, bucket_ms)
+        pfc_vals = [y for _, y in total_pfc[: len(buckets)]]
+        delay_vals = [b["delay_p99_ms"] for b in buckets[: len(pfc_vals)]]
+        axes[4].scatter(pfc_vals, delay_vals, s=18, alpha=0.65, color="#4b5563")
+        axes[4].set_xlabel("PFC delta / bucket")
+        axes[4].set_ylabel("POST-DONE p99 ms")
+    else:
+        axes[4].set_ylabel("PFC unavailable")
+
+    for ax in axes[:4]:
+        for row in decrease_rows:
+            x = (to_float(row.get("tNs")) - start_ns) / 1_000_000_000.0
+            ax.axvline(x, color="#b91c1c", alpha=0.22, linewidth=1.2)
+        for row in increase_rows:
+            x = (to_float(row.get("tNs")) - start_ns) / 1_000_000_000.0
+            ax.axvline(x, color="#047857", alpha=0.22, linewidth=1.2)
+        ax.grid(True, alpha=0.25)
+    axes[4].grid(True, alpha=0.25)
+
+    axes[3].set_xlabel("Time since P6 CTRL_EPOCH start (s)")
+    alignment = "switch mode_start aligned" if marker_aligned else "not switch-aligned"
+    fig.suptitle(f"{repeat} {mode}: Bucketed POST-DONE/W vs PFC ({bucket_ms:g} ms, {alignment})")
+    fig.tight_layout()
+    name = f"{repeat}_{mode}_bucketed_w_pfc_delay.png"
+    fig.savefig(output_dir / name, dpi=150)
+    plt.close(fig)
+    return name
+
+
+def plot_event_centered(
+    repeat: str,
+    mode: str,
+    rows: list[dict],
+    event_row: dict,
+    event_idx: int,
+    switch: Optional[dict],
+    output_dir: Path,
+    bucket_ms: float,
+    window_sec: float,
+) -> str:
+    event_ns = int(to_float(event_row.get("tNs")))
+    window_ns = int(window_sec * 1_000_000_000.0)
+    channel = event_row.get("channel")
+    worker = event_row.get("worker")
+    local_rows = [
+        r
+        for r in rows
+        if r.get("worker") == worker
+        and r.get("channel") == channel
+        and event_ns - window_ns <= int(to_float(r.get("tNs"))) <= event_ns + window_ns
+    ]
+    if not local_rows:
+        return ""
+    xs = [(to_float(r.get("tNs")) - event_ns) / 1_000_000_000.0 for r in local_rows]
+    ctrl_start_ns, switch_start_ns, _switch_end_ns, marker_aligned = aligned_switch_window(repeat, mode, rows, switch)
+    aligned_event_ns = switch_start_ns + (event_ns - ctrl_start_ns) if marker_aligned else event_ns
+
+    fig, axes = plt.subplots(4, 1, figsize=(16, 12), sharex=True)
+    axes[0].plot(xs, [to_float(r.get("delayMeanNs")) / 1e6 for r in local_rows], label="delayMean ms", color="#dc2626")
+    axes[0].plot(xs, [to_float(r.get("delaySlowNs")) / 1e6 for r in local_rows], label="delaySlow ms", color="#7c3aed", alpha=0.8)
+    axes[0].set_ylabel("POST-DONE ms")
+    axes[0].legend(loc="upper right")
+
+    axes[1].plot(xs, [to_float(r.get("wAfter")) for r in local_rows], label="W", color="#2563eb")
+    axes[1].set_ylabel("W")
+    axes[1].legend(loc="upper right")
+
+    axes[2].plot(xs, [to_float(r.get("e")) for r in local_rows], label="spike e", color="#f59e0b")
+    axes[2].plot(xs, [to_float(r.get("wstallRatio")) for r in local_rows], label="wstallRatio", color="#16a34a")
+    axes[2].set_ylabel("Controller")
+    axes[2].legend(loc="upper right")
+
+    if switch:
+        pfc = bucket_delta(switch["total_pfc"], aligned_event_ns - window_ns, aligned_event_ns + window_ns, bucket_ms)
+        ecn = bucket_delta(switch["spine_ecn"], aligned_event_ns - window_ns, aligned_event_ns + window_ns, bucket_ms)
+        if pfc:
+            axes[3].plot([x - window_sec for x, _ in pfc], [y for _, y in pfc], label="total PFC delta/bucket", color="#111827")
+        if ecn:
+            axes[3].plot([x - window_sec for x, _ in ecn], [y for _, y in ecn], label="spine ECN delta/bucket", color="#8c564b")
+    axes[3].set_ylabel("Switch delta")
+    axes[3].legend(loc="upper right")
+
+    for ax in axes:
+        ax.axvline(0.0, color="#b91c1c", linewidth=1.5, alpha=0.75, label="_nolegend_")
+        ax.grid(True, alpha=0.25)
+    axes[-1].set_xlabel("Time relative to W decrease event (s)")
+    fig.suptitle(
+        f"{repeat} {mode} event {event_idx:03d}: W {event_row.get('wBefore')} -> {event_row.get('wAfter')} "
+        f"worker={worker} channel={channel}"
+    )
+    fig.tight_layout()
+    safe_channel = str(channel).replace(".", "_")
+    name = f"{repeat}_{mode}_event_{event_idx:03d}_{worker}_ch{safe_channel}_centered.png"
     fig.savefig(output_dir / name, dpi=150)
     plt.close(fig)
     return name
@@ -518,10 +773,23 @@ def write_event_csv(groups: dict[tuple[str, str], list[dict]], switch: Optional[
     return path
 
 
-def write_html(output_dir: Path, image_names: list[str], event_csv: Path, switch: Optional[dict]) -> Path:
+def write_html(
+    output_dir: Path,
+    raw_images: list[str],
+    bucket_images: list[str],
+    event_images: list[str],
+    event_csv: Path,
+    bucket_csv: Path,
+    switch: Optional[dict],
+) -> Path:
     path = output_dir / "phase6_network_overlay_report.html"
     switch_msg = f"switch_log_dir={html.escape(str(switch['log_dir']))}" if switch else "switch_log_dir=not found"
-    images = "\n".join(f"<h2>{html.escape(name)}</h2><img src='{html.escape(name)}'>" for name in image_names)
+    def image_section(title: str, names: list[str]) -> str:
+        if not names:
+            return ""
+        images = "\n".join(f"<h3>{html.escape(name)}</h3><img src='{html.escape(name)}'>" for name in names)
+        return f"<h2>{html.escape(title)}</h2>\n{images}"
+
     path.write_text(
         f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Phase6 Network Overlay</title>
@@ -532,8 +800,11 @@ code {{ background: #eef2f7; padding: 2px 5px; border-radius: 4px; }}
 </style></head><body>
 <h1>Phase6 W Adjustment vs Network Congestion</h1>
 <p><code>{switch_msg}</code></p>
-<p>Red vertical lines are W decrease events. Green vertical lines are W increase events. Switch metrics are aligned with <code>mode_start</code> markers from <code>markers.jsonl</code>. Event before/after network deltas are in <code>{html.escape(event_csv.name)}</code>.</p>
-{images}
+<p>Red vertical lines are W decrease events. Green vertical lines are W increase events. Switch metrics are aligned with <code>mode_start</code> markers from <code>markers.jsonl</code>.</p>
+<p>Bucket metrics are in <code>{html.escape(bucket_csv.name)}</code>. Event before/after network deltas are in <code>{html.escape(event_csv.name)}</code>.</p>
+{image_section("Bucketed Timeline: POST-DONE p99/max, W, PFC", bucket_images)}
+{image_section("Event-Centered W Decrease Windows", event_images)}
+{image_section("Raw Timeline", raw_images)}
 </body></html>
 """,
         encoding="utf-8",
@@ -552,12 +823,43 @@ def main() -> None:
     groups = group_rows(rows)
     switch = load_switch_bundle(run_root)
     event_csv = write_event_csv(groups, switch, output_dir, args.event_window_sec)
-    image_names = [
+    bucket_csv = write_bucket_csv(groups, switch, output_dir, args.bucket_ms)
+    raw_images = [
         plot_group(repeat, mode, group, switch, output_dir, args.bucket_ms)
         for (repeat, mode), group in sorted(groups.items())
         if group
     ]
-    html_path = write_html(output_dir, image_names, event_csv, switch)
+    bucket_images = [
+        plot_bucket_group(repeat, mode, group, switch, output_dir, args.bucket_ms)
+        for (repeat, mode), group in sorted(groups.items())
+        if group
+    ]
+    bucket_images = [name for name in bucket_images if name]
+
+    event_images: list[str] = []
+    event_count = 0
+    for (repeat, mode), group in sorted(groups.items()):
+        for event_idx, event_row in enumerate((r for r in group if r.get("action") == "decrease"), start=1):
+            if event_count >= args.max_event_plots:
+                break
+            name = plot_event_centered(
+                repeat,
+                mode,
+                group,
+                event_row,
+                event_idx,
+                switch,
+                output_dir,
+                args.bucket_ms,
+                args.event_plot_window_sec,
+            )
+            if name:
+                event_images.append(name)
+                event_count += 1
+        if event_count >= args.max_event_plots:
+            break
+
+    html_path = write_html(output_dir, raw_images, bucket_images, event_images, event_csv, bucket_csv, switch)
     worker_msg = "all" if workers is None else ",".join(sorted(workers))
     print(f"[phase6-network] rows={len(rows)} groups={len(groups)} workers={worker_msg} switch={bool(switch)} html={html_path}")
 
