@@ -3,12 +3,23 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "${SCRIPT_DIR}/../../.." && pwd)
+CONFIG_PATH=${CONFIG_PATH:-"${SCRIPT_DIR}/phase6_pi_runtime_ddp.json"}
 
-CONFIG_PATH=${SCRIPT_DIR}/phase6_post_rate_probe.json
-if [[ "${1:-}" == "--config" ]]; then
-  CONFIG_PATH=${2:?config path required}
-elif [[ -n "${1:-}" ]]; then
-  CONFIG_PATH=${1}
-fi
+# Default phase6 controller knobs. Override from the shell for sweeps.
+export NCCL_PHASE6_W_STEP=${NCCL_PHASE6_W_STEP:-0.2}
+export NCCL_PHASE6_KP=${NCCL_PHASE6_KP:-1.0}
+export NCCL_PHASE6_KI=${NCCL_PHASE6_KI:-0.05}
+export NCCL_PHASE6_EPOCH_MS=${NCCL_PHASE6_EPOCH_MS:-20}
+export NCCL_PHASE6_MIN_SAMPLES=${NCCL_PHASE6_MIN_SAMPLES:-16}
+export NCCL_PHASE6_WARMUP_EPOCHS=${NCCL_PHASE6_WARMUP_EPOCHS:-10}
+export NCCL_PHASE6_COOLDOWN_EPOCHS=${NCCL_PHASE6_COOLDOWN_EPOCHS:-3}
+export NCCL_PHASE6_STABLE_EPOCHS=${NCCL_PHASE6_STABLE_EPOCHS:-5}
+export NCCL_PHASE6_THRESHOLD_HIGH_PCT=${NCCL_PHASE6_THRESHOLD_HIGH_PCT:-25}
+export NCCL_PHASE6_THRESHOLD_LOW_PCT=${NCCL_PHASE6_THRESHOLD_LOW_PCT:-10}
+export NCCL_PHASE6_THROUGHPUT_LOW_PCT=${NCCL_PHASE6_THROUGHPUT_LOW_PCT:-85}
+export NCCL_PHASE6_WSTALL_HIGH_PCT=${NCCL_PHASE6_WSTALL_HIGH_PCT:-20}
+export NCCL_PHASE6_INTEGRAL_LIMIT_PCT=${NCCL_PHASE6_INTEGRAL_LIMIT_PCT:-500}
+export NCCL_PHASE6_ALPHA_FAST_PCT=${NCCL_PHASE6_ALPHA_FAST_PCT:-30}
+export NCCL_PHASE6_ALPHA_SLOW_PCT=${NCCL_PHASE6_ALPHA_SLOW_PCT:-5}
 
-exec bash "${REPO_ROOT}/research/code/phase4/run_b4_matrix.sh" --config "${CONFIG_PATH}"
+exec bash "${REPO_ROOT}/research/code/phase4/run_b4_matrix.sh" --config "${CONFIG_PATH}" "$@"

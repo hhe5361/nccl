@@ -181,6 +181,18 @@ NCCL_PARAM(Phase5Log, "PHASE5_LOG", 0);
 NCCL_PARAM(Phase5ProgressLogEvery, "PHASE5_PROGRESS_LOG_EVERY", 128);
 NCCL_PARAM(Phase6Enable, "PHASE6_ENABLE", 0);
 NCCL_PARAM(Phase6Log, "PHASE6_LOG", 0);
+NCCL_PARAM(Phase6EpochMs, "PHASE6_EPOCH_MS", 20);
+NCCL_PARAM(Phase6MinSamples, "PHASE6_MIN_SAMPLES", 16);
+NCCL_PARAM(Phase6WarmupEpochs, "PHASE6_WARMUP_EPOCHS", 10);
+NCCL_PARAM(Phase6CooldownEpochs, "PHASE6_COOLDOWN_EPOCHS", 3);
+NCCL_PARAM(Phase6StableEpochs, "PHASE6_STABLE_EPOCHS", 5);
+NCCL_PARAM(Phase6ThresholdHighPct, "PHASE6_THRESHOLD_HIGH_PCT", 25);
+NCCL_PARAM(Phase6ThresholdLowPct, "PHASE6_THRESHOLD_LOW_PCT", 10);
+NCCL_PARAM(Phase6ThroughputLowPct, "PHASE6_THROUGHPUT_LOW_PCT", 85);
+NCCL_PARAM(Phase6WstallHighPct, "PHASE6_WSTALL_HIGH_PCT", 20);
+NCCL_PARAM(Phase6IntegralLimitPct, "PHASE6_INTEGRAL_LIMIT_PCT", 500);
+NCCL_PARAM(Phase6AlphaFastPct, "PHASE6_ALPHA_FAST_PCT", 30);
+NCCL_PARAM(Phase6AlphaSlowPct, "PHASE6_ALPHA_SLOW_PCT", 5);
 NCCL_PARAM(Phase7Enable, "PHASE7_ENABLE", 0);
 NCCL_PARAM(Phase7Log, "PHASE7_LOG", 0);
 NCCL_PARAM(Phase9Log, "PHASE9_LOG", 0);
@@ -818,8 +830,59 @@ static inline double phase6PostBurstRaw() {
   return value;
 }
 
-static inline int phase6Enabled() {
-  return ncclParamPhase6Enable() != 0 || phase6PostRateRaw() > 0.0;
+static inline int phase6CtrlEnabled() {
+  return ncclParamPhase6Enable() != 0;
+}
+
+static inline int phase6RateLimiterEnabled() {
+  return phase6PostRateRaw() > 0.0;
+}
+
+static inline double phase6EnvDouble(const char* name, double defaultValue, double minValue) {
+  const char* env = getenv(name);
+  if (env == NULL || env[0] == '\0') return defaultValue;
+  char* end = NULL;
+  double value = strtod(env, &end);
+  if (end == env) return defaultValue;
+  return value < minValue ? minValue : value;
+}
+
+static inline double phase6ClampDouble(double value, double lo, double hi) {
+  if (value < lo) return lo;
+  if (value > hi) return hi;
+  return value;
+}
+
+static inline double phase6AlphaPct(int pct, double fallback) {
+  if (pct <= 0) return fallback;
+  if (pct >= 100) return 1.0;
+  return (double)pct * 0.01;
+}
+
+static inline double phase6CtrlWBase(int wBase) {
+  double configured = phase6EnvDouble("NCCL_PHASE6_W_BASE", 0.0, 0.0);
+  return configured > 0.0 ? configured : (double)wBase;
+}
+
+static inline double phase6CtrlWMin() {
+  return phase6EnvDouble("NCCL_PHASE6_W_MIN", 1.0, 1.0);
+}
+
+static inline double phase6CtrlWMax(int wBase) {
+  double configured = phase6EnvDouble("NCCL_PHASE6_W_MAX", 0.0, 0.0);
+  return configured > 0.0 ? configured : (double)wBase;
+}
+
+static inline double phase6CtrlWStep() {
+  return phase6EnvDouble("NCCL_PHASE6_W_STEP", 0.2, 0.001);
+}
+
+static inline double phase6CtrlKp() {
+  return phase6EnvDouble("NCCL_PHASE6_KP", 1.0, 0.0);
+}
+
+static inline double phase6CtrlKi() {
+  return phase6EnvDouble("NCCL_PHASE6_KI", 0.05, 0.0);
 }
 
 static inline double phase7RateRatioRaw() {
@@ -915,6 +978,294 @@ static inline void phase6RateDecisionLog(
       burstRaw,
       tokensBefore,
       tokensAfter);
+}
+
+static inline void phase6CtrlCfgLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    int maxDepth,
+    double wBase,
+    double wMin,
+    double wMax) {
+  if (ncclParamPhase6Log() == 0 || sub->phase6CtrlCfgLogged) return;
+  INFO(NCCL_NET,
+      "PHASE6 event=CTRL_CFG tNs=%llu rank=%d peer=%d channel=%d groupSize=%d coll=%s collApi=%s algo=%s proto=%s maxDepth=%d wBase=%.3f wMin=%.3f wMax=%.3f wStep=%.3f epochMs=%ld minSamples=%ld warmupEpochs=%ld cooldownEpochs=%ld stableEpochs=%ld kp=%.6f ki=%.6f thresholdHighPct=%ld thresholdLowPct=%ld throughputLowPct=%ld wstallHighPct=%ld alphaFastPct=%ld alphaSlowPct=%ld",
+      (unsigned long long)clockNano(),
+      proxyState->tpRank,
+      sub->peer,
+      sub->channelId,
+      sub->groupSize,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol),
+      maxDepth,
+      wBase,
+      wMin,
+      wMax,
+      phase6CtrlWStep(),
+      ncclParamPhase6EpochMs(),
+      ncclParamPhase6MinSamples(),
+      ncclParamPhase6WarmupEpochs(),
+      ncclParamPhase6CooldownEpochs(),
+      ncclParamPhase6StableEpochs(),
+      phase6CtrlKp(),
+      phase6CtrlKi(),
+      ncclParamPhase6ThresholdHighPct(),
+      ncclParamPhase6ThresholdLowPct(),
+      ncclParamPhase6ThroughputLowPct(),
+      ncclParamPhase6WstallHighPct(),
+      ncclParamPhase6AlphaFastPct(),
+      ncclParamPhase6AlphaSlowPct());
+  sub->phase6CtrlCfgLogged = 1;
+}
+
+static inline void phase6CtrlEnsure(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    int maxDepth,
+    uint64_t nowNs) {
+  double wMin = phase6CtrlWMin();
+  double wMax = phase6CtrlWMax(maxDepth);
+  if (wMax < wMin) wMax = wMin;
+  if (sub->phase6CtrlW <= 0.0) {
+    sub->phase6CtrlW = phase6ClampDouble(phase6CtrlWBase(maxDepth), wMin, wMax);
+    sub->phase6CtrlEpochStartNs = nowNs;
+  }
+  phase6CtrlCfgLog(proxyState, args, sub, maxDepth, sub->phase6CtrlW, wMin, wMax);
+}
+
+static inline double phase6CtrlWindowRaw(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    int maxDepth) {
+  phase6CtrlEnsure(proxyState, args, sub, maxDepth, clockNano());
+  double wMin = phase6CtrlWMin();
+  double wMax = phase6CtrlWMax(maxDepth);
+  if (wMax < wMin) wMax = wMin;
+  sub->phase6CtrlW = phase6ClampDouble(sub->phase6CtrlW, wMin, wMax);
+  return sub->phase6CtrlW;
+}
+
+static inline void phase6CtrlWstallLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    int slot,
+    double wRaw,
+    int wEff) {
+  if (ncclParamAppendix2DisableWstallLog()) return;
+  if (ncclParamPhase6Log() == 0 || sub->phase6CtrlWstall) return;
+  INFO(NCCL_NET,
+      "PHASE6 event=CTRL_WSTALL tNs=%llu rank=%d peer=%d channel=%d slot=%d coll=%s collApi=%s algo=%s proto=%s base=%llu posted=%llu received=%llu transmitted=%llu done=%llu nsteps=%d wRaw=%.3f wEff=%d occPr=%llu occPd=%llu",
+      (unsigned long long)clockNano(),
+      proxyState->tpRank,
+      sub->peer,
+      sub->channelId,
+      slot,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol),
+      (unsigned long long)sub->base,
+      (unsigned long long)sub->posted,
+      (unsigned long long)sub->received,
+      (unsigned long long)sub->transmitted,
+      (unsigned long long)sub->done,
+      sub->nsteps,
+      wRaw,
+      wEff,
+      (unsigned long long)(sub->posted - sub->received),
+      (unsigned long long)(sub->posted - sub->done));
+  sub->phase6CtrlWstall = 1;
+  sub->phase6CtrlEpochWstalls++;
+}
+
+static inline void phase6CtrlObservePost(struct ncclProxySubArgs* sub) {
+  sub->phase6CtrlEpochPosts++;
+}
+
+static inline void phase6CtrlResetEpoch(struct ncclProxySubArgs* sub, uint64_t nowNs) {
+  sub->phase6CtrlEpochStartNs = nowNs;
+  sub->phase6CtrlEpochSamples = 0;
+  sub->phase6CtrlEpochDelaySumNs = 0;
+  sub->phase6CtrlEpochDelayMaxNs = 0;
+  sub->phase6CtrlEpochBytes = 0;
+  sub->phase6CtrlEpochPosts = 0;
+  sub->phase6CtrlEpochWstalls = 0;
+}
+
+static inline void phase6CtrlEpochLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    const char* action,
+    uint64_t nowNs,
+    uint64_t elapsedNs,
+    double delayMeanNs,
+    double delayMaxNs,
+    double epochGbps,
+    double eDelay,
+    double eTrend,
+    double eThroughput,
+    double e,
+    double u,
+    double wBefore,
+    double wAfter,
+    double wstallRatio) {
+  if (ncclParamPhase6Log() == 0) return;
+  INFO(NCCL_NET,
+      "PHASE6 event=CTRL_EPOCH tNs=%llu rank=%d peer=%d channel=%d groupSize=%d coll=%s collApi=%s algo=%s proto=%s action=%s elapsedNs=%llu samples=%llu bytes=%llu posts=%llu wstalls=%llu delayMeanNs=%.3f delayMaxNs=%.3f delayBaselineNs=%.3f delayFastNs=%.3f delaySlowNs=%.3f gbps=%.6f gbpsBaseline=%.6f gbpsFast=%.6f gbpsSlow=%.6f eDelay=%.6f eTrend=%.6f eThroughput=%.6f e=%.6f integral=%.6f u=%.6f wBefore=%.3f wAfter=%.3f cooldown=%u stableLow=%u wstallRatio=%.6f baselineReady=%u warmupEpochsSeen=%u",
+      (unsigned long long)nowNs,
+      proxyState->tpRank,
+      sub->peer,
+      sub->channelId,
+      sub->groupSize,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol),
+      action,
+      (unsigned long long)elapsedNs,
+      (unsigned long long)sub->phase6CtrlEpochSamples,
+      (unsigned long long)sub->phase6CtrlEpochBytes,
+      (unsigned long long)sub->phase6CtrlEpochPosts,
+      (unsigned long long)sub->phase6CtrlEpochWstalls,
+      delayMeanNs,
+      delayMaxNs,
+      sub->phase6CtrlBaselineDelayNs,
+      sub->phase6CtrlDelayFastNs,
+      sub->phase6CtrlDelaySlowNs,
+      epochGbps,
+      sub->phase6CtrlBaselineGbps,
+      sub->phase6CtrlThroughputFastGbps,
+      sub->phase6CtrlThroughputSlowGbps,
+      eDelay,
+      eTrend,
+      eThroughput,
+      e,
+      sub->phase6CtrlIntegral,
+      u,
+      wBefore,
+      wAfter,
+      sub->phase6CtrlCooldown,
+      sub->phase6CtrlStableLowCount,
+      wstallRatio,
+      sub->phase6CtrlBaselineReady,
+      sub->phase6CtrlWarmupEpochsSeen);
+}
+
+static inline void phase6CtrlObserveNetDone(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    int maxDepth,
+    uint64_t delayNs,
+    uint64_t bytes,
+    uint64_t nowNs) {
+  if (!phase6CtrlEnabled() || delayNs == 0) return;
+  phase6CtrlEnsure(proxyState, args, sub, maxDepth, nowNs);
+  if (sub->phase6CtrlEpochStartNs == 0) sub->phase6CtrlEpochStartNs = nowNs;
+
+  sub->phase6CtrlEpochSamples++;
+  sub->phase6CtrlEpochDelaySumNs += delayNs;
+  if (delayNs > sub->phase6CtrlEpochDelayMaxNs) sub->phase6CtrlEpochDelayMaxNs = delayNs;
+  sub->phase6CtrlEpochBytes += bytes;
+
+  uint64_t elapsedNs = nowNs - sub->phase6CtrlEpochStartNs;
+  uint64_t epochNs = (uint64_t)std::max(1L, ncclParamPhase6EpochMs()) * 1000000ULL;
+  uint64_t minSamples = (uint64_t)std::max(1L, ncclParamPhase6MinSamples());
+  if (elapsedNs < epochNs || sub->phase6CtrlEpochSamples < minSamples) return;
+
+  double alphaFast = phase6AlphaPct((int)ncclParamPhase6AlphaFastPct(), 0.30);
+  double alphaSlow = phase6AlphaPct((int)ncclParamPhase6AlphaSlowPct(), 0.05);
+  double delayMeanNs = (double)sub->phase6CtrlEpochDelaySumNs / (double)sub->phase6CtrlEpochSamples;
+  double delayMaxNs = (double)sub->phase6CtrlEpochDelayMaxNs;
+  double epochGbps = elapsedNs > 0 ? ((double)sub->phase6CtrlEpochBytes * 8.0 / (double)elapsedNs) : 0.0;
+  double wstallRatio = sub->phase6CtrlEpochPosts > 0 ? ((double)sub->phase6CtrlEpochWstalls / (double)sub->phase6CtrlEpochPosts) : 0.0;
+
+  if (sub->phase6CtrlDelayFastNs <= 0.0) sub->phase6CtrlDelayFastNs = delayMeanNs;
+  else sub->phase6CtrlDelayFastNs = alphaFast * delayMeanNs + (1.0 - alphaFast) * sub->phase6CtrlDelayFastNs;
+  if (sub->phase6CtrlDelaySlowNs <= 0.0) sub->phase6CtrlDelaySlowNs = delayMeanNs;
+  else sub->phase6CtrlDelaySlowNs = alphaSlow * delayMeanNs + (1.0 - alphaSlow) * sub->phase6CtrlDelaySlowNs;
+  if (sub->phase6CtrlThroughputFastGbps <= 0.0) sub->phase6CtrlThroughputFastGbps = epochGbps;
+  else sub->phase6CtrlThroughputFastGbps = alphaFast * epochGbps + (1.0 - alphaFast) * sub->phase6CtrlThroughputFastGbps;
+  if (sub->phase6CtrlThroughputSlowGbps <= 0.0) sub->phase6CtrlThroughputSlowGbps = epochGbps;
+  else sub->phase6CtrlThroughputSlowGbps = alphaSlow * epochGbps + (1.0 - alphaSlow) * sub->phase6CtrlThroughputSlowGbps;
+
+  double wBefore = sub->phase6CtrlW;
+  double wAfter = wBefore;
+  double eDelay = 0.0;
+  double eTrend = 0.0;
+  double eThroughput = 0.0;
+  double e = 0.0;
+  double u = 0.0;
+  const char* action = "warmup";
+
+  if (!sub->phase6CtrlBaselineReady) {
+    if (sub->phase6CtrlBaselineDelayNs <= 0.0) sub->phase6CtrlBaselineDelayNs = delayMeanNs;
+    else sub->phase6CtrlBaselineDelayNs = alphaSlow * delayMeanNs + (1.0 - alphaSlow) * sub->phase6CtrlBaselineDelayNs;
+    if (sub->phase6CtrlBaselineGbps <= 0.0) sub->phase6CtrlBaselineGbps = epochGbps;
+    else sub->phase6CtrlBaselineGbps = alphaSlow * epochGbps + (1.0 - alphaSlow) * sub->phase6CtrlBaselineGbps;
+    sub->phase6CtrlWarmupEpochsSeen++;
+    if (sub->phase6CtrlWarmupEpochsSeen >= (uint16_t)std::max(1L, ncclParamPhase6WarmupEpochs())) {
+      sub->phase6CtrlBaselineReady = 1;
+      action = "baseline_ready";
+    }
+  } else if (sub->phase6CtrlCooldown > 0) {
+    sub->phase6CtrlCooldown--;
+    action = "cooldown";
+  } else {
+    if (sub->phase6CtrlBaselineDelayNs > 0.0) eDelay = (delayMeanNs / sub->phase6CtrlBaselineDelayNs) - 1.0;
+    if (sub->phase6CtrlDelaySlowNs > 0.0) eTrend = (sub->phase6CtrlDelayFastNs / sub->phase6CtrlDelaySlowNs) - 1.0;
+    if (sub->phase6CtrlBaselineGbps > 0.0) eThroughput = 1.0 - (sub->phase6CtrlThroughputFastGbps / sub->phase6CtrlBaselineGbps);
+    if (eDelay < 0.0) eDelay = 0.0;
+    if (eTrend < 0.0) eTrend = 0.0;
+    if (eThroughput < 0.0) eThroughput = 0.0;
+    e = std::max(eDelay, eTrend);
+
+    double thresholdHigh = (double)std::max(1L, ncclParamPhase6ThresholdHighPct()) * 0.01;
+    double thresholdLow = (double)std::max(1L, ncclParamPhase6ThresholdLowPct()) * 0.01;
+    double integralLimit = (double)std::max(1L, ncclParamPhase6IntegralLimitPct()) * 0.01;
+    if (e <= thresholdLow) sub->phase6CtrlIntegral *= 0.80;
+    else sub->phase6CtrlIntegral = phase6ClampDouble(sub->phase6CtrlIntegral + e, -integralLimit, integralLimit);
+    u = phase6CtrlKp() * e + phase6CtrlKi() * sub->phase6CtrlIntegral;
+
+    double throughputLow = (double)std::max(1L, ncclParamPhase6ThroughputLowPct()) * 0.01;
+    double wstallHigh = (double)std::max(0L, ncclParamPhase6WstallHighPct()) * 0.01;
+    int throughputGuard = sub->phase6CtrlBaselineGbps > 0.0 && sub->phase6CtrlThroughputFastGbps < sub->phase6CtrlBaselineGbps * throughputLow;
+    int wstallGuard = wstallRatio >= wstallHigh;
+    double wMin = phase6CtrlWMin();
+    double wMax = phase6CtrlWMax(maxDepth);
+    if (wMax < wMin) wMax = wMin;
+    if (u >= thresholdHigh && (throughputGuard || wstallGuard || eDelay >= thresholdHigh || eTrend >= thresholdHigh)) {
+      wAfter = phase6ClampDouble(wBefore - phase6CtrlWStep(), wMin, wMax);
+      sub->phase6CtrlW = wAfter;
+      sub->phase6CtrlCooldown = (uint8_t)std::max(0L, ncclParamPhase6CooldownEpochs());
+      sub->phase6CtrlStableLowCount = 0;
+      action = "decrease";
+    } else if (e <= thresholdLow && !throughputGuard && !wstallGuard && wBefore < wMax) {
+      sub->phase6CtrlStableLowCount++;
+      if (sub->phase6CtrlStableLowCount >= (uint16_t)std::max(1L, ncclParamPhase6StableEpochs())) {
+        wAfter = phase6ClampDouble(wBefore + phase6CtrlWStep(), wMin, wMax);
+        sub->phase6CtrlW = wAfter;
+        sub->phase6CtrlCooldown = (uint8_t)std::max(0L, ncclParamPhase6CooldownEpochs());
+        sub->phase6CtrlStableLowCount = 0;
+        action = "increase";
+      } else {
+        action = "stable_low";
+      }
+    } else {
+      sub->phase6CtrlStableLowCount = 0;
+      action = "hold";
+    }
+  }
+
+  phase6CtrlEpochLog(proxyState, args, sub, action, nowNs, elapsedNs, delayMeanNs, delayMaxNs, epochGbps, eDelay, eTrend, eThroughput, e, u, wBefore, sub->phase6CtrlW, wstallRatio);
+  phase6CtrlResetEpoch(sub, nowNs);
 }
 
 static inline void phase7RateCfgLog(
@@ -2254,6 +2605,27 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
       sub->phase6RateStall = 0;
       sub->phase6Tokens = 0.0;
       sub->phase6LastRefillNs = 0;
+      sub->phase6CtrlCfgLogged = 0;
+      sub->phase6CtrlBaselineReady = 0;
+      sub->phase6CtrlWstall = 0;
+      sub->phase6CtrlCooldown = 0;
+      sub->phase6CtrlWarmupEpochsSeen = 0;
+      sub->phase6CtrlStableLowCount = 0;
+      sub->phase6CtrlEpochStartNs = 0;
+      sub->phase6CtrlEpochSamples = 0;
+      sub->phase6CtrlEpochDelaySumNs = 0;
+      sub->phase6CtrlEpochDelayMaxNs = 0;
+      sub->phase6CtrlEpochBytes = 0;
+      sub->phase6CtrlEpochPosts = 0;
+      sub->phase6CtrlEpochWstalls = 0;
+      sub->phase6CtrlW = 0.0;
+      sub->phase6CtrlBaselineDelayNs = 0.0;
+      sub->phase6CtrlBaselineGbps = 0.0;
+      sub->phase6CtrlDelayFastNs = 0.0;
+      sub->phase6CtrlDelaySlowNs = 0.0;
+      sub->phase6CtrlThroughputFastGbps = 0.0;
+      sub->phase6CtrlThroughputSlowGbps = 0.0;
+      sub->phase6CtrlIntegral = 0.0;
       sub->phase3CurrentW = 0;
       sub->phase3LastLoggedW = 0;
       sub->phase3HiCount = 0;
@@ -2464,6 +2836,27 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
       sub->phase6RateStall = 0;
       sub->phase6Tokens = 0.0;
       sub->phase6LastRefillNs = 0;
+      sub->phase6CtrlCfgLogged = 0;
+      sub->phase6CtrlBaselineReady = 0;
+      sub->phase6CtrlWstall = 0;
+      sub->phase6CtrlCooldown = 0;
+      sub->phase6CtrlWarmupEpochsSeen = 0;
+      sub->phase6CtrlStableLowCount = 0;
+      sub->phase6CtrlEpochStartNs = 0;
+      sub->phase6CtrlEpochSamples = 0;
+      sub->phase6CtrlEpochDelaySumNs = 0;
+      sub->phase6CtrlEpochDelayMaxNs = 0;
+      sub->phase6CtrlEpochBytes = 0;
+      sub->phase6CtrlEpochPosts = 0;
+      sub->phase6CtrlEpochWstalls = 0;
+      sub->phase6CtrlW = 0.0;
+      sub->phase6CtrlBaselineDelayNs = 0.0;
+      sub->phase6CtrlBaselineGbps = 0.0;
+      sub->phase6CtrlDelayFastNs = 0.0;
+      sub->phase6CtrlDelaySlowNs = 0.0;
+      sub->phase6CtrlThroughputFastGbps = 0.0;
+      sub->phase6CtrlThroughputSlowGbps = 0.0;
+      sub->phase6CtrlIntegral = 0.0;
       sub->phase7RateCfgLogged = 0;
       sub->phase7RateStall = 0;
       sub->phase7ControlActive = 0;
@@ -2505,7 +2898,8 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
     int wCfg = phase1WindowCfg();
     int phase4Enabled = ncclParamPhase4Enable();
     double phase4WRaw = phase4WindowRaw();
-    int phase6RateEnabled = phase6Enabled();
+    int phase6CtrlActive = phase6CtrlEnabled();
+    int phase6RateEnabled = phase6RateLimiterEnabled();
     double phase6RateRaw = phase6PostRateRaw();
     double phase6BurstRaw = phase6PostBurstRaw();
     int phase7RateEnabled = phase7Enabled();
@@ -2537,8 +2931,14 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
           struct phase3WindowDecision phase3Decision = phase3SnapshotWindow(sub, &semanticDecision);
           int wEff = wBase;
           int slotDepth = wBase;
+          double phase6WRaw = 0.0;
+          double activeWRaw = phase4WRaw;
           phase4ProxyMaxDepthLog(proxyState, args, sub, wBase, phase4Enabled, phase4WRaw);
-          if (phase4Enabled && phase4WRaw > 0.0) {
+          if (phase6CtrlActive) {
+            phase6WRaw = phase6CtrlWindowRaw(proxyState, args, sub, wBase);
+            activeWRaw = phase6WRaw;
+            wEff = phase4WindowEff(proxyState, args, sub, phase6WRaw);
+          } else if (phase4Enabled && phase4WRaw > 0.0) {
             wEff = phase4WindowEff(proxyState, args, sub, phase4WRaw);
             phase4ProxyWindowCfgLog(proxyState, args, sub, wBase, phase4WRaw, wEff);
           } else if (wCfg > 0) {
@@ -2563,7 +2963,13 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             subCount = 0;
             break;
           }
-          if (phase4Enabled && phase4WRaw > 0.0 && sub->posted >= sub->received + wEff) {
+          if (phase6CtrlActive && activeWRaw > 0.0 && sub->posted >= sub->received + wEff) {
+            phase6CtrlWstallLog(proxyState, args, sub, (sub->base+sub->posted)%NCCL_STEPS, activeWRaw, wEff);
+            phase5RecvEventLog(proxyState, args, sub, "PROXY_RECV_WSTALL", (sub->base + sub->posted) % NCCL_STEPS, 0, wBase, activeWRaw, wEff, 0, 0, 0);
+            subCount = 0;
+            break;
+          }
+          if (!phase6CtrlActive && phase4Enabled && phase4WRaw > 0.0 && sub->posted >= sub->received + wEff) {
             phase4ProxyWstallLog(proxyState, args, sub, "PROXY_RECV_WSTALL", (sub->base+sub->posted)%NCCL_STEPS, phase4WRaw, wEff, &sub->phase4RecvWstall);
             phase5RecvEventLog(proxyState, args, sub, "PROXY_RECV_WSTALL", (sub->base + sub->posted) % NCCL_STEPS, 0, wBase, phase4WRaw, wEff, 0, 0, 0);
             subCount = 0;
@@ -2573,6 +2979,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
           sub->phase2RecvWstall = 0;
           sub->phase3RecvWstall = 0;
           sub->phase4RecvWstall = 0;
+          sub->phase6CtrlWstall = 0;
           ncclProfilerStartRecvProxyStepEvent(s+i, args, postedStepId);
           int stepSize = resources->buffSizes[p] / NCCL_STEPS;
           char* localBuff = NCCL_NET_MAP_GET_POINTER(&resources->map, cpu, buffs[p]);
@@ -2661,7 +3068,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             leader->phase7Tokens -= (double)postCost;
             phase7RateDecisionLog(proxyState, args, leader, "RATE_ALLOW", elapsedNs, postCost, phase7RatioPct, leader->phase7BaselineRatePerMs, leader->phase7TargetRatePerMs, leader->phase7TargetBurst, tokensBefore, leader->phase7Tokens);
           }
-        } else if (phase6RateEnabled && phase6RateRaw > 0.0 && phase6BurstRaw > 0.0) {
+        } else if (!phase6CtrlActive && phase6RateEnabled && phase6RateRaw > 0.0 && phase6BurstRaw > 0.0) {
           struct ncclProxySubArgs* leader = subGroup;
           uint64_t nowNs = clockNano();
           if (!leader->phase6RateCfgLogged) {
@@ -2706,7 +3113,14 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             int postedStepId = sub->posted;
             struct phase2WindowDecision semanticDecision = phase2SelectWindow(proxyState, args, sub);
             struct phase3WindowDecision phase3Decision = phase3SnapshotWindow(sub, &semanticDecision);
+            double activeWRaw = phase4WRaw;
             int wEff = (wCfg > 0) ? phase1WindowEff(args) : (phase3Decision.enabled ? phase3Decision.wEff : (semanticDecision.enabled ? semanticDecision.wEff : wBase));
+            if (phase6CtrlActive) {
+              activeWRaw = phase6CtrlWindowRaw(proxyState, args, sub, wBase);
+              wEff = phase4WindowEff(proxyState, args, sub, activeWRaw);
+            } else if (phase4Enabled && phase4WRaw > 0.0) {
+              wEff = phase4WindowEff(proxyState, args, sub, phase4WRaw);
+            }
             int buffSlot = (sub->base + sub->posted) % NCCL_STEPS;
             uint64_t postTsNs = clockNano();
             TRACE(NCCL_NET, "recvProxy [%ld/%d/%d] Irecv posted, buff %p, size %ld, myRank %d, channelId %d, mhandle %p", sub->posted, buffSlot, sub->nsteps, ptrs[i], sizes[i], proxyState->tpRank, sub->channelId, mhandles[i]);
@@ -2714,7 +3128,8 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             sub->phase3PostTs[buffSlot] = postTsNs;
             sub->phase5PostTs[buffSlot] = postTsNs;
             sub->phase5PostProgressCall[buffSlot] = args->phase5RecvProxyCalls;
-            phase5RecvEventLog(proxyState, args, sub, "PROXY_RECV_POST", buffSlot, sizes[i], wBase, phase4WRaw, wEff, postTsNs, 0, 0);
+            if (phase6CtrlActive) phase6CtrlObservePost(sub);
+            phase5RecvEventLog(proxyState, args, sub, "PROXY_RECV_POST", buffSlot, sizes[i], wBase, activeWRaw, wEff, postTsNs, 0, 0);
             sub->posted += args->sliceSteps;
             ncclProfilerRecordProxyStepEventState(s+i, args, postedStepId, ncclProfilerProxyStepRecvWait);
           }
@@ -2744,7 +3159,14 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
             int buffSlot = (sub->base + sub->received) % NCCL_STEPS;
             struct phase2WindowDecision semanticDecision = phase2SelectWindow(proxyState, args, sub);
             struct phase3WindowDecision phase3Decision = phase3SnapshotWindow(sub, &semanticDecision);
+            double activeWRaw = phase4WRaw;
             int wEff = (wCfg > 0) ? phase1WindowEff(args) : (phase3Decision.enabled ? phase3Decision.wEff : (semanticDecision.enabled ? semanticDecision.wEff : wBase));
+            if (phase6CtrlActive) {
+              activeWRaw = phase6CtrlWindowRaw(proxyState, args, sub, wBase);
+              wEff = phase4WindowEff(proxyState, args, sub, activeWRaw);
+            } else if (phase4Enabled && phase4WRaw > 0.0) {
+              wEff = phase4WindowEff(proxyState, args, sub, phase4WRaw);
+            }
             struct recvNetResources* resources = (struct recvNetResources*)(sub->connection->transportResources);
             volatile struct ncclConnFifo* connFifo = (volatile struct ncclConnFifo*)resources->recvMem->connFifo;
             connFifo[buffSlot].size = -1;
@@ -2762,7 +3184,8 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
               uint64_t phase5PostTsNs = sub->phase5PostTs[buffSlot];
               uint64_t phase5DelayNs = (phase5PostTsNs != 0 && nowNs >= phase5PostTsNs) ? (nowNs - phase5PostTsNs) : 0;
               uint64_t progressCallsSincePost = sub->phase5PostProgressCall[buffSlot] ? (args->phase5RecvProxyCalls - sub->phase5PostProgressCall[buffSlot]) : 0;
-              phase5RecvEventLog(proxyState, args, sub, "PROXY_RECV_NET_DONE", buffSlot, sizes[i], wBase, phase4WRaw, wEff, phase5PostTsNs, phase5DelayNs, progressCallsSincePost);
+              phase5RecvEventLog(proxyState, args, sub, "PROXY_RECV_NET_DONE", buffSlot, sizes[i], wBase, activeWRaw, wEff, phase5PostTsNs, phase5DelayNs, progressCallsSincePost);
+              phase6CtrlObserveNetDone(proxyState, args, sub, wBase, phase5DelayNs, sizes[i], nowNs);
             }
             sub->received += args->sliceSteps;
             ncclProfilerRecordProxyStepEventState(s+i, args, receivedStepId, ncclProfilerProxyStepRecvFlushWait);

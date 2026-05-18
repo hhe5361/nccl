@@ -1,35 +1,31 @@
 {
-  "phase": "phase9",
-  "name": "phase9_post_rate_probe",
-  "description": "Observe online recvComm POST rate under STOCK without control.",
+  "phase": "phase6",
+  "name": "p6_pi_runtime_ddp",
+  "description": "Runtime PI-style receiver-side W controller. Logs W timeline, POST-to-NET_DONE delay, internal throughput, and WSTALL ratio for switch PFC overlay.",
   "run": {
-    "run_id_prefix": "phase9_post_rate_probe",
+    "run_id_prefix": "phase6_pi_ddp",
     "master_server": "worker01",
     "master_addr": "172.16.0.101",
-    "master_port": 40400,
+    "master_port": 40100,
     "all_workers": [
       "worker01",
       "worker02",
-      "worker03",
-      "worker04",
-      "worker05",
       "worker06",
-      "worker07",
-      "worker08"
+      "worker07"
     ],
     "run_modes": [
-      "stock"
+      "stock",
+      "p6_pi"
     ],
-    "repeats": 5,
-    "steps": 100,
+    "repeats": 3,
+    "steps": 200,
     "warmup_steps": 20,
-    "mode_timeout_sec": 600,
+    "mode_timeout_sec": 1000,
+    "mode_delay_sec": 180,
     "torch_env": "/workspace/venvs/torch-cu121-custom/bin/activate",
     "target_script": "research/code/phase4/ddp_b4.py",
-    "worker_script": "research/code/phase9/run_p9_mode_worker.sh",
-    "compare_script": "research/code/phase4/compare_b4_vs_stock.py",
-    "summary_script": "research/code/phase9/phase9_diag_summary.py",
-    "summary_output_name": "phase9_diag_summary.json"
+    "worker_script": "research/code/phase4/run_b4_mode_worker.sh",
+    "compare_script": "research/code/phase4/compare_b4_vs_stock.py"
   },
   "paths": {
     "log_root_base": "/mnt/nfs_share/cts_experiments",
@@ -47,13 +43,13 @@
   "ssh": {
     "worker_ssh_user": "",
     "worker_ssh_user_map": "",
-    "worker_ssh_port": 14750,
+    "worker_ssh_port": 14760,
     "worker_ssh_port_map": "",
     "ssh_connect_timeout_sec": 10
   },
   "model": {
     "dtype": "float32",
-    "hidden_dim": 1024,
+    "hidden_dim": 2048,
     "num_layers": 4,
     "batch_size": 16,
     "bucket_cap_mb": 1,
@@ -63,7 +59,10 @@
   "nccl": {
     "algo": "Ring",
     "proto": "auto",
-    "phase0_log": 0,
+    "phase0_log": 1,
+    "phase4_log": 0,
+    "phase6_log": 1,
+    "appendix2_group_log": 0,
     "debug": "INFO",
     "debug_subsys": "NET",
     "net_gdr_level": 0
@@ -73,7 +72,15 @@
       "mode_id": "stock",
       "label": "STOCK",
       "phase4_enable": 0,
-      "post_receive_w": 0
+      "phase6_enable": 0,
+      "post_receive_w": null
+    },
+    {
+      "mode_id": "p6_pi",
+      "label": "P6_PI",
+      "phase4_enable": 0,
+      "phase6_enable": 1,
+      "post_receive_w": null
     }
   ]
 }
