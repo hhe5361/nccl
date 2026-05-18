@@ -1,7 +1,7 @@
 {
   "phase": "phase6",
-  "name": "p6_pi_runtime_ddp",
-  "description": "Runtime PI-style receiver-side W controller. Logs W timeline, POST-to-NET_DONE delay, internal throughput, and WSTALL ratio for switch PFC overlay.",
+  "name": "p6_spike_runtime_ddp",
+  "description": "Runtime spike-based receiver-side W controller. Logs W timeline, POST-to-NET_DONE delay, internal throughput, and WSTALL ratio for switch PFC overlay.",
   "run": {
     "run_id_prefix": "phase6_pi_ddp",
     "master_server": "worker01",
@@ -15,7 +15,7 @@
     ],
     "run_modes": [
       "stock",
-      "p6_pi"
+      "p6_spike"
     ],
     "repeats": 3,
     "steps": 200,
@@ -76,8 +76,8 @@
       "post_receive_w": null
     },
     {
-      "mode_id": "p6_pi",
-      "label": "P6_PI",
+      "mode_id": "p6_spike",
+      "label": "P6_SPIKE",
       "phase4_enable": 0,
       "phase6_enable": 1,
       "post_receive_w": null

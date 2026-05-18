@@ -181,13 +181,13 @@ NCCL_PARAM(Phase5Log, "PHASE5_LOG", 0);
 NCCL_PARAM(Phase5ProgressLogEvery, "PHASE5_PROGRESS_LOG_EVERY", 128);
 NCCL_PARAM(Phase6Enable, "PHASE6_ENABLE", 0);
 NCCL_PARAM(Phase6Log, "PHASE6_LOG", 0);
-NCCL_PARAM(Phase6EpochMs, "PHASE6_EPOCH_MS", 20);
-NCCL_PARAM(Phase6MinSamples, "PHASE6_MIN_SAMPLES", 16);
-NCCL_PARAM(Phase6WarmupEpochs, "PHASE6_WARMUP_EPOCHS", 10);
-NCCL_PARAM(Phase6CooldownEpochs, "PHASE6_COOLDOWN_EPOCHS", 3);
-NCCL_PARAM(Phase6StableEpochs, "PHASE6_STABLE_EPOCHS", 5);
-NCCL_PARAM(Phase6ThresholdHighPct, "PHASE6_THRESHOLD_HIGH_PCT", 25);
-NCCL_PARAM(Phase6ThresholdLowPct, "PHASE6_THRESHOLD_LOW_PCT", 10);
+NCCL_PARAM(Phase6EpochMs, "PHASE6_EPOCH_MS", 5);
+NCCL_PARAM(Phase6MinSamples, "PHASE6_MIN_SAMPLES", 4);
+NCCL_PARAM(Phase6WarmupEpochs, "PHASE6_WARMUP_EPOCHS", 1);
+NCCL_PARAM(Phase6CooldownEpochs, "PHASE6_COOLDOWN_EPOCHS", 1);
+NCCL_PARAM(Phase6StableEpochs, "PHASE6_STABLE_EPOCHS", 3);
+NCCL_PARAM(Phase6ThresholdHighPct, "PHASE6_THRESHOLD_HIGH_PCT", 50);
+NCCL_PARAM(Phase6ThresholdLowPct, "PHASE6_THRESHOLD_LOW_PCT", 15);
 NCCL_PARAM(Phase6ThroughputLowPct, "PHASE6_THROUGHPUT_LOW_PCT", 85);
 NCCL_PARAM(Phase6WstallHighPct, "PHASE6_WSTALL_HIGH_PCT", 20);
 NCCL_PARAM(Phase6IntegralLimitPct, "PHASE6_INTEGRAL_LIMIT_PCT", 500);
@@ -990,7 +990,7 @@ static inline void phase6CtrlCfgLog(
     double wMax) {
   if (ncclParamPhase6Log() == 0 || sub->phase6CtrlCfgLogged) return;
   INFO(NCCL_NET,
-      "PHASE6 event=CTRL_CFG tNs=%llu rank=%d peer=%d channel=%d groupSize=%d coll=%s collApi=%s algo=%s proto=%s maxDepth=%d wBase=%.3f wMin=%.3f wMax=%.3f wStep=%.3f epochMs=%ld minSamples=%ld warmupEpochs=%ld cooldownEpochs=%ld stableEpochs=%ld kp=%.6f ki=%.6f thresholdHighPct=%ld thresholdLowPct=%ld throughputLowPct=%ld wstallHighPct=%ld alphaFastPct=%ld alphaSlowPct=%ld",
+      "PHASE6 event=CTRL_CFG ctrl=spike tNs=%llu rank=%d peer=%d channel=%d groupSize=%d coll=%s collApi=%s algo=%s proto=%s maxDepth=%d wBase=%.3f wMin=%.3f wMax=%.3f wStep=%.3f epochMs=%ld minSamples=%ld warmupEpochs=%ld cooldownEpochs=%ld stableEpochs=%ld kp=%.6f ki=%.6f spikeHighPct=%ld spikeLowPct=%ld throughputLowPct=%ld wstallHighPct=%ld alphaFastPct=%ld alphaSlowPct=%ld",
       (unsigned long long)clockNano(),
       proxyState->tpRank,
       sub->peer,
@@ -1057,8 +1057,11 @@ static inline void phase6CtrlWstallLog(
     int slot,
     double wRaw,
     int wEff) {
+  if (sub->phase6CtrlWstall) return;
+  sub->phase6CtrlWstall = 1;
+  sub->phase6CtrlEpochWstalls++;
   if (ncclParamAppendix2DisableWstallLog()) return;
-  if (ncclParamPhase6Log() == 0 || sub->phase6CtrlWstall) return;
+  if (ncclParamPhase6Log() == 0) return;
   INFO(NCCL_NET,
       "PHASE6 event=CTRL_WSTALL tNs=%llu rank=%d peer=%d channel=%d slot=%d coll=%s collApi=%s algo=%s proto=%s base=%llu posted=%llu received=%llu transmitted=%llu done=%llu nsteps=%d wRaw=%.3f wEff=%d occPr=%llu occPd=%llu",
       (unsigned long long)clockNano(),
@@ -1080,8 +1083,6 @@ static inline void phase6CtrlWstallLog(
       wEff,
       (unsigned long long)(sub->posted - sub->received),
       (unsigned long long)(sub->posted - sub->done));
-  sub->phase6CtrlWstall = 1;
-  sub->phase6CtrlEpochWstalls++;
 }
 
 static inline void phase6CtrlObservePost(struct ncclProxySubArgs* sub) {
@@ -1205,11 +1206,11 @@ static inline void phase6CtrlObserveNetDone(
   double u = 0.0;
   const char* action = "warmup";
 
+  // Phase6 uses an op-local spike detector: fast/slow EWMA replaces a fixed baseline.
+  sub->phase6CtrlBaselineDelayNs = sub->phase6CtrlDelaySlowNs;
+  sub->phase6CtrlBaselineGbps = sub->phase6CtrlThroughputSlowGbps;
+
   if (!sub->phase6CtrlBaselineReady) {
-    if (sub->phase6CtrlBaselineDelayNs <= 0.0) sub->phase6CtrlBaselineDelayNs = delayMeanNs;
-    else sub->phase6CtrlBaselineDelayNs = alphaSlow * delayMeanNs + (1.0 - alphaSlow) * sub->phase6CtrlBaselineDelayNs;
-    if (sub->phase6CtrlBaselineGbps <= 0.0) sub->phase6CtrlBaselineGbps = epochGbps;
-    else sub->phase6CtrlBaselineGbps = alphaSlow * epochGbps + (1.0 - alphaSlow) * sub->phase6CtrlBaselineGbps;
     sub->phase6CtrlWarmupEpochsSeen++;
     if (sub->phase6CtrlWarmupEpochsSeen >= (uint16_t)std::max(1L, ncclParamPhase6WarmupEpochs())) {
       sub->phase6CtrlBaselineReady = 1;
@@ -1219,9 +1220,9 @@ static inline void phase6CtrlObserveNetDone(
     sub->phase6CtrlCooldown--;
     action = "cooldown";
   } else {
-    if (sub->phase6CtrlBaselineDelayNs > 0.0) eDelay = (delayMeanNs / sub->phase6CtrlBaselineDelayNs) - 1.0;
+    if (sub->phase6CtrlDelaySlowNs > 0.0) eDelay = (delayMeanNs / sub->phase6CtrlDelaySlowNs) - 1.0;
     if (sub->phase6CtrlDelaySlowNs > 0.0) eTrend = (sub->phase6CtrlDelayFastNs / sub->phase6CtrlDelaySlowNs) - 1.0;
-    if (sub->phase6CtrlBaselineGbps > 0.0) eThroughput = 1.0 - (sub->phase6CtrlThroughputFastGbps / sub->phase6CtrlBaselineGbps);
+    if (sub->phase6CtrlThroughputSlowGbps > 0.0) eThroughput = 1.0 - (sub->phase6CtrlThroughputFastGbps / sub->phase6CtrlThroughputSlowGbps);
     if (eDelay < 0.0) eDelay = 0.0;
     if (eTrend < 0.0) eTrend = 0.0;
     if (eThroughput < 0.0) eThroughput = 0.0;
@@ -1229,19 +1230,16 @@ static inline void phase6CtrlObserveNetDone(
 
     double thresholdHigh = (double)std::max(1L, ncclParamPhase6ThresholdHighPct()) * 0.01;
     double thresholdLow = (double)std::max(1L, ncclParamPhase6ThresholdLowPct()) * 0.01;
-    double integralLimit = (double)std::max(1L, ncclParamPhase6IntegralLimitPct()) * 0.01;
-    if (e <= thresholdLow) sub->phase6CtrlIntegral *= 0.80;
-    else sub->phase6CtrlIntegral = phase6ClampDouble(sub->phase6CtrlIntegral + e, -integralLimit, integralLimit);
-    u = phase6CtrlKp() * e + phase6CtrlKi() * sub->phase6CtrlIntegral;
-
     double throughputLow = (double)std::max(1L, ncclParamPhase6ThroughputLowPct()) * 0.01;
     double wstallHigh = (double)std::max(0L, ncclParamPhase6WstallHighPct()) * 0.01;
-    int throughputGuard = sub->phase6CtrlBaselineGbps > 0.0 && sub->phase6CtrlThroughputFastGbps < sub->phase6CtrlBaselineGbps * throughputLow;
+    int throughputGuard = sub->phase6CtrlThroughputSlowGbps > 0.0 && sub->phase6CtrlThroughputFastGbps < sub->phase6CtrlThroughputSlowGbps * throughputLow;
     int wstallGuard = wstallRatio >= wstallHigh;
+    sub->phase6CtrlIntegral = 0.0;
+    u = e;
     double wMin = phase6CtrlWMin();
     double wMax = phase6CtrlWMax(maxDepth);
     if (wMax < wMin) wMax = wMin;
-    if (u >= thresholdHigh && (throughputGuard || wstallGuard || eDelay >= thresholdHigh || eTrend >= thresholdHigh)) {
+    if (e >= thresholdHigh || wstallGuard) {
       wAfter = phase6ClampDouble(wBefore - phase6CtrlWStep(), wMin, wMax);
       sub->phase6CtrlW = wAfter;
       sub->phase6CtrlCooldown = (uint8_t)std::max(0L, ncclParamPhase6CooldownEpochs());
