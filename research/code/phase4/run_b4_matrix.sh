@@ -561,7 +561,7 @@ cleanup_worker_processes() {
   local remote_repo_root
   local cmd
   remote_repo_root=$(resolve_remote_repo_root "${worker}")
-  cmd="cd $(printf '%q' "${remote_repo_root}") && bash ./research/code/deploy/run_dev_container.sh bash -lc $(printf '%q' "pkill -f 'torchrun|torch\\.distributed\\.run|ddp_b4\\.py' >/dev/null 2>&1 || true; sleep 1; ps -ef | grep -E 'torchrun|torch\\.distributed\\.run|ddp_b4\\.py' | grep -v grep || true")"
+  cmd="cd $(printf '%q' "${remote_repo_root}") && bash ./research/code/deploy/run_dev_container.sh bash -lc $(printf '%q' "pkill -f 'torchrun|torch\\.distributed\\.run|ddp_b4\\.py|ddp_phase7_timeline\\.py' >/dev/null 2>&1 || true; sleep 1; ps -ef | grep -E 'torchrun|torch\\.distributed\\.run|ddp_b4\\.py|ddp_phase7_timeline\\.py' | grep -v grep || true")"
   remote_worker_bash "${worker}" "${cmd}" >/dev/null 2>&1 || true
 }
 

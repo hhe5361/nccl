@@ -62,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", required=True, type=Path, help="Phase6 experiment run root")
     parser.add_argument("--output-dir", required=True, type=Path, help="Output directory")
     parser.add_argument("--bucket-ms", type=float, default=1000.0, help="Network bucket width in ms")
+    parser.add_argument("--bin-ms", type=float, default=None, help="Alias for --bucket-ms")
     parser.add_argument("--event-window-sec", type=float, default=2.0, help="Before/after window around W adjustment events")
     parser.add_argument(
         "--event-plot-window-sec",
@@ -76,6 +77,27 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated worker directory names to scan for NCCL logs. Default: worker01",
     )
     parser.add_argument("--all-workers", action="store_true", help="Scan all workers. Slower on large NCCL logs.")
+    parser.add_argument("--switch-log-dir", type=Path, default=None, help="Explicit local switch log directory")
+    parser.add_argument("--skip-raw", action="store_true", help="Skip raw timeline plots. Recommended for all-worker reports.")
+    parser.add_argument(
+        "--delay-plot-pct",
+        type=float,
+        default=99.0,
+        help="Percentile used as the trimmed POST-DONE tail line in binned plots",
+    )
+    parser.add_argument(
+        "--delay-trim-top",
+        type=int,
+        default=3,
+        help="Drop this many largest POST-DONE samples per analysis bin before plotting tail/max lines",
+    )
+    parser.add_argument(
+        "--delay-ymax-pct",
+        type=float,
+        default=99.5,
+        help="Percentile used to choose POST-DONE y-axis upper limit in binned plots",
+    )
+    parser.add_argument("--delay-ymax-ms", type=float, default=None, help="Explicit POST-DONE y-axis upper limit in ms")
     return parser.parse_args()
 
 
@@ -119,8 +141,20 @@ def percentile(values: Iterable[float], pct: float) -> float:
     vals = sorted(finite(values))
     if not vals:
         return math.nan
-    idx = min(len(vals) - 1, max(0, int(round((pct / 100.0) * (len(vals) - 1)))))
-    return vals[idx]
+    if len(vals) == 1:
+        return vals[0]
+    pos = min(len(vals) - 1, max(0.0, (pct / 100.0) * (len(vals) - 1)))
+    lo = int(math.floor(pos))
+    hi = min(len(vals) - 1, lo + 1)
+    frac = pos - lo
+    return vals[lo] * (1.0 - frac) + vals[hi] * frac
+
+
+def drop_top(values: Iterable[float], count: int) -> list[float]:
+    vals = sorted(finite(values))
+    if count <= 0 or len(vals) <= count:
+        return vals
+    return vals[:-count]
 
 
 def parse_pairs(line: str) -> dict:
@@ -194,21 +228,55 @@ def load_phase6_epochs(run_root: Path, workers: Optional[set[str]]) -> list[dict
         row["worker"] = worker
         rows.append(row)
     rows.sort(key=lambda r: (str(r["repeat"]), str(r["mode"]), to_float(r.get("tNs")), str(r["worker"])))
+    add_worker_relative_times(rows)
     return rows
 
 
-def resolve_switch_log_dir(run_root: Path) -> Optional[Path]:
+def add_worker_relative_times(rows: list[dict]) -> None:
+    starts: dict[tuple[str, str, str], float] = {}
+    for row in rows:
+        key = (str(row["repeat"]), str(row["mode"]), str(row["worker"]))
+        t_ns = to_float(row.get("tNs"))
+        if not math.isfinite(t_ns):
+            continue
+        starts[key] = min(starts.get(key, t_ns), t_ns)
+    for row in rows:
+        key = (str(row["repeat"]), str(row["mode"]), str(row["worker"]))
+        t_ns = to_float(row.get("tNs"))
+        start_ns = starts.get(key, t_ns)
+        row["relNs"] = max(0.0, t_ns - start_ns)
+
+
+def resolve_switch_log_dir(run_root: Path, explicit_switch_log_dir: Optional[Path] = None) -> Optional[Path]:
+    if explicit_switch_log_dir is not None:
+        explicit = explicit_switch_log_dir.expanduser().resolve()
+        if explicit.exists():
+            return explicit
     env_path = run_root / "switch_logger.env"
     if not env_path.exists():
         return None
     candidates: list[Path] = []
+    run_ids: list[str] = []
     for line in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
         line = line.strip()
         if line.startswith("SWITCH_LOG_LOCAL_DIR=") or line.startswith("SWITCH_LOG_DIR="):
             candidates.append(Path(line.split("=", 1)[1].strip()))
         elif line.startswith("SWITCH_LOG_RUN_ID="):
             run_id = line.split("=", 1)[1].strip()
+            run_ids.append(run_id)
             candidates.extend(root / run_id for root in SWITCH_SHARED_ROOTS)
+    for run_id in run_ids:
+        for parent in [run_root, *run_root.parents]:
+            candidates.extend(
+                [
+                    parent / "switch_log" / run_id,
+                    parent / "switch_log" / "switch_log" / run_id,
+                    parent.parent / "switch_log" / run_id if parent.parent != parent else parent / "switch_log" / run_id,
+                    parent.parent / "switch_log" / "switch_log" / run_id
+                    if parent.parent != parent
+                    else parent / "switch_log" / "switch_log" / run_id,
+                ]
+            )
     seen: set[str] = set()
     for candidate in candidates:
         variants = [candidate]
@@ -325,15 +393,14 @@ def bucket_rate(series: list[tuple[int, float]], start_ns: int, end_ns: int, buc
     return points
 
 
-def load_switch_bundle(run_root: Path) -> Optional[dict]:
-    log_dir = resolve_switch_log_dir(run_root)
+def load_switch_bundle(run_root: Path, explicit_switch_log_dir: Optional[Path] = None) -> Optional[dict]:
+    log_dir = resolve_switch_log_dir(run_root, explicit_switch_log_dir)
     if log_dir is None:
         return None
     markers = load_mode_markers(log_dir / "markers.jsonl")
     rack_a = load_cumulative_series(log_dir / "rackA_pfc_aggregate.jsonl", ("rx_pause_total", "tx_pause_total"))
     rack_b = load_cumulative_series(log_dir / "rackB_pfc_aggregate.jsonl", ("rx_pause_total", "tx_pause_total"))
     spine_pfc = load_cumulative_series(log_dir / "spine_pfc_ecn_aggregate.jsonl", ("rx_pause_packets_total", "tx_pause_packets_total"))
-    spine_ecn = load_cumulative_series(log_dir / "spine_pfc_ecn_aggregate.jsonl", ("rx_ecn_marked_packets_total",))
     total_pfc = combine_series([rack_a, rack_b, spine_pfc])
     worker_bytes = load_cumulative_series(
         log_dir / "worker_roce_counters_aggregate.jsonl",
@@ -349,7 +416,6 @@ def load_switch_bundle(run_root: Path) -> Optional[dict]:
         "rackA_pfc": rack_a,
         "rackB_pfc": rack_b,
         "spine_pfc": spine_pfc,
-        "spine_ecn": spine_ecn,
         "total_pfc": total_pfc,
         "worker_bytes": worker_bytes,
         "worker_cnp": worker_cnp,
@@ -381,8 +447,8 @@ def aligned_switch_window(
     rows: list[dict],
     switch: Optional[dict],
 ) -> tuple[int, int, int, bool]:
-    ctrl_start_ns = int(min(to_float(r.get("tNs")) for r in rows))
-    ctrl_end_ns = int(max(to_float(r.get("tNs")) for r in rows))
+    ctrl_start_ns = 0
+    ctrl_end_ns = int(max(to_float(r.get("relNs")) for r in rows))
     if switch:
         marker = switch.get("markers", {}).get((repeat, mode))
         if marker and "start_ns" in marker:
@@ -396,7 +462,7 @@ def group_rows(rows: list[dict]) -> dict[tuple[str, str], list[dict]]:
     for row in rows:
         groups[(str(row["repeat"]), str(row["mode"]))].append(row)
     for group in groups.values():
-        group.sort(key=lambda r: to_float(r.get("tNs")))
+        group.sort(key=lambda r: (to_float(r.get("relNs")), str(r.get("worker")), to_float(r.get("tNs"))))
     return groups
 
 
@@ -410,13 +476,20 @@ def downsample(rows: list[dict], limit: int = 6000) -> list[dict]:
     return sampled
 
 
-def bucket_ctrl_rows(rows: list[dict], start_ns: int, end_ns: int, bucket_ms: float) -> list[dict]:
+def bucket_ctrl_rows(
+    rows: list[dict],
+    start_ns: int,
+    end_ns: int,
+    bucket_ms: float,
+    plot_pct: float = 99.0,
+    trim_top: int = 0,
+) -> list[dict]:
     if not rows or end_ns <= start_ns:
         return []
     bucket_ns = max(1, int(bucket_ms * 1_000_000.0))
     buckets: dict[int, list[dict]] = defaultdict(list)
     for row in rows:
-        t_ns = int(to_float(row.get("tNs")))
+        t_ns = int(to_float(row.get("relNs")))
         if t_ns < start_ns or t_ns > end_ns:
             continue
         bucket_idx = max(0, int((t_ns - start_ns) // bucket_ns))
@@ -430,7 +503,12 @@ def bucket_ctrl_rows(rows: list[dict], start_ns: int, end_ns: int, bucket_ms: fl
         bucket_end_ns = min(end_ns, bucket_start_ns + bucket_ns)
         rel_mid_s = ((bucket_start_ns + bucket_end_ns) / 2.0 - start_ns) / 1_000_000_000.0
         delays = [to_float(r.get("delayMeanNs")) / 1e6 for r in group]
+        plot_delays = drop_top(delays, trim_top)
         delay_max = [to_float(r.get("delayMaxNs")) / 1e6 for r in group]
+        by_worker: dict[str, list[float]] = defaultdict(list)
+        for row in group:
+            by_worker[str(row.get("worker", ""))].append(to_float(row.get("delayMeanNs")) / 1e6)
+        worker_p99 = [percentile(values, 99) for values in by_worker.values()]
         w_vals = [to_float(r.get("wAfter")) for r in group]
         e_vals = [to_float(r.get("e")) for r in group]
         wstall_vals = [to_float(r.get("wstallRatio")) for r in group]
@@ -443,6 +521,9 @@ def bucket_ctrl_rows(rows: list[dict], start_ns: int, end_ns: int, bucket_ms: fl
                 "delay_p50_ms": percentile(delays, 50),
                 "delay_p95_ms": percentile(delays, 95),
                 "delay_p99_ms": percentile(delays, 99),
+                "delay_plot_tail_ms": percentile(plot_delays, plot_pct),
+                "delay_trimmed_max_ms": max(finite(plot_delays), default=math.nan),
+                "delay_worker_p99_max_ms": max(finite(worker_p99), default=math.nan),
                 "delay_mean_max_ms": max(finite(delays), default=math.nan),
                 "delay_max_peak_ms": max(finite(delay_max), default=math.nan),
                 "w_min": min(finite(w_vals), default=math.nan),
@@ -461,8 +542,10 @@ def write_bucket_csv(
     switch: Optional[dict],
     output_dir: Path,
     bucket_ms: float,
+    plot_pct: float,
+    trim_top: int,
 ) -> Path:
-    path = output_dir / "phase6_bucket_metrics.csv"
+    path = output_dir / "phase6_bin_metrics.csv"
     fields = [
         "repeat",
         "mode",
@@ -471,6 +554,9 @@ def write_bucket_csv(
         "delay_p50_ms",
         "delay_p95_ms",
         "delay_p99_ms",
+        "delay_plot_tail_ms",
+        "delay_trimmed_max_ms",
+        "delay_worker_p99_max_ms",
         "delay_mean_max_ms",
         "delay_max_peak_ms",
         "w_min",
@@ -480,23 +566,20 @@ def write_bucket_csv(
         "decrease_count",
         "increase_count",
         "pfc_delta",
-        "ecn_delta",
     ]
     with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields)
         writer.writeheader()
         for (repeat, mode), rows in sorted(groups.items()):
             ctrl_start_ns, switch_start_ns, switch_end_ns, _marker_aligned = aligned_switch_window(repeat, mode, rows, switch)
-            ctrl_end_ns = int(max(to_float(r.get("tNs")) for r in rows))
-            buckets = bucket_ctrl_rows(rows, ctrl_start_ns, ctrl_end_ns, bucket_ms)
+            ctrl_end_ns = int(max(to_float(r.get("relNs")) for r in rows))
+            buckets = bucket_ctrl_rows(rows, ctrl_start_ns, ctrl_end_ns, bucket_ms, plot_pct, trim_top)
             switch_pfc = bucket_delta(switch["total_pfc"], switch_start_ns, switch_end_ns, bucket_ms) if switch else []
-            switch_ecn = bucket_delta(switch["spine_ecn"], switch_start_ns, switch_end_ns, bucket_ms) if switch else []
             for idx, bucket in enumerate(buckets):
                 out = {key: bucket.get(key, "") for key in fields}
                 out["repeat"] = repeat
                 out["mode"] = mode
                 out["pfc_delta"] = switch_pfc[idx][1] if idx < len(switch_pfc) else 0.0
-                out["ecn_delta"] = switch_ecn[idx][1] if idx < len(switch_ecn) else 0.0
                 writer.writerow(out)
     return path
 
@@ -504,7 +587,7 @@ def write_bucket_csv(
 def plot_group(repeat: str, mode: str, rows: list[dict], switch: Optional[dict], output_dir: Path, bucket_ms: float) -> str:
     start_ns, switch_start_ns, switch_end_ns, marker_aligned = aligned_switch_window(repeat, mode, rows, switch)
     plot_rows = downsample(rows)
-    xs = [(to_float(r.get("tNs")) - start_ns) / 1_000_000_000.0 for r in plot_rows]
+    xs = [to_float(r.get("relNs")) / 1_000_000_000.0 for r in plot_rows]
     decrease_rows = [r for r in rows if r.get("action") == "decrease"]
     increase_rows = [r for r in rows if r.get("action") == "increase"]
 
@@ -525,12 +608,9 @@ def plot_group(repeat: str, mode: str, rows: list[dict], switch: Optional[dict],
 
     if switch:
         total_pfc = bucket_delta(switch["total_pfc"], switch_start_ns, switch_end_ns, bucket_ms)
-        spine_ecn = bucket_delta(switch["spine_ecn"], switch_start_ns, switch_end_ns, bucket_ms)
         worker_gbps = bucket_rate(switch["worker_bytes"], switch_start_ns, switch_end_ns, bucket_ms, scale=8e-9)
         if total_pfc:
-            axes[3].plot([x for x, _ in total_pfc], [y for _, y in total_pfc], label="total PFC delta/bucket", color="#111827")
-        if spine_ecn:
-            axes[3].plot([x for x, _ in spine_ecn], [y for _, y in spine_ecn], label="spine ECN delta/bucket", color="#8c564b")
+            axes[3].plot([x for x, _ in total_pfc], [y for _, y in total_pfc], label="total PFC delta/bin", color="#111827")
         if worker_gbps:
             ax2 = axes[3].twinx()
             ax2.plot([x for x, _ in worker_gbps], [y for _, y in worker_gbps], label="worker NIC Gbps", color="#17becf", alpha=0.7)
@@ -541,10 +621,10 @@ def plot_group(repeat: str, mode: str, rows: list[dict], switch: Optional[dict],
 
     for ax in axes:
         for row in decrease_rows:
-            x = (to_float(row.get("tNs")) - start_ns) / 1_000_000_000.0
+            x = to_float(row.get("relNs")) / 1_000_000_000.0
             ax.axvline(x, color="#b91c1c", alpha=0.22, linewidth=1.2)
         for row in increase_rows:
-            x = (to_float(row.get("tNs")) - start_ns) / 1_000_000_000.0
+            x = to_float(row.get("relNs")) / 1_000_000_000.0
             ax.axvline(x, color="#047857", alpha=0.22, linewidth=1.2)
         ax.grid(True, alpha=0.25)
 
@@ -565,10 +645,14 @@ def plot_bucket_group(
     switch: Optional[dict],
     output_dir: Path,
     bucket_ms: float,
+    plot_pct: float,
+    trim_top: int,
+    ymax_pct: float,
+    explicit_ymax_ms: Optional[float],
 ) -> str:
     start_ns, switch_start_ns, switch_end_ns, marker_aligned = aligned_switch_window(repeat, mode, rows, switch)
-    end_ns = int(max(to_float(r.get("tNs")) for r in rows))
-    buckets = bucket_ctrl_rows(rows, start_ns, end_ns, bucket_ms)
+    end_ns = int(max(to_float(r.get("relNs")) for r in rows))
+    buckets = bucket_ctrl_rows(rows, start_ns, end_ns, bucket_ms, plot_pct, trim_top)
     if not buckets:
         return ""
     xs = [b["rel_mid_s"] for b in buckets]
@@ -579,7 +663,29 @@ def plot_bucket_group(
     axes[0].plot(xs, [b["delay_p50_ms"] for b in buckets], label="POST-DONE p50", color="#9ca3af", linewidth=1.0)
     axes[0].plot(xs, [b["delay_p95_ms"] for b in buckets], label="POST-DONE p95", color="#f97316", linewidth=1.0)
     axes[0].plot(xs, [b["delay_p99_ms"] for b in buckets], label="POST-DONE p99", color="#dc2626", linewidth=1.2)
-    axes[0].plot(xs, [b["delay_mean_max_ms"] for b in buckets], label="POST-DONE mean max", color="#7f1d1d", linewidth=0.9, alpha=0.75)
+    axes[0].plot(xs, [b["delay_worker_p99_max_ms"] for b in buckets], label="max worker p99", color="#991b1b", linewidth=1.0, linestyle="--")
+    axes[0].plot(xs, [b["delay_plot_tail_ms"] for b in buckets], label=f"trim-top{trim_top} p{plot_pct:g}", color="#7f1d1d", linewidth=0.9, alpha=0.75)
+    axes[0].plot(xs, [b["delay_trimmed_max_ms"] for b in buckets], label=f"trim-top{trim_top} max", color="#374151", linewidth=0.8, alpha=0.65)
+    y_candidates = []
+    for bucket in buckets:
+        y_candidates.extend(
+            [
+                bucket["delay_p50_ms"],
+                bucket["delay_p95_ms"],
+                bucket["delay_p99_ms"],
+                bucket["delay_worker_p99_max_ms"],
+                bucket["delay_plot_tail_ms"],
+                bucket["delay_trimmed_max_ms"],
+            ]
+        )
+    if explicit_ymax_ms is not None and explicit_ymax_ms > 0:
+        y_max = explicit_ymax_ms
+    else:
+        y_max = percentile(y_candidates, ymax_pct)
+        if not math.isfinite(y_max) or y_max <= 0:
+            y_max = max(finite(y_candidates), default=1.0)
+        y_max *= 1.15
+    axes[0].set_ylim(bottom=0, top=max(y_max, 1.0))
     axes[0].set_ylabel("POST-DONE ms")
     axes[0].legend(loc="upper right")
 
@@ -596,11 +702,8 @@ def plot_bucket_group(
 
     if switch:
         total_pfc = bucket_delta(switch["total_pfc"], switch_start_ns, switch_end_ns, bucket_ms)
-        spine_ecn = bucket_delta(switch["spine_ecn"], switch_start_ns, switch_end_ns, bucket_ms)
         if total_pfc:
-            axes[3].plot([x for x, _ in total_pfc], [y for _, y in total_pfc], label="total PFC delta/bucket", color="#111827")
-        if spine_ecn:
-            axes[3].plot([x for x, _ in spine_ecn], [y for _, y in spine_ecn], label="spine ECN delta/bucket", color="#8c564b")
+            axes[3].plot([x for x, _ in total_pfc], [y for _, y in total_pfc], label="total PFC delta/bin", color="#111827")
     axes[3].set_ylabel("Switch delta")
     axes[3].legend(loc="upper right")
 
@@ -609,26 +712,29 @@ def plot_bucket_group(
         pfc_vals = [y for _, y in total_pfc[: len(buckets)]]
         delay_vals = [b["delay_p99_ms"] for b in buckets[: len(pfc_vals)]]
         axes[4].scatter(pfc_vals, delay_vals, s=18, alpha=0.65, color="#4b5563")
-        axes[4].set_xlabel("PFC delta / bucket")
+        axes[4].set_xlabel("PFC delta / analysis bin")
         axes[4].set_ylabel("POST-DONE p99 ms")
     else:
         axes[4].set_ylabel("PFC unavailable")
 
     for ax in axes[:4]:
         for row in decrease_rows:
-            x = (to_float(row.get("tNs")) - start_ns) / 1_000_000_000.0
+            x = to_float(row.get("relNs")) / 1_000_000_000.0
             ax.axvline(x, color="#b91c1c", alpha=0.22, linewidth=1.2)
         for row in increase_rows:
-            x = (to_float(row.get("tNs")) - start_ns) / 1_000_000_000.0
+            x = to_float(row.get("relNs")) / 1_000_000_000.0
             ax.axvline(x, color="#047857", alpha=0.22, linewidth=1.2)
         ax.grid(True, alpha=0.25)
     axes[4].grid(True, alpha=0.25)
 
     axes[3].set_xlabel("Time since P6 CTRL_EPOCH start (s)")
     alignment = "switch mode_start aligned" if marker_aligned else "not switch-aligned"
-    fig.suptitle(f"{repeat} {mode}: Bucketed POST-DONE/W vs PFC ({bucket_ms:g} ms, {alignment})")
+    fig.suptitle(
+        f"{repeat} {mode}: Binned POST-DONE/W vs PFC "
+        f"({bucket_ms:g} ms, trim-top{trim_top} p{plot_pct:g}, {alignment})"
+    )
     fig.tight_layout()
-    name = f"{repeat}_{mode}_bucketed_w_pfc_delay.png"
+    name = f"{repeat}_{mode}_binned_w_pfc_delay.png"
     fig.savefig(output_dir / name, dpi=150)
     plt.close(fig)
     return name
@@ -645,7 +751,7 @@ def plot_event_centered(
     bucket_ms: float,
     window_sec: float,
 ) -> str:
-    event_ns = int(to_float(event_row.get("tNs")))
+    event_ns = int(to_float(event_row.get("relNs")))
     window_ns = int(window_sec * 1_000_000_000.0)
     channel = event_row.get("channel")
     worker = event_row.get("worker")
@@ -654,11 +760,11 @@ def plot_event_centered(
         for r in rows
         if r.get("worker") == worker
         and r.get("channel") == channel
-        and event_ns - window_ns <= int(to_float(r.get("tNs"))) <= event_ns + window_ns
+        and event_ns - window_ns <= int(to_float(r.get("relNs"))) <= event_ns + window_ns
     ]
     if not local_rows:
         return ""
-    xs = [(to_float(r.get("tNs")) - event_ns) / 1_000_000_000.0 for r in local_rows]
+    xs = [(to_float(r.get("relNs")) - event_ns) / 1_000_000_000.0 for r in local_rows]
     ctrl_start_ns, switch_start_ns, _switch_end_ns, marker_aligned = aligned_switch_window(repeat, mode, rows, switch)
     aligned_event_ns = switch_start_ns + (event_ns - ctrl_start_ns) if marker_aligned else event_ns
 
@@ -679,11 +785,8 @@ def plot_event_centered(
 
     if switch:
         pfc = bucket_delta(switch["total_pfc"], aligned_event_ns - window_ns, aligned_event_ns + window_ns, bucket_ms)
-        ecn = bucket_delta(switch["spine_ecn"], aligned_event_ns - window_ns, aligned_event_ns + window_ns, bucket_ms)
         if pfc:
-            axes[3].plot([x - window_sec for x, _ in pfc], [y for _, y in pfc], label="total PFC delta/bucket", color="#111827")
-        if ecn:
-            axes[3].plot([x - window_sec for x, _ in ecn], [y for _, y in ecn], label="spine ECN delta/bucket", color="#8c564b")
+            axes[3].plot([x - window_sec for x, _ in pfc], [y for _, y in pfc], label="total PFC delta/bin", color="#111827")
     axes[3].set_ylabel("Switch delta")
     axes[3].legend(loc="upper right")
 
@@ -712,6 +815,7 @@ def write_event_csv(groups: dict[tuple[str, str], list[dict]], switch: Optional[
         "channel",
         "action",
         "tNs",
+        "relTimeS",
         "aligned_switch_unix_ns",
         "wBefore",
         "wAfter",
@@ -720,8 +824,6 @@ def write_event_csv(groups: dict[tuple[str, str], list[dict]], switch: Optional[
         "delaySlowMs",
         "pfc_before",
         "pfc_after",
-        "ecn_before",
-        "ecn_after",
         "worker_gb_before",
         "worker_gb_after",
         "cnp_before",
@@ -737,7 +839,8 @@ def write_event_csv(groups: dict[tuple[str, str], list[dict]], switch: Optional[
                 if row.get("action") not in ("decrease", "increase"):
                     continue
                 t_ns = int(to_float(row.get("tNs")))
-                aligned_t_ns = switch_start_ns + (t_ns - ctrl_start_ns) if marker_aligned else t_ns
+                rel_ns = int(to_float(row.get("relNs")))
+                aligned_t_ns = switch_start_ns + rel_ns if marker_aligned else rel_ns
                 out = {
                     "repeat": repeat,
                     "mode": mode,
@@ -745,6 +848,7 @@ def write_event_csv(groups: dict[tuple[str, str], list[dict]], switch: Optional[
                     "channel": row.get("channel"),
                     "action": row.get("action"),
                     "tNs": t_ns,
+                    "relTimeS": rel_ns / 1_000_000_000.0,
                     "aligned_switch_unix_ns": aligned_t_ns if marker_aligned else "",
                     "wBefore": row.get("wBefore"),
                     "wAfter": row.get("wAfter"),
@@ -753,8 +857,6 @@ def write_event_csv(groups: dict[tuple[str, str], list[dict]], switch: Optional[
                     "delaySlowMs": to_float(row.get("delaySlowNs")) / 1e6,
                     "pfc_before": 0.0,
                     "pfc_after": 0.0,
-                    "ecn_before": 0.0,
-                    "ecn_after": 0.0,
                     "worker_gb_before": 0.0,
                     "worker_gb_after": 0.0,
                     "cnp_before": 0.0,
@@ -763,8 +865,6 @@ def write_event_csv(groups: dict[tuple[str, str], list[dict]], switch: Optional[
                 if switch:
                     out["pfc_before"] = window_delta(switch["total_pfc"], aligned_t_ns - window_ns, aligned_t_ns)
                     out["pfc_after"] = window_delta(switch["total_pfc"], aligned_t_ns, aligned_t_ns + window_ns)
-                    out["ecn_before"] = window_delta(switch["spine_ecn"], aligned_t_ns - window_ns, aligned_t_ns)
-                    out["ecn_after"] = window_delta(switch["spine_ecn"], aligned_t_ns, aligned_t_ns + window_ns)
                     out["worker_gb_before"] = window_delta(switch["worker_bytes"], aligned_t_ns - window_ns, aligned_t_ns) * 8e-9
                     out["worker_gb_after"] = window_delta(switch["worker_bytes"], aligned_t_ns, aligned_t_ns + window_ns) * 8e-9
                     out["cnp_before"] = window_delta(switch["worker_cnp"], aligned_t_ns - window_ns, aligned_t_ns)
@@ -801,8 +901,8 @@ code {{ background: #eef2f7; padding: 2px 5px; border-radius: 4px; }}
 <h1>Phase6 W Adjustment vs Network Congestion</h1>
 <p><code>{switch_msg}</code></p>
 <p>Red vertical lines are W decrease events. Green vertical lines are W increase events. Switch metrics are aligned with <code>mode_start</code> markers from <code>markers.jsonl</code>.</p>
-<p>Bucket metrics are in <code>{html.escape(bucket_csv.name)}</code>. Event before/after network deltas are in <code>{html.escape(event_csv.name)}</code>.</p>
-{image_section("Bucketed Timeline: POST-DONE p99/max, W, PFC", bucket_images)}
+<p>Analysis-bin metrics are in <code>{html.escape(bucket_csv.name)}</code>. Event before/after network deltas are in <code>{html.escape(event_csv.name)}</code>.</p>
+{image_section("Binned Timeline: POST-DONE p99/max, W, PFC", bucket_images)}
 {image_section("Event-Centered W Decrease Windows", event_images)}
 {image_section("Raw Timeline", raw_images)}
 </body></html>
@@ -817,20 +917,35 @@ def main() -> None:
     run_root = args.input.resolve()
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.bin_ms is not None:
+        args.bucket_ms = args.bin_ms
 
     workers = None if args.all_workers else {item.strip() for item in args.workers.split(",") if item.strip()}
     rows = load_phase6_epochs(run_root, workers)
     groups = group_rows(rows)
-    switch = load_switch_bundle(run_root)
+    switch = load_switch_bundle(run_root, args.switch_log_dir)
     event_csv = write_event_csv(groups, switch, output_dir, args.event_window_sec)
-    bucket_csv = write_bucket_csv(groups, switch, output_dir, args.bucket_ms)
-    raw_images = [
-        plot_group(repeat, mode, group, switch, output_dir, args.bucket_ms)
-        for (repeat, mode), group in sorted(groups.items())
-        if group
-    ]
+    bucket_csv = write_bucket_csv(groups, switch, output_dir, args.bucket_ms, args.delay_plot_pct, args.delay_trim_top)
+    raw_images = []
+    if not args.skip_raw:
+        raw_images = [
+            plot_group(repeat, mode, group, switch, output_dir, args.bucket_ms)
+            for (repeat, mode), group in sorted(groups.items())
+            if group
+        ]
     bucket_images = [
-        plot_bucket_group(repeat, mode, group, switch, output_dir, args.bucket_ms)
+        plot_bucket_group(
+            repeat,
+            mode,
+            group,
+            switch,
+            output_dir,
+            args.bucket_ms,
+            args.delay_plot_pct,
+            args.delay_trim_top,
+            args.delay_ymax_pct,
+            args.delay_ymax_ms,
+        )
         for (repeat, mode), group in sorted(groups.items())
         if group
     ]

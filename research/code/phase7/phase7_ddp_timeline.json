@@ -1,0 +1,81 @@
+{
+  "phase": "phase7",
+  "name": "ddp_backward_timeline",
+  "description": "DDP backward timeline with switch-side PFC pause/deadlock correlation.",
+  "run": {
+    "run_id_prefix": "phase7_ddp_timeline",
+    "master_server": "worker01",
+    "master_addr": "172.16.0.101",
+    "master_port": 40100,
+    "all_workers": [
+      "worker01",
+      "worker02",
+      "worker06",
+      "worker07"
+    ],
+    "run_modes": [
+      "stock"
+    ],
+    "repeats": 1,
+    "steps": 100,
+    "warmup_steps": 10,
+    "mode_timeout_sec": 900,
+    "mode_delay_sec": 0,
+    "torch_env": "/workspace/venvs/torch-cu121-custom/bin/activate",
+    "target_script": "research/code/phase7/ddp_phase7_timeline.py",
+    "worker_script": "research/code/phase4/run_b4_mode_worker.sh",
+    "compare_script": "research/code/phase4/compare_b4_vs_stock.py",
+    "summary_script": "research/code/phase4/phase4_ncc_event_summary.py",
+    "summary_output_name": "phase7_ncc_event_summary.json"
+  },
+  "paths": {
+    "log_root_base": "/mnt/nfs_share/cts_experiments",
+    "host_repo_root": "",
+    "remote_repo_root": "/home/{user}/hyoeun/nccl",
+    "remote_repo_root_map": "",
+    "container_repo_root": "/workspace/nccl",
+    "network_topology_file": "research/env/network_topology_internal_ips.txt"
+  },
+  "container": {
+    "name": "nccl-cu121-dev",
+    "reset_at_start": 1,
+    "restart_on_failure": 1
+  },
+  "ssh": {
+    "worker_ssh_user": "",
+    "worker_ssh_user_map": "",
+    "worker_ssh_port": 14760,
+    "worker_ssh_port_map": "",
+    "ssh_connect_timeout_sec": 10
+  },
+  "model": {
+    "dtype": "float32",
+    "hidden_dim": 2048,
+    "num_layers": 4,
+    "batch_size": 16,
+    "bucket_cap_mb": 1,
+    "lr": 0.01,
+    "model_seed": 20260504
+  },
+  "nccl": {
+    "algo": "Ring",
+    "proto": "auto",
+    "phase0_log": 1,
+    "phase4_log": 0,
+    "phase5_log": 1,
+    "phase6_log": 0,
+    "phase7_log": 0,
+    "appendix2_group_log": 0,
+    "debug": "INFO",
+    "debug_subsys": "NET",
+    "net_gdr_level": 0
+  },
+  "mode_matrix": [
+    {
+      "mode_id": "stock",
+      "label": "STOCK",
+      "phase4_enable": 0,
+      "post_receive_w": null
+    }
+  ]
+}
