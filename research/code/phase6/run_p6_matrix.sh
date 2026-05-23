@@ -22,4 +22,9 @@ export NCCL_PHASE6_INTEGRAL_LIMIT_PCT=${NCCL_PHASE6_INTEGRAL_LIMIT_PCT:-500}
 export NCCL_PHASE6_ALPHA_FAST_PCT=${NCCL_PHASE6_ALPHA_FAST_PCT:-30}
 export NCCL_PHASE6_ALPHA_SLOW_PCT=${NCCL_PHASE6_ALPHA_SLOW_PCT:-5}
 
+# Optional switch logger v2 port filters. Leave empty to use logger-side active-port discovery.
+export SWITCH_SPINE_PORTS=${SWITCH_SPINE_PORTS:-}
+export SWITCH_RACKA_PORTS=${SWITCH_RACKA_PORTS:-}
+export SWITCH_RACKB_PORTS=${SWITCH_RACKB_PORTS:-}
+
 exec bash "${REPO_ROOT}/research/code/phase4/run_b4_matrix.sh" --config "${CONFIG_PATH}" "$@"

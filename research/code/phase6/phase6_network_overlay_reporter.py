@@ -835,6 +835,71 @@ def plot_bucket_group(
     return name
 
 
+def plot_switch_pfc_components(
+    repeat: str,
+    mode: str,
+    rows: list[dict],
+    switch: Optional[dict],
+    output_dir: Path,
+    bucket_ms: float,
+) -> str:
+    if not switch:
+        return ""
+    ctrl_start_ns, switch_start_ns, switch_end_ns, marker_aligned = aligned_switch_window(repeat, mode, rows, switch)
+    if switch_end_ns <= switch_start_ns:
+        return ""
+
+    pfc_series = [
+        ("total PFC", "total_pfc", "#111827", "-"),
+        ("rackA PFC", "rackA_pfc", "#2563eb", "-"),
+        ("rackB PFC", "rackB_pfc", "#16a34a", "-"),
+        ("spine PFC", "spine_pfc", "#f97316", "-"),
+    ]
+    deadlock_series = [
+        ("rackA deadlock", "rackA_deadlock", "#7f1d1d", "-"),
+        ("rackB deadlock", "rackB_deadlock", "#be123c", "--"),
+        ("total deadlock", "total_deadlock", "#450a0a", ":"),
+    ]
+    if not any(switch.get(key) for _label, key, _color, _style in pfc_series + deadlock_series):
+        return ""
+
+    decrease_rows = [r for r in rows if r.get("action") == "decrease"]
+    increase_rows = [r for r in rows if r.get("action") == "increase"]
+
+    fig, axes = plt.subplots(2, 1, figsize=(18, 9), sharex=True)
+    for label, key, color, linestyle in pfc_series:
+        points = bucket_delta(switch.get(key, []), switch_start_ns, switch_end_ns, bucket_ms)
+        if points:
+            axes[0].plot([x for x, _ in points], [y for _, y in points], label=f"{label} delta/bin", color=color, linestyle=linestyle)
+    axes[0].set_ylabel("PFC delta")
+    axes[0].legend(loc="upper right")
+
+    for label, key, color, linestyle in deadlock_series:
+        points = bucket_delta(switch.get(key, []), switch_start_ns, switch_end_ns, bucket_ms)
+        if points:
+            axes[1].plot([x for x, _ in points], [y for _, y in points], label=f"{label} delta/bin", color=color, linestyle=linestyle)
+    axes[1].set_ylabel("Deadlock delta")
+    axes[1].legend(loc="upper right")
+
+    for ax in axes:
+        for row in decrease_rows:
+            x = (to_float(row.get("relNs")) - ctrl_start_ns) / 1_000_000_000.0
+            ax.axvline(x, color="#b91c1c", alpha=0.22, linewidth=1.2)
+        for row in increase_rows:
+            x = (to_float(row.get("relNs")) - ctrl_start_ns) / 1_000_000_000.0
+            ax.axvline(x, color="#047857", alpha=0.22, linewidth=1.2)
+        ax.grid(True, alpha=0.25)
+
+    axes[-1].set_xlabel("Time since aligned Phase6 start (s)")
+    alignment = "switch mode_start aligned" if marker_aligned else "not switch-aligned"
+    fig.suptitle(f"{repeat} {mode}: Switch PFC Component Breakdown ({bucket_ms:g} ms, {alignment})")
+    fig.tight_layout()
+    name = f"{repeat}_{mode}_switch_pfc_components.png"
+    fig.savefig(output_dir / name, dpi=150)
+    plt.close(fig)
+    return name
+
+
 def plot_event_centered(
     repeat: str,
     mode: str,
@@ -990,6 +1055,7 @@ def write_html(
     output_dir: Path,
     raw_images: list[str],
     bucket_images: list[str],
+    component_images: list[str],
     event_images: list[str],
     event_csv: Path,
     bucket_csv: Path,
@@ -1016,7 +1082,9 @@ code {{ background: #eef2f7; padding: 2px 5px; border-radius: 4px; }}
 <p>Red vertical lines are W decrease events. Green vertical lines are W increase events. If <code>CTRL_ANCHOR</code> exists, NCCL monotonic time is converted to unix time and aligned to switch <code>mode_start</code>. Without anchor logs, the reporter falls back to first <code>CTRL_EPOCH</code> relative alignment.</p>
 <p>Analysis-bin metrics are in <code>{html.escape(bucket_csv.name)}</code>. Event before/after network deltas are in <code>{html.escape(event_csv.name)}</code>.</p>
 <p>PFC deadlock is plotted from <code>rackA_pfc_deadlock_aggregate.jsonl</code> and <code>rackB_pfc_deadlock_aggregate.jsonl</code> using <code>deadlock_count_total</code> deltas.</p>
+<p>The main timeline keeps <code>total_pfc = rackA + rackB + spine</code>. The component breakdown below plots rackA, rackB, and spine separately so switch-local congestion can be distinguished from total network pressure.</p>
 {image_section("Binned Timeline: POST-DONE p99/max, W, PFC, Deadlock", bucket_images)}
+{image_section("Switch PFC Component Breakdown", component_images)}
 {image_section("Event-Centered W Decrease Windows", event_images)}
 {image_section("Raw Timeline", raw_images)}
 </body></html>
@@ -1065,6 +1133,12 @@ def main() -> None:
         if group
     ]
     bucket_images = [name for name in bucket_images if name]
+    component_images = [
+        plot_switch_pfc_components(repeat, mode, group, switch, output_dir, args.bucket_ms)
+        for (repeat, mode), group in sorted(groups.items())
+        if group
+    ]
+    component_images = [name for name in component_images if name]
 
     event_images: list[str] = []
     event_count = 0
@@ -1089,7 +1163,7 @@ def main() -> None:
         if event_count >= args.max_event_plots:
             break
 
-    html_path = write_html(output_dir, raw_images, bucket_images, event_images, event_csv, bucket_csv, switch)
+    html_path = write_html(output_dir, raw_images, bucket_images, component_images, event_images, event_csv, bucket_csv, switch)
     worker_msg = "all" if workers is None else ",".join(sorted(workers))
     anchor_rows = sum(1 for row in rows if int(to_float(row.get("anchorAligned"), 0)) == 1)
     print(

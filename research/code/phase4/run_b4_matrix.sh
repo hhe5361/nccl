@@ -32,6 +32,9 @@ SWITCH_LOGGER_ROOT=${SWITCH_LOGGER_ROOT:-/home/ubuntu/hyoeun/switch_setup_task}
 SWITCH_LOGGER_V2_SUBDIR=${SWITCH_LOGGER_V2_SUBDIR:-switch_congestion_logger_v2}
 SWITCH_LOG_INTERVAL_SEC=${SWITCH_LOG_INTERVAL_SEC:-1}
 SWITCH_LOG_SHARED_ROOT=${SWITCH_LOG_SHARED_ROOT:-/mnt/nfs_share/cts_experiments/switch_log}
+SWITCH_SPINE_PORTS=${SWITCH_SPINE_PORTS:-}
+SWITCH_RACKA_PORTS=${SWITCH_RACKA_PORTS:-}
+SWITCH_RACKB_PORTS=${SWITCH_RACKB_PORTS:-}
 DPU_NODE_HOST=${DPU_NODE_HOST:-172.16.0.100}
 DPU_NODE_USER=${DPU_NODE_USER:-ubuntu}
 DPU_NODE_PORT=${DPU_NODE_PORT:-22}
@@ -286,6 +289,15 @@ start_switch_logger() {
     cmd+="export NETWORK_NODE_PORT=$(printf '%q' "${NETWORK_NODE_PORT}") && "
   fi
   cmd+="./start_switch_congestion_loggers.sh --interval-sec $(printf '%q' "${SWITCH_LOG_INTERVAL_SEC}") --network-node-password $(printf '%q' "${NETWORK_NODE_PASSWORD}") --switch-password $(printf '%q' "${SWITCH_PASSWORD}")"
+  if [[ -n "${SWITCH_SPINE_PORTS}" ]]; then
+    cmd+=" --spine-ports $(printf '%q' "${SWITCH_SPINE_PORTS}")"
+  fi
+  if [[ -n "${SWITCH_RACKA_PORTS}" ]]; then
+    cmd+=" --racka-ports $(printf '%q' "${SWITCH_RACKA_PORTS}")"
+  fi
+  if [[ -n "${SWITCH_RACKB_PORTS}" ]]; then
+    cmd+=" --rackb-ports $(printf '%q' "${SWITCH_RACKB_PORTS}")"
+  fi
   output=$(remote_dpu_bash "${cmd}")
   while IFS='=' read -r key value; do
     case "${key}" in
@@ -312,6 +324,9 @@ SWITCH_LOG_PID_FILE=${SWITCH_LOG_PID_FILE}
 SWITCH_LOG_MARKERS_JSONL=${SWITCH_LOG_MARKERS_JSONL}
 SWITCH_LOGGER_ROOT=${SWITCH_LOGGER_ROOT}
 SWITCH_LOGGER_V2_SUBDIR=${SWITCH_LOGGER_V2_SUBDIR}
+SWITCH_SPINE_PORTS=${SWITCH_SPINE_PORTS}
+SWITCH_RACKA_PORTS=${SWITCH_RACKA_PORTS}
+SWITCH_RACKB_PORTS=${SWITCH_RACKB_PORTS}
 NET_BURST=${NET_BURST}
 EOF
 }
