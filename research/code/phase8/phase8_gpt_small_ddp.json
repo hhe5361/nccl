@@ -1,9 +1,9 @@
 {
-  "phase": "phase6",
-  "name": "p6_spike_runtime_ddp",
-  "description": "Runtime spike-based receiver-side W controller. Logs W timeline, POST-to-NET_DONE delay, internal throughput, and WSTALL ratio for switch PFC overlay.",
+  "phase": "phase8",
+  "name": "gpt_small_ddp_random_tokens",
+  "description": "GPT-small scratch random-token DDP workload for phase6 W controller evaluation.",
   "run": {
-    "run_id_prefix": "phase6_pi_ddp",
+    "run_id_prefix": "phase8_gpt_small_ddp",
     "master_server": "worker01",
     "master_addr": "172.16.0.101",
     "master_port": 40100,
@@ -18,14 +18,16 @@
       "p6_spike"
     ],
     "repeats": 1,
-    "steps": 1000,
+    "steps": 200,
     "warmup_steps": 20,
-    "mode_timeout_sec": 1000,
+    "mode_timeout_sec": 0,
     "mode_delay_sec": 180,
     "torch_env": "/workspace/venvs/torch-cu121-custom/bin/activate",
-    "target_script": "research/code/phase4/ddp_b4.py",
+    "target_script": "research/code/phase8/ddp_gpt_small.py",
     "worker_script": "research/code/phase4/run_b4_mode_worker.sh",
-    "compare_script": "research/code/phase4/compare_b4_vs_stock.py"
+    "compare_script": "research/code/phase4/compare_b4_vs_stock.py",
+    "summary_script": "research/code/phase4/phase4_ncc_event_summary.py",
+    "summary_output_name": "phase8_ncc_event_summary.json"
   },
   "paths": {
     "log_root_base": "/mnt/nfs_share/cts_experiments",
@@ -49,11 +51,15 @@
   },
   "model": {
     "dtype": "float32",
-    "hidden_dim": 4096,
-    "num_layers": 8,
-    "batch_size": 16,
-    "bucket_cap_mb": 1,
-    "lr": 0.01,
+    "hidden_dim": 768,
+    "num_layers": 12,
+    "num_heads": 12,
+    "seq_len": 128,
+    "vocab_size": 50257,
+    "dropout": 0.0,
+    "batch_size": 1,
+    "bucket_cap_mb": 4,
+    "lr": 0.00005,
     "model_seed": 20260504
   },
   "nccl": {

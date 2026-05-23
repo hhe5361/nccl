@@ -25,6 +25,7 @@ SWITCH_SHARED_ROOTS = (
 PAIR_RE = re.compile(r"([A-Za-z0-9_]+)=([^ ]+)")
 NUMERIC_FIELDS = {
     "tNs",
+    "tsUnixNs",
     "rank",
     "peer",
     "channel",
@@ -165,7 +166,7 @@ def parse_pairs(line: str) -> dict:
     return row
 
 
-def run_rg(input_dir: Path, workers: Optional[set[str]]) -> list[tuple[Path, str]]:
+def run_rg(input_dir: Path, workers: Optional[set[str]], needle: str = "PHASE6 event=CTRL_EPOCH") -> list[tuple[Path, str]]:
     if workers:
         log_paths = []
         for worker in sorted(workers):
@@ -189,15 +190,15 @@ def run_rg(input_dir: Path, workers: Optional[set[str]]) -> list[tuple[Path, str
         "--line-number",
         "--threads",
         "4",
-        "PHASE6 event=CTRL_EPOCH",
+        needle,
         *[str(path) for path in log_paths],
     ]
     try:
         proc = subprocess.run(cmd, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except FileNotFoundError:
-        return run_python_scan(log_paths)
+        return run_python_scan(log_paths, needle)
     if proc.returncode not in (0, 1):
-        return run_python_scan(log_paths)
+        return run_python_scan(log_paths, needle)
     matches: list[tuple[Path, str]] = []
     for line in proc.stdout.splitlines():
         path_str, _line_no, payload = line.split(":", 2)
@@ -205,17 +206,37 @@ def run_rg(input_dir: Path, workers: Optional[set[str]]) -> list[tuple[Path, str
     return matches
 
 
-def run_python_scan(log_paths: Iterable[Path]) -> list[tuple[Path, str]]:
+def run_python_scan(log_paths: Iterable[Path], needle: str) -> list[tuple[Path, str]]:
     matches: list[tuple[Path, str]] = []
     for log_path in log_paths:
         with log_path.open("r", encoding="utf-8", errors="replace") as fh:
             for line in fh:
-                if "PHASE6 event=CTRL_EPOCH" in line:
+                if needle in line:
                     matches.append((log_path, line))
     return matches
 
 
+def load_phase6_anchors(run_root: Path, workers: Optional[set[str]]) -> dict[tuple[str, str, str], dict[str, float]]:
+    anchors: dict[tuple[str, str, str], dict[str, float]] = {}
+    for log_path, line in run_rg(run_root, workers, "PHASE6 event=CTRL_ANCHOR"):
+        parts = log_path.relative_to(run_root).parts
+        if len(parts) < 4:
+            continue
+        repeat, mode, worker = parts[:3]
+        row = parse_pairs(line)
+        t_ns = to_float(row.get("tNs"))
+        unix_ns = to_float(row.get("tsUnixNs"))
+        if not math.isfinite(t_ns) or not math.isfinite(unix_ns):
+            continue
+        key = (repeat, mode, worker)
+        previous = anchors.get(key)
+        if previous is None or t_ns < previous["anchor_t_ns"]:
+            anchors[key] = {"anchor_t_ns": t_ns, "anchor_unix_ns": unix_ns}
+    return anchors
+
+
 def load_phase6_epochs(run_root: Path, workers: Optional[set[str]]) -> list[dict]:
+    anchors = load_phase6_anchors(run_root, workers)
     rows: list[dict] = []
     for log_path, line in run_rg(run_root, workers):
         parts = log_path.relative_to(run_root).parts
@@ -229,7 +250,28 @@ def load_phase6_epochs(run_root: Path, workers: Optional[set[str]]) -> list[dict
         rows.append(row)
     rows.sort(key=lambda r: (str(r["repeat"]), str(r["mode"]), to_float(r.get("tNs")), str(r["worker"])))
     add_worker_relative_times(rows)
+    apply_anchor_unix_times(rows, anchors)
+    rows.sort(
+        key=lambda r: (
+            str(r["repeat"]),
+            str(r["mode"]),
+            to_float(r.get("unixNs"), to_float(r.get("tNs"))),
+            str(r["worker"]),
+        )
+    )
     return rows
+
+
+def apply_anchor_unix_times(rows: list[dict], anchors: dict[tuple[str, str, str], dict[str, float]]) -> None:
+    for row in rows:
+        key = (str(row["repeat"]), str(row["mode"]), str(row["worker"]))
+        t_ns = to_float(row.get("tNs"))
+        anchor = anchors.get(key)
+        if anchor is None or not math.isfinite(t_ns):
+            row["anchorAligned"] = 0
+            continue
+        row["unixNs"] = anchor["anchor_unix_ns"] + (t_ns - anchor["anchor_t_ns"])
+        row["anchorAligned"] = 1
 
 
 def add_worker_relative_times(rows: list[dict]) -> None:
@@ -245,6 +287,23 @@ def add_worker_relative_times(rows: list[dict]) -> None:
         t_ns = to_float(row.get("tNs"))
         start_ns = starts.get(key, t_ns)
         row["relNs"] = max(0.0, t_ns - start_ns)
+
+
+def apply_switch_relative_times(rows: list[dict], switch: Optional[dict]) -> int:
+    if not switch:
+        return 0
+    aligned = 0
+    markers = switch.get("markers", {})
+    for row in rows:
+        marker = markers.get((str(row["repeat"]), str(row["mode"])))
+        unix_ns = to_float(row.get("unixNs"))
+        if not marker or "start_ns" not in marker or not math.isfinite(unix_ns):
+            row["switchAligned"] = 0
+            continue
+        row["relNs"] = unix_ns - int(marker["start_ns"])
+        row["switchAligned"] = 1
+        aligned += 1
+    return aligned
 
 
 def resolve_switch_log_dir(run_root: Path, explicit_switch_log_dir: Optional[Path] = None) -> Optional[Path]:
@@ -401,7 +460,10 @@ def load_switch_bundle(run_root: Path, explicit_switch_log_dir: Optional[Path] =
     rack_a = load_cumulative_series(log_dir / "rackA_pfc_aggregate.jsonl", ("rx_pause_total", "tx_pause_total"))
     rack_b = load_cumulative_series(log_dir / "rackB_pfc_aggregate.jsonl", ("rx_pause_total", "tx_pause_total"))
     spine_pfc = load_cumulative_series(log_dir / "spine_pfc_ecn_aggregate.jsonl", ("rx_pause_packets_total", "tx_pause_packets_total"))
+    rack_a_deadlock = load_cumulative_series(log_dir / "rackA_pfc_deadlock_aggregate.jsonl", ("deadlock_count_total",))
+    rack_b_deadlock = load_cumulative_series(log_dir / "rackB_pfc_deadlock_aggregate.jsonl", ("deadlock_count_total",))
     total_pfc = combine_series([rack_a, rack_b, spine_pfc])
+    total_deadlock = combine_series([rack_a_deadlock, rack_b_deadlock])
     worker_bytes = load_cumulative_series(
         log_dir / "worker_roce_counters_aggregate.jsonl",
         ("tx_prio_bytes_total", "rx_prio_bytes_total", "tx_prio_bytes", "rx_prio_bytes"),
@@ -417,6 +479,9 @@ def load_switch_bundle(run_root: Path, explicit_switch_log_dir: Optional[Path] =
         "rackB_pfc": rack_b,
         "spine_pfc": spine_pfc,
         "total_pfc": total_pfc,
+        "rackA_deadlock": rack_a_deadlock,
+        "rackB_deadlock": rack_b_deadlock,
+        "total_deadlock": total_deadlock,
         "worker_bytes": worker_bytes,
         "worker_cnp": worker_cnp,
     }
@@ -447,13 +512,16 @@ def aligned_switch_window(
     rows: list[dict],
     switch: Optional[dict],
 ) -> tuple[int, int, int, bool]:
-    ctrl_start_ns = 0
-    ctrl_end_ns = int(max(to_float(r.get("relNs")) for r in rows))
+    rel_values = finite(to_float(r.get("relNs")) for r in rows)
+    ctrl_start_ns = int(min(0.0, min(rel_values, default=0.0)))
+    ctrl_end_ns = int(max(rel_values, default=0.0))
     if switch:
         marker = switch.get("markers", {}).get((repeat, mode))
         if marker and "start_ns" in marker:
-            switch_start_ns = int(marker["start_ns"])
-            return ctrl_start_ns, switch_start_ns, switch_start_ns + (ctrl_end_ns - ctrl_start_ns), True
+            marker_start_ns = int(marker["start_ns"])
+            if any(int(to_float(row.get("switchAligned"), 0)) == 1 for row in rows):
+                return ctrl_start_ns, marker_start_ns + ctrl_start_ns, marker_start_ns + ctrl_end_ns, True
+            return 0, marker_start_ns, marker_start_ns + ctrl_end_ns, True
     return ctrl_start_ns, ctrl_start_ns, ctrl_end_ns, False
 
 
@@ -566,6 +634,7 @@ def write_bucket_csv(
         "decrease_count",
         "increase_count",
         "pfc_delta",
+        "deadlock_delta",
     ]
     with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fields)
@@ -575,11 +644,13 @@ def write_bucket_csv(
             ctrl_end_ns = int(max(to_float(r.get("relNs")) for r in rows))
             buckets = bucket_ctrl_rows(rows, ctrl_start_ns, ctrl_end_ns, bucket_ms, plot_pct, trim_top)
             switch_pfc = bucket_delta(switch["total_pfc"], switch_start_ns, switch_end_ns, bucket_ms) if switch else []
+            switch_deadlock = bucket_delta(switch["total_deadlock"], switch_start_ns, switch_end_ns, bucket_ms) if switch else []
             for idx, bucket in enumerate(buckets):
                 out = {key: bucket.get(key, "") for key in fields}
                 out["repeat"] = repeat
                 out["mode"] = mode
                 out["pfc_delta"] = switch_pfc[idx][1] if idx < len(switch_pfc) else 0.0
+                out["deadlock_delta"] = switch_deadlock[idx][1] if idx < len(switch_deadlock) else 0.0
                 writer.writerow(out)
     return path
 
@@ -591,7 +662,7 @@ def plot_group(repeat: str, mode: str, rows: list[dict], switch: Optional[dict],
     decrease_rows = [r for r in rows if r.get("action") == "decrease"]
     increase_rows = [r for r in rows if r.get("action") == "increase"]
 
-    fig, axes = plt.subplots(4, 1, figsize=(18, 14), sharex=True)
+    fig, axes = plt.subplots(5, 1, figsize=(18, 16), sharex=True)
     axes[0].plot(xs, [to_float(r.get("wAfter")) for r in plot_rows], linewidth=1.5, label="W", color="#1f77b4")
     axes[0].set_ylabel("W")
     axes[0].legend(loc="upper right")
@@ -618,6 +689,18 @@ def plot_group(repeat: str, mode: str, rows: list[dict], switch: Optional[dict],
             ax2.legend(loc="upper right")
     axes[3].set_ylabel("Switch delta")
     axes[3].legend(loc="upper left")
+
+    if switch:
+        total_deadlock = bucket_delta(switch["total_deadlock"], switch_start_ns, switch_end_ns, bucket_ms)
+        if total_deadlock:
+            axes[4].plot(
+                [x for x, _ in total_deadlock],
+                [y for _, y in total_deadlock],
+                label="total PFC deadlock delta/bin",
+                color="#7f1d1d",
+            )
+    axes[4].set_ylabel("Deadlock delta")
+    axes[4].legend(loc="upper right")
 
     for ax in axes:
         for row in decrease_rows:
@@ -659,7 +742,7 @@ def plot_bucket_group(
     decrease_rows = [r for r in rows if r.get("action") == "decrease"]
     increase_rows = [r for r in rows if r.get("action") == "increase"]
 
-    fig, axes = plt.subplots(5, 1, figsize=(18, 16), sharex=False)
+    fig, axes = plt.subplots(6, 1, figsize=(18, 18), sharex=False)
     axes[0].plot(xs, [b["delay_p50_ms"] for b in buckets], label="POST-DONE p50", color="#9ca3af", linewidth=1.0)
     axes[0].plot(xs, [b["delay_p95_ms"] for b in buckets], label="POST-DONE p95", color="#f97316", linewidth=1.0)
     axes[0].plot(xs, [b["delay_p99_ms"] for b in buckets], label="POST-DONE p99", color="#dc2626", linewidth=1.2)
@@ -708,16 +791,28 @@ def plot_bucket_group(
     axes[3].legend(loc="upper right")
 
     if switch:
+        total_deadlock = bucket_delta(switch["total_deadlock"], switch_start_ns, switch_end_ns, bucket_ms)
+        if total_deadlock:
+            axes[4].plot(
+                [x for x, _ in total_deadlock],
+                [y for _, y in total_deadlock],
+                label="total PFC deadlock delta/bin",
+                color="#7f1d1d",
+            )
+    axes[4].set_ylabel("Deadlock delta")
+    axes[4].legend(loc="upper right")
+
+    if switch:
         total_pfc = bucket_delta(switch["total_pfc"], switch_start_ns, switch_end_ns, bucket_ms)
         pfc_vals = [y for _, y in total_pfc[: len(buckets)]]
         delay_vals = [b["delay_p99_ms"] for b in buckets[: len(pfc_vals)]]
-        axes[4].scatter(pfc_vals, delay_vals, s=18, alpha=0.65, color="#4b5563")
-        axes[4].set_xlabel("PFC delta / analysis bin")
-        axes[4].set_ylabel("POST-DONE p99 ms")
+        axes[5].scatter(pfc_vals, delay_vals, s=18, alpha=0.65, color="#4b5563")
+        axes[5].set_xlabel("PFC delta / analysis bin")
+        axes[5].set_ylabel("POST-DONE p99 ms")
     else:
-        axes[4].set_ylabel("PFC unavailable")
+        axes[5].set_ylabel("PFC unavailable")
 
-    for ax in axes[:4]:
+    for ax in axes[:5]:
         for row in decrease_rows:
             x = to_float(row.get("relNs")) / 1_000_000_000.0
             ax.axvline(x, color="#b91c1c", alpha=0.22, linewidth=1.2)
@@ -725,12 +820,12 @@ def plot_bucket_group(
             x = to_float(row.get("relNs")) / 1_000_000_000.0
             ax.axvline(x, color="#047857", alpha=0.22, linewidth=1.2)
         ax.grid(True, alpha=0.25)
-    axes[4].grid(True, alpha=0.25)
+    axes[5].grid(True, alpha=0.25)
 
-    axes[3].set_xlabel("Time since P6 CTRL_EPOCH start (s)")
+    axes[4].set_xlabel("Time since aligned Phase6 start (s)")
     alignment = "switch mode_start aligned" if marker_aligned else "not switch-aligned"
     fig.suptitle(
-        f"{repeat} {mode}: Binned POST-DONE/W vs PFC "
+        f"{repeat} {mode}: Binned POST-DONE/W vs PFC/Deadlock "
         f"({bucket_ms:g} ms, trim-top{trim_top} p{plot_pct:g}, {alignment})"
     )
     fig.tight_layout()
@@ -768,7 +863,7 @@ def plot_event_centered(
     ctrl_start_ns, switch_start_ns, _switch_end_ns, marker_aligned = aligned_switch_window(repeat, mode, rows, switch)
     aligned_event_ns = switch_start_ns + (event_ns - ctrl_start_ns) if marker_aligned else event_ns
 
-    fig, axes = plt.subplots(4, 1, figsize=(16, 12), sharex=True)
+    fig, axes = plt.subplots(5, 1, figsize=(16, 14), sharex=True)
     axes[0].plot(xs, [to_float(r.get("delayMeanNs")) / 1e6 for r in local_rows], label="delayMean ms", color="#dc2626")
     axes[0].plot(xs, [to_float(r.get("delaySlowNs")) / 1e6 for r in local_rows], label="delaySlow ms", color="#7c3aed", alpha=0.8)
     axes[0].set_ylabel("POST-DONE ms")
@@ -789,6 +884,18 @@ def plot_event_centered(
             axes[3].plot([x - window_sec for x, _ in pfc], [y for _, y in pfc], label="total PFC delta/bin", color="#111827")
     axes[3].set_ylabel("Switch delta")
     axes[3].legend(loc="upper right")
+
+    if switch:
+        deadlock = bucket_delta(switch["total_deadlock"], aligned_event_ns - window_ns, aligned_event_ns + window_ns, bucket_ms)
+        if deadlock:
+            axes[4].plot(
+                [x - window_sec for x, _ in deadlock],
+                [y for _, y in deadlock],
+                label="total PFC deadlock delta/bin",
+                color="#7f1d1d",
+            )
+    axes[4].set_ylabel("Deadlock delta")
+    axes[4].legend(loc="upper right")
 
     for ax in axes:
         ax.axvline(0.0, color="#b91c1c", linewidth=1.5, alpha=0.75, label="_nolegend_")
@@ -824,6 +931,8 @@ def write_event_csv(groups: dict[tuple[str, str], list[dict]], switch: Optional[
         "delaySlowMs",
         "pfc_before",
         "pfc_after",
+        "deadlock_before",
+        "deadlock_after",
         "worker_gb_before",
         "worker_gb_after",
         "cnp_before",
@@ -840,7 +949,7 @@ def write_event_csv(groups: dict[tuple[str, str], list[dict]], switch: Optional[
                     continue
                 t_ns = int(to_float(row.get("tNs")))
                 rel_ns = int(to_float(row.get("relNs")))
-                aligned_t_ns = switch_start_ns + rel_ns if marker_aligned else rel_ns
+                aligned_t_ns = switch_start_ns + (rel_ns - ctrl_start_ns) if marker_aligned else rel_ns
                 out = {
                     "repeat": repeat,
                     "mode": mode,
@@ -857,6 +966,8 @@ def write_event_csv(groups: dict[tuple[str, str], list[dict]], switch: Optional[
                     "delaySlowMs": to_float(row.get("delaySlowNs")) / 1e6,
                     "pfc_before": 0.0,
                     "pfc_after": 0.0,
+                    "deadlock_before": 0.0,
+                    "deadlock_after": 0.0,
                     "worker_gb_before": 0.0,
                     "worker_gb_after": 0.0,
                     "cnp_before": 0.0,
@@ -865,6 +976,8 @@ def write_event_csv(groups: dict[tuple[str, str], list[dict]], switch: Optional[
                 if switch:
                     out["pfc_before"] = window_delta(switch["total_pfc"], aligned_t_ns - window_ns, aligned_t_ns)
                     out["pfc_after"] = window_delta(switch["total_pfc"], aligned_t_ns, aligned_t_ns + window_ns)
+                    out["deadlock_before"] = window_delta(switch["total_deadlock"], aligned_t_ns - window_ns, aligned_t_ns)
+                    out["deadlock_after"] = window_delta(switch["total_deadlock"], aligned_t_ns, aligned_t_ns + window_ns)
                     out["worker_gb_before"] = window_delta(switch["worker_bytes"], aligned_t_ns - window_ns, aligned_t_ns) * 8e-9
                     out["worker_gb_after"] = window_delta(switch["worker_bytes"], aligned_t_ns, aligned_t_ns + window_ns) * 8e-9
                     out["cnp_before"] = window_delta(switch["worker_cnp"], aligned_t_ns - window_ns, aligned_t_ns)
@@ -900,9 +1013,10 @@ code {{ background: #eef2f7; padding: 2px 5px; border-radius: 4px; }}
 </style></head><body>
 <h1>Phase6 W Adjustment vs Network Congestion</h1>
 <p><code>{switch_msg}</code></p>
-<p>Red vertical lines are W decrease events. Green vertical lines are W increase events. Switch metrics are aligned with <code>mode_start</code> markers from <code>markers.jsonl</code>.</p>
+<p>Red vertical lines are W decrease events. Green vertical lines are W increase events. If <code>CTRL_ANCHOR</code> exists, NCCL monotonic time is converted to unix time and aligned to switch <code>mode_start</code>. Without anchor logs, the reporter falls back to first <code>CTRL_EPOCH</code> relative alignment.</p>
 <p>Analysis-bin metrics are in <code>{html.escape(bucket_csv.name)}</code>. Event before/after network deltas are in <code>{html.escape(event_csv.name)}</code>.</p>
-{image_section("Binned Timeline: POST-DONE p99/max, W, PFC", bucket_images)}
+<p>PFC deadlock is plotted from <code>rackA_pfc_deadlock_aggregate.jsonl</code> and <code>rackB_pfc_deadlock_aggregate.jsonl</code> using <code>deadlock_count_total</code> deltas.</p>
+{image_section("Binned Timeline: POST-DONE p99/max, W, PFC, Deadlock", bucket_images)}
 {image_section("Event-Centered W Decrease Windows", event_images)}
 {image_section("Raw Timeline", raw_images)}
 </body></html>
@@ -922,8 +1036,9 @@ def main() -> None:
 
     workers = None if args.all_workers else {item.strip() for item in args.workers.split(",") if item.strip()}
     rows = load_phase6_epochs(run_root, workers)
-    groups = group_rows(rows)
     switch = load_switch_bundle(run_root, args.switch_log_dir)
+    switch_aligned_rows = apply_switch_relative_times(rows, switch)
+    groups = group_rows(rows)
     event_csv = write_event_csv(groups, switch, output_dir, args.event_window_sec)
     bucket_csv = write_bucket_csv(groups, switch, output_dir, args.bucket_ms, args.delay_plot_pct, args.delay_trim_top)
     raw_images = []
@@ -976,7 +1091,11 @@ def main() -> None:
 
     html_path = write_html(output_dir, raw_images, bucket_images, event_images, event_csv, bucket_csv, switch)
     worker_msg = "all" if workers is None else ",".join(sorted(workers))
-    print(f"[phase6-network] rows={len(rows)} groups={len(groups)} workers={worker_msg} switch={bool(switch)} html={html_path}")
+    anchor_rows = sum(1 for row in rows if int(to_float(row.get("anchorAligned"), 0)) == 1)
+    print(
+        f"[phase6-network] rows={len(rows)} groups={len(groups)} workers={worker_msg} "
+        f"switch={bool(switch)} anchor_rows={anchor_rows} switch_aligned_rows={switch_aligned_rows} html={html_path}"
+    )
 
 
 if __name__ == "__main__":

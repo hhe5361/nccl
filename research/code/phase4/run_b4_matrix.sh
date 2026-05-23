@@ -99,6 +99,10 @@ pairs = {
     "CFG_BUCKET_CAP_MB": model.get("bucket_cap_mb", 1),
     "CFG_LR": model.get("lr", 0.01),
     "CFG_MODEL_SEED": model.get("model_seed", 20260504),
+    "CFG_PHASE8_SEQ_LEN": model.get("seq_len", 128),
+    "CFG_PHASE8_VOCAB_SIZE": model.get("vocab_size", 50257),
+    "CFG_PHASE8_NUM_HEADS": model.get("num_heads", 12),
+    "CFG_PHASE8_DROPOUT": model.get("dropout", 0.0),
     "CFG_NCCL_ALGO": nccl.get("algo", "auto"),
     "CFG_NCCL_PROTO": nccl.get("proto", "auto"),
     "CFG_NCCL_PHASE0_LOG": nccl.get("phase0_log", 1),
@@ -159,6 +163,10 @@ BATCH_SIZE=${BATCH_SIZE:-${CFG_BATCH_SIZE}}
 BUCKET_CAP_MB=${BUCKET_CAP_MB:-${CFG_BUCKET_CAP_MB}}
 LR=${LR:-${CFG_LR}}
 MODEL_SEED=${MODEL_SEED:-${CFG_MODEL_SEED}}
+PHASE8_SEQ_LEN=${PHASE8_SEQ_LEN:-${CFG_PHASE8_SEQ_LEN}}
+PHASE8_VOCAB_SIZE=${PHASE8_VOCAB_SIZE:-${CFG_PHASE8_VOCAB_SIZE}}
+PHASE8_NUM_HEADS=${PHASE8_NUM_HEADS:-${CFG_PHASE8_NUM_HEADS}}
+PHASE8_DROPOUT=${PHASE8_DROPOUT:-${CFG_PHASE8_DROPOUT}}
 NCCL_ALGO=${NCCL_ALGO:-${CFG_NCCL_ALGO}}
 NCCL_PROTO=${NCCL_PROTO:-${CFG_NCCL_PROTO}}
 NCCL_PHASE0_LOG=${NCCL_PHASE0_LOG:-${CFG_NCCL_PHASE0_LOG}}
@@ -561,7 +569,7 @@ cleanup_worker_processes() {
   local remote_repo_root
   local cmd
   remote_repo_root=$(resolve_remote_repo_root "${worker}")
-  cmd="cd $(printf '%q' "${remote_repo_root}") && bash ./research/code/deploy/run_dev_container.sh bash -lc $(printf '%q' "pkill -f 'torchrun|torch\\.distributed\\.run|ddp_b4\\.py|ddp_phase7_timeline\\.py' >/dev/null 2>&1 || true; sleep 1; ps -ef | grep -E 'torchrun|torch\\.distributed\\.run|ddp_b4\\.py|ddp_phase7_timeline\\.py' | grep -v grep || true")"
+  cmd="cd $(printf '%q' "${remote_repo_root}") && bash ./research/code/deploy/run_dev_container.sh bash -lc $(printf '%q' "pkill -f 'torchrun|torch\\.distributed\\.run|ddp_b4\\.py|ddp_phase7_timeline\\.py|ddp_gpt_small\\.py' >/dev/null 2>&1 || true; sleep 1; ps -ef | grep -E 'torchrun|torch\\.distributed\\.run|ddp_b4\\.py|ddp_phase7_timeline\\.py|ddp_gpt_small\\.py' | grep -v grep || true")"
   remote_worker_bash "${worker}" "${cmd}" >/dev/null 2>&1 || true
 }
 
@@ -660,6 +668,10 @@ BATCH_SIZE=$(printf '%q' "${BATCH_SIZE}") \
 BUCKET_CAP_MB=$(printf '%q' "${BUCKET_CAP_MB}") \
 LR=$(printf '%q' "${LR}") \
 MODEL_SEED=$(printf '%q' "${MODEL_SEED}") \
+PHASE8_SEQ_LEN=$(printf '%q' "${PHASE8_SEQ_LEN}") \
+PHASE8_VOCAB_SIZE=$(printf '%q' "${PHASE8_VOCAB_SIZE}") \
+PHASE8_NUM_HEADS=$(printf '%q' "${PHASE8_NUM_HEADS}") \
+PHASE8_DROPOUT=$(printf '%q' "${PHASE8_DROPOUT}") \
 bash $(printf '%q' "${WORKER_SCRIPT}")
 EOF
 )
@@ -756,7 +768,7 @@ wait_for_mode_completion() {
     if (( success_count == NNODES )); then
       return 0
     fi
-    if (( elapsed >= MODE_TIMEOUT_SEC )); then
+    if (( MODE_TIMEOUT_SEC > 0 && elapsed >= MODE_TIMEOUT_SEC )); then
       echo "[phase4-matrix] ERROR: mode timeout reached mode=${mode_upper_value} timeout=${MODE_TIMEOUT_SEC}s" >&2
       return 2
     fi

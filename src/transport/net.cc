@@ -885,6 +885,12 @@ static inline double phase6CtrlKi() {
   return phase6EnvDouble("NCCL_PHASE6_KI", 0.05, 0.0);
 }
 
+static inline uint64_t phase6UnixNano() {
+  struct timespec ts;
+  clockRealtime(&ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 static inline double phase7RateRatioRaw() {
   const char* env = getenv("NCCL_PHASE7_POST_RATE_RATIO_PCT");
   if (env == NULL || env[0] == '\0') return 0.0;
@@ -1021,6 +1027,27 @@ static inline void phase6CtrlCfgLog(
   sub->phase6CtrlCfgLogged = 1;
 }
 
+static inline void phase6CtrlAnchorLog(
+    struct ncclProxyState* proxyState,
+    struct ncclProxyArgs* args,
+    struct ncclProxySubArgs* sub,
+    uint64_t nowNs) {
+  if (ncclParamPhase6Log() == 0 || sub->phase6CtrlAnchorLogged) return;
+  INFO(NCCL_NET,
+      "PHASE6 event=CTRL_ANCHOR tNs=%llu tsUnixNs=%llu rank=%d peer=%d channel=%d groupSize=%d coll=%s collApi=%s algo=%s proto=%s",
+      (unsigned long long)nowNs,
+      (unsigned long long)phase6UnixNano(),
+      proxyState->tpRank,
+      sub->peer,
+      sub->channelId,
+      sub->groupSize,
+      ncclFuncToString((ncclFunc_t)args->coll),
+      ncclFuncToString((ncclFunc_t)args->collAPI),
+      ncclAlgoToString(args->algorithm),
+      ncclProtoToString(args->protocol));
+  sub->phase6CtrlAnchorLogged = 1;
+}
+
 static inline void phase6CtrlEnsure(
     struct ncclProxyState* proxyState,
     struct ncclProxyArgs* args,
@@ -1034,6 +1061,7 @@ static inline void phase6CtrlEnsure(
     sub->phase6CtrlW = phase6ClampDouble(phase6CtrlWBase(maxDepth), wMin, wMax);
     sub->phase6CtrlEpochStartNs = nowNs;
   }
+  phase6CtrlAnchorLog(proxyState, args, sub, nowNs);
   phase6CtrlCfgLog(proxyState, args, sub, maxDepth, sub->phase6CtrlW, wMin, wMax);
 }
 
@@ -2604,6 +2632,7 @@ static ncclResult_t sendProxyProgress(struct ncclProxyState* proxyState, struct 
       sub->phase6Tokens = 0.0;
       sub->phase6LastRefillNs = 0;
       sub->phase6CtrlCfgLogged = 0;
+      sub->phase6CtrlAnchorLogged = 0;
       sub->phase6CtrlBaselineReady = 0;
       sub->phase6CtrlWstall = 0;
       sub->phase6CtrlCooldown = 0;
@@ -2835,6 +2864,7 @@ static ncclResult_t recvProxyProgress(struct ncclProxyState* proxyState, struct 
       sub->phase6Tokens = 0.0;
       sub->phase6LastRefillNs = 0;
       sub->phase6CtrlCfgLogged = 0;
+      sub->phase6CtrlAnchorLogged = 0;
       sub->phase6CtrlBaselineReady = 0;
       sub->phase6CtrlWstall = 0;
       sub->phase6CtrlCooldown = 0;

@@ -293,6 +293,7 @@ echo "[phase4-worker] PHASE6_ENABLE=${NCCL_PHASE6_ENABLE} PHASE6_LOG=${NCCL_PHAS
 echo "[phase4-worker] APPENDIX2_GROUP_LOG=${NCCL_APPENDIX2_GROUP_LOG} APPENDIX2_DISABLE_WSTALL_LOG=${NCCL_APPENDIX2_DISABLE_WSTALL_LOG}"
 echo "[phase4-worker] HIDDEN_DIM=${HIDDEN_DIM} NUM_LAYERS=${NUM_LAYERS} BATCH_SIZE=${BATCH_SIZE} BUCKET_CAP_MB=${BUCKET_CAP_MB} LR=${LR}"
 echo "[phase4-worker] MODEL_SEED=${MODEL_SEED}"
+echo "[phase4-worker] PHASE8_SEQ_LEN=${PHASE8_SEQ_LEN:-} PHASE8_VOCAB_SIZE=${PHASE8_VOCAB_SIZE:-} PHASE8_NUM_HEADS=${PHASE8_NUM_HEADS:-}"
 echo "[phase4-worker] NET_BURST=${NET_BURST_VALUE}"
 echo "[phase4-worker] PYTHON_BIN=${PYTHON_BIN} RANK=${RANK} WORLD_SIZE=${WORLD_SIZE} LOCAL_RANK=${LOCAL_RANK}"
 echo "[phase4-worker] NCCL_ALGO=${ALGO_SETTING} NCCL_PROTO=${PROTO_SETTING} STATUS_FILE=${STATUS_FILE}"
@@ -304,21 +305,29 @@ if (( NET_BURST_VALUE > 0 )); then
   sleep "${PHASE4_LOAD_LEADIN_SEC}"
 fi
 
+PY_CMD=(
+  "${PYTHON_BIN}" "${REPO_ROOT}/${TARGET_SCRIPT}"
+  --steps "${STEPS}"
+  --warmup-steps "${WARMUP_STEPS}"
+  --dtype "${DTYPE}"
+  --output-dir "${RUN_ROOT}"
+  --tag "${MODE_UPPER}"
+  --hidden-dim "${HIDDEN_DIM}"
+  --num-layers "${NUM_LAYERS}"
+  --batch-size "${BATCH_SIZE}"
+  --bucket-cap-mb "${BUCKET_CAP_MB}"
+  --lr "${LR}"
+  --model-seed "${MODEL_SEED}"
+  --net-burst "${NET_BURST_VALUE}"
+)
+
 set +e
-timeout --signal=TERM --kill-after=30 "${MODE_TIMEOUT_SEC}" \
-  "${PYTHON_BIN}" "${REPO_ROOT}/${TARGET_SCRIPT}" \
-    --steps "${STEPS}" \
-    --warmup-steps "${WARMUP_STEPS}" \
-    --dtype "${DTYPE}" \
-    --output-dir "${RUN_ROOT}" \
-    --tag "${MODE_UPPER}" \
-    --hidden-dim "${HIDDEN_DIM}" \
-    --num-layers "${NUM_LAYERS}" \
-    --batch-size "${BATCH_SIZE}" \
-    --bucket-cap-mb "${BUCKET_CAP_MB}" \
-    --lr "${LR}" \
-    --model-seed "${MODEL_SEED}" \
-    --net-burst "${NET_BURST_VALUE}"
+if (( MODE_TIMEOUT_SEC > 0 )); then
+  timeout --signal=TERM --kill-after=30 "${MODE_TIMEOUT_SEC}" "${PY_CMD[@]}"
+else
+  echo "[phase4-worker] MODE_TIMEOUT_SEC=0 timeout disabled"
+  "${PY_CMD[@]}"
+fi
 RUN_RC=$?
 set -e
 

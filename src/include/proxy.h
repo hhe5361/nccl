@@ -177,6 +177,7 @@ struct ncclProxySubArgs {
   double phase6Tokens;
   uint64_t phase6LastRefillNs;
   uint8_t phase6CtrlCfgLogged;
+  uint8_t phase6CtrlAnchorLogged;
   uint8_t phase6CtrlBaselineReady;
   uint8_t phase6CtrlWstall;
   uint8_t phase6CtrlCooldown;
