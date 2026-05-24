@@ -42,6 +42,27 @@ MAX_EVENT_PLOTS="80"
 SKIP_RAW=1
 PYTHON_BIN=${PYTHON_BIN:-python3}
 
+log() {
+  printf '[phase6-reporters] %s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+elapsed_msg() {
+  local start_ts=$1
+  local end_ts
+  end_ts=$(date +%s)
+  printf '%ss' "$((end_ts - start_ts))"
+}
+
+require_file() {
+  local path=$1
+  local label=$2
+  if [[ -s "${path}" ]]; then
+    log "ok ${label}: ${path}"
+  else
+    log "warning ${label} missing_or_empty: ${path}"
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --input)
@@ -118,13 +139,24 @@ W_SIGNAL_OUT="${OUTPUT_ROOT%/}/plots_w_signal"
 
 mkdir -p "${PI_OUT}" "${NETWORK_OUT}" "${W_SIGNAL_OUT}"
 
-echo "[phase6-reporters] input=${INPUT_DIR}"
-echo "[phase6-reporters] output_root=${OUTPUT_ROOT}"
+TOTAL_START_TS=$(date +%s)
+log "input=${INPUT_DIR}"
+log "output_root=${OUTPUT_ROOT}"
+if [[ "${ALL_WORKERS}" -eq 1 ]]; then
+  log "network_workers=all"
+else
+  log "network_workers=${WORKERS}"
+fi
+log "bucket_ms=${BUCKET_MS} event_window_sec=${EVENT_WINDOW_SEC} max_event_plots=${MAX_EVENT_PLOTS} include_raw=$((1 - SKIP_RAW))"
 
-echo "[phase6-reporters] generating controller report -> ${PI_OUT}"
+STEP_START_TS=$(date +%s)
+log "step 1/3 start controller report -> ${PI_OUT}"
 "${PYTHON_BIN}" "${SCRIPT_DIR}/phase6_pi_reporter.py" \
   --input "${INPUT_DIR}" \
   --output-dir "${PI_OUT}"
+log "step 1/3 done elapsed=$(elapsed_msg "${STEP_START_TS}")"
+require_file "${PI_OUT}/phase6_spike_report.html" "controller_html"
+require_file "${PI_OUT}/phase6_summary.csv" "controller_summary_csv"
 
 network_args=(
   --input "${INPUT_DIR}"
@@ -148,18 +180,29 @@ if [[ -n "${SWITCH_LOG_DIR}" ]]; then
   network_args+=(--switch-log-dir "${SWITCH_LOG_DIR}")
 fi
 
-echo "[phase6-reporters] generating network overlay -> ${NETWORK_OUT}"
+STEP_START_TS=$(date +%s)
+log "step 2/3 start network overlay -> ${NETWORK_OUT}"
+log "step 2/3 command ${PYTHON_BIN} ${SCRIPT_DIR}/phase6_network_overlay_reporter.py ${network_args[*]}"
 "${PYTHON_BIN}" "${SCRIPT_DIR}/phase6_network_overlay_reporter.py" "${network_args[@]}"
+log "step 2/3 done elapsed=$(elapsed_msg "${STEP_START_TS}")"
+require_file "${NETWORK_OUT}/phase6_network_overlay_report.html" "network_html"
+require_file "${NETWORK_OUT}/phase6_bin_metrics.csv" "network_bin_csv"
+require_file "${NETWORK_OUT}/phase6_w_adjustment_network_windows.csv" "network_event_csv"
 
-echo "[phase6-reporters] generating W-signal summary -> ${W_SIGNAL_OUT}"
+STEP_START_TS=$(date +%s)
+log "step 3/3 start W-signal summary -> ${W_SIGNAL_OUT}"
 "${PYTHON_BIN}" "${SCRIPT_DIR}/phase6_w_signal_summary_reporter.py" \
   --input "${OUTPUT_ROOT}" \
   --output-dir "${W_SIGNAL_OUT}" \
   --event-csv "${NETWORK_OUT}/phase6_w_adjustment_network_windows.csv" \
   --summary-csv "${PI_OUT}/phase6_summary.csv"
+log "step 3/3 done elapsed=$(elapsed_msg "${STEP_START_TS}")"
+require_file "${W_SIGNAL_OUT}/phase6_w_signal_summary.html" "w_signal_html"
+require_file "${W_SIGNAL_OUT}/phase6_w_signal_event_summary.csv" "w_signal_event_csv"
+require_file "${W_SIGNAL_OUT}/phase6_w_signal_controller_summary.csv" "w_signal_controller_csv"
 
 cat <<EOF
-[phase6-reporters] done
+[phase6-reporters] done elapsed=$(elapsed_msg "${TOTAL_START_TS}")
   controller: ${PI_OUT}/phase6_spike_report.html
   network:    ${NETWORK_OUT}/phase6_network_overlay_report.html
   w_signal:   ${W_SIGNAL_OUT}/phase6_w_signal_summary.html

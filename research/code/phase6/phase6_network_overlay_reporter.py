@@ -659,8 +659,6 @@ def plot_group(repeat: str, mode: str, rows: list[dict], switch: Optional[dict],
     start_ns, switch_start_ns, switch_end_ns, marker_aligned = aligned_switch_window(repeat, mode, rows, switch)
     plot_rows = downsample(rows)
     xs = [to_float(r.get("relNs")) / 1_000_000_000.0 for r in plot_rows]
-    decrease_rows = [r for r in rows if r.get("action") == "decrease"]
-    increase_rows = [r for r in rows if r.get("action") == "increase"]
 
     fig, axes = plt.subplots(5, 1, figsize=(18, 16), sharex=True)
     axes[0].plot(xs, [to_float(r.get("wAfter")) for r in plot_rows], linewidth=1.5, label="W", color="#1f77b4")
@@ -703,12 +701,6 @@ def plot_group(repeat: str, mode: str, rows: list[dict], switch: Optional[dict],
     axes[4].legend(loc="upper right")
 
     for ax in axes:
-        for row in decrease_rows:
-            x = to_float(row.get("relNs")) / 1_000_000_000.0
-            ax.axvline(x, color="#b91c1c", alpha=0.22, linewidth=1.2)
-        for row in increase_rows:
-            x = to_float(row.get("relNs")) / 1_000_000_000.0
-            ax.axvline(x, color="#047857", alpha=0.22, linewidth=1.2)
         ax.grid(True, alpha=0.25)
 
     axes[-1].set_xlabel("Time since P6 mode start (s)")
@@ -739,8 +731,6 @@ def plot_bucket_group(
     if not buckets:
         return ""
     xs = [b["rel_mid_s"] for b in buckets]
-    decrease_rows = [r for r in rows if r.get("action") == "decrease"]
-    increase_rows = [r for r in rows if r.get("action") == "increase"]
 
     fig, axes = plt.subplots(6, 1, figsize=(18, 18), sharex=False)
     axes[0].plot(xs, [b["delay_p50_ms"] for b in buckets], label="POST-DONE p50", color="#9ca3af", linewidth=1.0)
@@ -774,8 +764,7 @@ def plot_bucket_group(
 
     axes[1].plot(xs, [b["w_min"] for b in buckets], label="W min", color="#1d4ed8")
     axes[1].plot(xs, [b["w_max"] for b in buckets], label="W max", color="#60a5fa", alpha=0.8)
-    axes[1].bar(xs, [b["decrease_count"] for b in buckets], width=bucket_ms / 1000.0 * 0.8, label="W decrease count", color="#ef4444", alpha=0.35)
-    axes[1].set_ylabel("W / events")
+    axes[1].set_ylabel("W")
     axes[1].legend(loc="upper right")
 
     axes[2].plot(xs, [b["e_max"] for b in buckets], label="spike e max", color="#f59e0b")
@@ -813,12 +802,6 @@ def plot_bucket_group(
         axes[5].set_ylabel("PFC unavailable")
 
     for ax in axes[:5]:
-        for row in decrease_rows:
-            x = to_float(row.get("relNs")) / 1_000_000_000.0
-            ax.axvline(x, color="#b91c1c", alpha=0.22, linewidth=1.2)
-        for row in increase_rows:
-            x = to_float(row.get("relNs")) / 1_000_000_000.0
-            ax.axvline(x, color="#047857", alpha=0.22, linewidth=1.2)
         ax.grid(True, alpha=0.25)
     axes[5].grid(True, alpha=0.25)
 
@@ -830,6 +813,50 @@ def plot_bucket_group(
     )
     fig.tight_layout()
     name = f"{repeat}_{mode}_binned_w_pfc_delay.png"
+    fig.savefig(output_dir / name, dpi=150)
+    plt.close(fig)
+    return name
+
+
+def plot_w_event_counts(
+    repeat: str,
+    mode: str,
+    rows: list[dict],
+    output_dir: Path,
+    bucket_ms: float,
+    plot_pct: float,
+    trim_top: int,
+) -> str:
+    start_ns = int(min(0.0, min(finite(to_float(r.get("relNs")) for r in rows), default=0.0)))
+    end_ns = int(max(to_float(r.get("relNs")) for r in rows))
+    buckets = bucket_ctrl_rows(rows, start_ns, end_ns, bucket_ms, plot_pct, trim_top)
+    if not buckets:
+        return ""
+    xs = [b["rel_mid_s"] for b in buckets]
+    width = bucket_ms / 1000.0 * 0.8
+
+    fig, axes = plt.subplots(3, 1, figsize=(18, 9), sharex=True)
+    axes[0].plot(xs, [b["w_min"] for b in buckets], label="W min", color="#1d4ed8")
+    axes[0].plot(xs, [b["w_max"] for b in buckets], label="W max", color="#60a5fa", alpha=0.8)
+    axes[0].set_ylabel("W")
+    axes[0].legend(loc="upper right")
+
+    axes[1].bar(xs, [b["decrease_count"] for b in buckets], width=width, label="W decrease count", color="#b91c1c", alpha=0.75)
+    axes[1].bar(xs, [b["increase_count"] for b in buckets], width=width * 0.45, label="W increase count", color="#047857", alpha=0.65)
+    axes[1].set_ylabel("events / bin")
+    axes[1].legend(loc="upper right")
+
+    axes[2].plot(xs, [b["e_max"] for b in buckets], label="spike e max", color="#f59e0b")
+    axes[2].plot(xs, [b["wstall_max"] for b in buckets], label="wstallRatio max", color="#16a34a")
+    axes[2].set_ylabel("controller")
+    axes[2].set_xlabel("Time since aligned Phase6 start (s)")
+    axes[2].legend(loc="upper right")
+
+    for ax in axes:
+        ax.grid(True, alpha=0.25)
+    fig.suptitle(f"{repeat} {mode}: W Adjustment Events ({bucket_ms:g} ms)")
+    fig.tight_layout()
+    name = f"{repeat}_{mode}_w_event_counts.png"
     fig.savefig(output_dir / name, dpi=150)
     plt.close(fig)
     return name
@@ -863,9 +890,6 @@ def plot_switch_pfc_components(
     if not any(switch.get(key) for _label, key, _color, _style in pfc_series + deadlock_series):
         return ""
 
-    decrease_rows = [r for r in rows if r.get("action") == "decrease"]
-    increase_rows = [r for r in rows if r.get("action") == "increase"]
-
     fig, axes = plt.subplots(2, 1, figsize=(18, 9), sharex=True)
     for label, key, color, linestyle in pfc_series:
         points = bucket_delta(switch.get(key, []), switch_start_ns, switch_end_ns, bucket_ms)
@@ -882,12 +906,6 @@ def plot_switch_pfc_components(
     axes[1].legend(loc="upper right")
 
     for ax in axes:
-        for row in decrease_rows:
-            x = (to_float(row.get("relNs")) - ctrl_start_ns) / 1_000_000_000.0
-            ax.axvline(x, color="#b91c1c", alpha=0.22, linewidth=1.2)
-        for row in increase_rows:
-            x = (to_float(row.get("relNs")) - ctrl_start_ns) / 1_000_000_000.0
-            ax.axvline(x, color="#047857", alpha=0.22, linewidth=1.2)
         ax.grid(True, alpha=0.25)
 
     axes[-1].set_xlabel("Time since aligned Phase6 start (s)")
@@ -1055,6 +1073,7 @@ def write_html(
     output_dir: Path,
     raw_images: list[str],
     bucket_images: list[str],
+    w_event_images: list[str],
     component_images: list[str],
     event_images: list[str],
     event_csv: Path,
@@ -1079,11 +1098,12 @@ code {{ background: #eef2f7; padding: 2px 5px; border-radius: 4px; }}
 </style></head><body>
 <h1>Phase6 W Adjustment vs Network Congestion</h1>
 <p><code>{switch_msg}</code></p>
-<p>Red vertical lines are W decrease events. Green vertical lines are W increase events. If <code>CTRL_ANCHOR</code> exists, NCCL monotonic time is converted to unix time and aligned to switch <code>mode_start</code>. Without anchor logs, the reporter falls back to first <code>CTRL_EPOCH</code> relative alignment.</p>
+<p>W decrease/increase events are separated into dedicated event-count plots so the main latency/PFC timeline remains readable. If <code>CTRL_ANCHOR</code> exists, NCCL monotonic time is converted to unix time and aligned to switch <code>mode_start</code>. Without anchor logs, the reporter falls back to first <code>CTRL_EPOCH</code> relative alignment.</p>
 <p>Analysis-bin metrics are in <code>{html.escape(bucket_csv.name)}</code>. Event before/after network deltas are in <code>{html.escape(event_csv.name)}</code>.</p>
 <p>PFC deadlock is plotted from <code>rackA_pfc_deadlock_aggregate.jsonl</code> and <code>rackB_pfc_deadlock_aggregate.jsonl</code> using <code>deadlock_count_total</code> deltas.</p>
 <p>The main timeline keeps <code>total_pfc = rackA + rackB + spine</code>. The component breakdown below plots rackA, rackB, and spine separately so switch-local congestion can be distinguished from total network pressure.</p>
 {image_section("Binned Timeline: POST-DONE p99/max, W, PFC, Deadlock", bucket_images)}
+{image_section("W Adjustment Event Counts", w_event_images)}
 {image_section("Switch PFC Component Breakdown", component_images)}
 {image_section("Event-Centered W Decrease Windows", event_images)}
 {image_section("Raw Timeline", raw_images)}
@@ -1133,6 +1153,20 @@ def main() -> None:
         if group
     ]
     bucket_images = [name for name in bucket_images if name]
+    w_event_images = [
+        plot_w_event_counts(
+            repeat,
+            mode,
+            group,
+            output_dir,
+            args.bucket_ms,
+            args.delay_plot_pct,
+            args.delay_trim_top,
+        )
+        for (repeat, mode), group in sorted(groups.items())
+        if group
+    ]
+    w_event_images = [name for name in w_event_images if name]
     component_images = [
         plot_switch_pfc_components(repeat, mode, group, switch, output_dir, args.bucket_ms)
         for (repeat, mode), group in sorted(groups.items())
@@ -1163,7 +1197,7 @@ def main() -> None:
         if event_count >= args.max_event_plots:
             break
 
-    html_path = write_html(output_dir, raw_images, bucket_images, component_images, event_images, event_csv, bucket_csv, switch)
+    html_path = write_html(output_dir, raw_images, bucket_images, w_event_images, component_images, event_images, event_csv, bucket_csv, switch)
     worker_msg = "all" if workers is None else ",".join(sorted(workers))
     anchor_rows = sum(1 for row in rows if int(to_float(row.get("anchorAligned"), 0)) == 1)
     print(
