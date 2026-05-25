@@ -12,6 +12,7 @@ Generates all Phase6 reports in one pass:
   1. phase6_pi_reporter.py
   2. phase6_network_overlay_reporter.py
   3. phase6_w_signal_summary_reporter.py
+  4. phase6_stock_vs_p6_reporter.py
 
 Options:
   --input RUN_DIR             Phase6 experiment run root. Required.
@@ -136,8 +137,9 @@ fi
 PI_OUT="${OUTPUT_ROOT%/}/phase6_plot_latest"
 NETWORK_OUT="${OUTPUT_ROOT%/}/network_overlay_allworker_no_ecn_trimtop"
 W_SIGNAL_OUT="${OUTPUT_ROOT%/}/plots_w_signal"
+STOCK_VS_P6_OUT="${OUTPUT_ROOT%/}/stock_vs_p6"
 
-mkdir -p "${PI_OUT}" "${NETWORK_OUT}" "${W_SIGNAL_OUT}"
+mkdir -p "${PI_OUT}" "${NETWORK_OUT}" "${W_SIGNAL_OUT}" "${STOCK_VS_P6_OUT}"
 
 TOTAL_START_TS=$(date +%s)
 log "input=${INPUT_DIR}"
@@ -150,11 +152,11 @@ fi
 log "bucket_ms=${BUCKET_MS} event_window_sec=${EVENT_WINDOW_SEC} max_event_plots=${MAX_EVENT_PLOTS} include_raw=$((1 - SKIP_RAW))"
 
 STEP_START_TS=$(date +%s)
-log "step 1/3 start controller report -> ${PI_OUT}"
+log "step 1/4 start controller report -> ${PI_OUT}"
 "${PYTHON_BIN}" "${SCRIPT_DIR}/phase6_pi_reporter.py" \
   --input "${INPUT_DIR}" \
   --output-dir "${PI_OUT}"
-log "step 1/3 done elapsed=$(elapsed_msg "${STEP_START_TS}")"
+log "step 1/4 done elapsed=$(elapsed_msg "${STEP_START_TS}")"
 require_file "${PI_OUT}/phase6_spike_report.html" "controller_html"
 require_file "${PI_OUT}/phase6_summary.csv" "controller_summary_csv"
 
@@ -181,29 +183,41 @@ if [[ -n "${SWITCH_LOG_DIR}" ]]; then
 fi
 
 STEP_START_TS=$(date +%s)
-log "step 2/3 start network overlay -> ${NETWORK_OUT}"
-log "step 2/3 command ${PYTHON_BIN} ${SCRIPT_DIR}/phase6_network_overlay_reporter.py ${network_args[*]}"
+log "step 2/4 start network overlay -> ${NETWORK_OUT}"
+log "step 2/4 command ${PYTHON_BIN} ${SCRIPT_DIR}/phase6_network_overlay_reporter.py ${network_args[*]}"
 "${PYTHON_BIN}" "${SCRIPT_DIR}/phase6_network_overlay_reporter.py" "${network_args[@]}"
-log "step 2/3 done elapsed=$(elapsed_msg "${STEP_START_TS}")"
+log "step 2/4 done elapsed=$(elapsed_msg "${STEP_START_TS}")"
 require_file "${NETWORK_OUT}/phase6_network_overlay_report.html" "network_html"
 require_file "${NETWORK_OUT}/phase6_bin_metrics.csv" "network_bin_csv"
 require_file "${NETWORK_OUT}/phase6_w_adjustment_network_windows.csv" "network_event_csv"
 
 STEP_START_TS=$(date +%s)
-log "step 3/3 start W-signal summary -> ${W_SIGNAL_OUT}"
+log "step 3/4 start W-signal summary -> ${W_SIGNAL_OUT}"
 "${PYTHON_BIN}" "${SCRIPT_DIR}/phase6_w_signal_summary_reporter.py" \
   --input "${OUTPUT_ROOT}" \
   --output-dir "${W_SIGNAL_OUT}" \
   --event-csv "${NETWORK_OUT}/phase6_w_adjustment_network_windows.csv" \
   --summary-csv "${PI_OUT}/phase6_summary.csv"
-log "step 3/3 done elapsed=$(elapsed_msg "${STEP_START_TS}")"
+log "step 3/4 done elapsed=$(elapsed_msg "${STEP_START_TS}")"
 require_file "${W_SIGNAL_OUT}/phase6_w_signal_summary.html" "w_signal_html"
 require_file "${W_SIGNAL_OUT}/phase6_w_signal_event_summary.csv" "w_signal_event_csv"
 require_file "${W_SIGNAL_OUT}/phase6_w_signal_controller_summary.csv" "w_signal_controller_csv"
+
+STEP_START_TS=$(date +%s)
+log "step 4/4 start STOCK baseline comparison -> ${STOCK_VS_P6_OUT}"
+"${PYTHON_BIN}" "${SCRIPT_DIR}/phase6_stock_vs_p6_reporter.py" \
+  --input "${OUTPUT_ROOT}" \
+  --output-dir "${STOCK_VS_P6_OUT}" \
+  --summary-csv "${PI_OUT}/phase6_summary.csv" \
+  --bin-csv "${NETWORK_OUT}/phase6_bin_metrics.csv"
+log "step 4/4 done elapsed=$(elapsed_msg "${STEP_START_TS}")"
+require_file "${STOCK_VS_P6_OUT}/phase6_stock_vs_p6_report.html" "stock_vs_p6_html"
+require_file "${STOCK_VS_P6_OUT}/phase6_stock_vs_p6_comparison.csv" "stock_vs_p6_csv"
 
 cat <<EOF
 [phase6-reporters] done elapsed=$(elapsed_msg "${TOTAL_START_TS}")
   controller: ${PI_OUT}/phase6_spike_report.html
   network:    ${NETWORK_OUT}/phase6_network_overlay_report.html
   w_signal:   ${W_SIGNAL_OUT}/phase6_w_signal_summary.html
+  stock_vs_p6:${STOCK_VS_P6_OUT}/phase6_stock_vs_p6_report.html
 EOF
