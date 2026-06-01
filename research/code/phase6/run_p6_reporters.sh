@@ -23,7 +23,7 @@ Options:
   --no-all-workers           Use --workers value instead of scanning all workers.
   --bucket-ms MS             Network overlay bucket size. Default: 1000.
   --event-window-sec SEC     Before/after event CSV window. Default: 2.
-  --max-event-plots N        Maximum event-centered plots. Default: 80.
+  --max-event-plots N        Maximum event-centered plots. Default: 0.
   --include-raw              Include raw network timeline plots.
   --python PYTHON            Python command. Default: python3.
   -h, --help                 Show this help.
@@ -39,7 +39,7 @@ WORKERS="worker01"
 ALL_WORKERS=1
 BUCKET_MS="1000"
 EVENT_WINDOW_SEC="2"
-MAX_EVENT_PLOTS="80"
+MAX_EVENT_PLOTS="0"
 SKIP_RAW=1
 PYTHON_BIN=${PYTHON_BIN:-python3}
 
@@ -205,11 +205,18 @@ require_file "${W_SIGNAL_OUT}/phase6_w_signal_controller_summary.csv" "w_signal_
 
 STEP_START_TS=$(date +%s)
 log "step 4/4 start STOCK baseline comparison -> ${STOCK_VS_P6_OUT}"
-"${PYTHON_BIN}" "${SCRIPT_DIR}/phase6_stock_vs_p6_reporter.py" \
+stock_vs_args=(
   --input "${OUTPUT_ROOT}" \
+  --run-root "${INPUT_DIR}" \
   --output-dir "${STOCK_VS_P6_OUT}" \
   --summary-csv "${PI_OUT}/phase6_summary.csv" \
   --bin-csv "${NETWORK_OUT}/phase6_bin_metrics.csv"
+)
+if [[ -n "${SWITCH_LOG_DIR}" ]]; then
+  stock_vs_args+=(--switch-log-dir "${SWITCH_LOG_DIR}")
+fi
+log "step 4/4 command ${PYTHON_BIN} ${SCRIPT_DIR}/phase6_stock_vs_p6_reporter.py ${stock_vs_args[*]}"
+"${PYTHON_BIN}" "${SCRIPT_DIR}/phase6_stock_vs_p6_reporter.py" "${stock_vs_args[@]}"
 log "step 4/4 done elapsed=$(elapsed_msg "${STEP_START_TS}")"
 require_file "${STOCK_VS_P6_OUT}/phase6_stock_vs_p6_report.html" "stock_vs_p6_html"
 require_file "${STOCK_VS_P6_OUT}/phase6_stock_vs_p6_comparison.csv" "stock_vs_p6_csv"

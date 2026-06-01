@@ -6,6 +6,7 @@ import csv
 import html
 import json
 import math
+import random
 import re
 import subprocess
 from collections import defaultdict
@@ -732,7 +733,7 @@ def plot_bucket_group(
         return ""
     xs = [b["rel_mid_s"] for b in buckets]
 
-    fig, axes = plt.subplots(6, 1, figsize=(18, 18), sharex=False)
+    fig, axes = plt.subplots(5, 1, figsize=(18, 15), sharex=False)
     axes[0].plot(xs, [b["delay_p50_ms"] for b in buckets], label="POST-DONE p50", color="#9ca3af", linewidth=1.0)
     axes[0].plot(xs, [b["delay_p95_ms"] for b in buckets], label="POST-DONE p95", color="#f97316", linewidth=1.0)
     axes[0].plot(xs, [b["delay_p99_ms"] for b in buckets], label="POST-DONE p99", color="#dc2626", linewidth=1.2)
@@ -791,19 +792,8 @@ def plot_bucket_group(
     axes[4].set_ylabel("Deadlock delta")
     axes[4].legend(loc="upper right")
 
-    if switch:
-        total_pfc = bucket_delta(switch["total_pfc"], switch_start_ns, switch_end_ns, bucket_ms)
-        pfc_vals = [y for _, y in total_pfc[: len(buckets)]]
-        delay_vals = [b["delay_p99_ms"] for b in buckets[: len(pfc_vals)]]
-        axes[5].scatter(pfc_vals, delay_vals, s=18, alpha=0.65, color="#4b5563")
-        axes[5].set_xlabel("PFC delta / analysis bin")
-        axes[5].set_ylabel("POST-DONE p99 ms")
-    else:
-        axes[5].set_ylabel("PFC unavailable")
-
-    for ax in axes[:5]:
+    for ax in axes:
         ax.grid(True, alpha=0.25)
-    axes[5].grid(True, alpha=0.25)
 
     axes[4].set_xlabel("Time since aligned Phase6 start (s)")
     alignment = "switch mode_start aligned" if marker_aligned else "not switch-aligned"
@@ -813,6 +803,97 @@ def plot_bucket_group(
     )
     fig.tight_layout()
     name = f"{repeat}_{mode}_binned_w_pfc_delay.png"
+    fig.savefig(output_dir / name, dpi=150)
+    plt.close(fig)
+    return name
+
+
+def plot_pfc_spike_overlay(
+    repeat: str,
+    mode: str,
+    rows: list[dict],
+    switch: Optional[dict],
+    output_dir: Path,
+    bucket_ms: float,
+    plot_pct: float,
+    trim_top: int,
+) -> str:
+    if not switch:
+        return ""
+    start_ns, switch_start_ns, switch_end_ns, marker_aligned = aligned_switch_window(repeat, mode, rows, switch)
+    end_ns = int(max(to_float(r.get("relNs")) for r in rows))
+    buckets = bucket_ctrl_rows(rows, start_ns, end_ns, bucket_ms, plot_pct, trim_top)
+    pfc = bucket_delta(switch["total_pfc"], switch_start_ns, switch_end_ns, bucket_ms)
+    if not buckets or not pfc:
+        return ""
+
+    xs = [b["rel_mid_s"] for b in buckets]
+    fig, ax = plt.subplots(figsize=(18, 5))
+    ax.plot([x for x, _ in pfc], [y for _, y in pfc], label="total PFC delta/bin", color="#111827", linewidth=1.4)
+    ax.set_ylabel("PFC delta / bin", color="#111827")
+    ax.tick_params(axis="y", labelcolor="#111827")
+    ax.grid(True, alpha=0.25)
+
+    ax2 = ax.twinx()
+    ax2.plot(xs, [b["e_max"] for b in buckets], label="spike e max", color="#f59e0b", linewidth=1.1)
+    ax2.plot(xs, [b["wstall_max"] for b in buckets], label="wstallRatio max", color="#16a34a", linewidth=0.9, alpha=0.8)
+    ax2.set_ylabel("controller signal", color="#92400e")
+    ax2.tick_params(axis="y", labelcolor="#92400e")
+
+    lines, labels = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines + lines2, labels + labels2, loc="upper right")
+    ax.set_xlabel("Time since aligned Phase6 start (s)")
+    alignment = "switch mode_start aligned" if marker_aligned else "not switch-aligned"
+    ax.set_title(f"{repeat} {mode}: PFC Delta vs Controller Spike Signal ({bucket_ms:g} ms, {alignment})")
+    fig.tight_layout()
+    name = f"{repeat}_{mode}_pfc_spike_overlay.png"
+    fig.savefig(output_dir / name, dpi=150)
+    plt.close(fig)
+    return name
+
+
+def plot_pfc_w_overlay(
+    repeat: str,
+    mode: str,
+    rows: list[dict],
+    switch: Optional[dict],
+    output_dir: Path,
+    bucket_ms: float,
+    plot_pct: float,
+    trim_top: int,
+) -> str:
+    if not switch:
+        return ""
+    start_ns, switch_start_ns, switch_end_ns, marker_aligned = aligned_switch_window(repeat, mode, rows, switch)
+    end_ns = int(max(to_float(r.get("relNs")) for r in rows))
+    buckets = bucket_ctrl_rows(rows, start_ns, end_ns, bucket_ms, plot_pct, trim_top)
+    pfc = bucket_delta(switch["total_pfc"], switch_start_ns, switch_end_ns, bucket_ms)
+    if not buckets or not pfc:
+        return ""
+
+    xs = [b["rel_mid_s"] for b in buckets]
+    fig, ax = plt.subplots(figsize=(18, 5))
+    ax.plot([x for x, _ in pfc], [y for _, y in pfc], label="total PFC delta/bin", color="#111827", linewidth=1.4)
+    ax.set_ylabel("PFC delta / bin", color="#111827")
+    ax.tick_params(axis="y", labelcolor="#111827")
+    ax.grid(True, alpha=0.25)
+
+    ax2 = ax.twinx()
+    ax2.plot(xs, [b["w_min"] for b in buckets], label="W min", color="#1d4ed8", linewidth=1.1)
+    ax2.plot(xs, [b["w_max"] for b in buckets], label="W max", color="#60a5fa", linewidth=0.9, alpha=0.7)
+    ax2.invert_yaxis()
+    ax2.set_ylabel("W (inverted; lower W is stronger control)", color="#1d4ed8")
+    ax2.tick_params(axis="y", labelcolor="#1d4ed8")
+
+    lines, labels = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines + lines2, labels + labels2, loc="upper right")
+    ax.set_xlabel("Time since aligned Phase6 start (s)")
+    alignment = "switch mode_start aligned" if marker_aligned else "not switch-aligned"
+    ax.set_title(f"{repeat} {mode}: PFC Delta vs W Control ({bucket_ms:g} ms, {alignment})")
+    fig.tight_layout()
+    name = f"{repeat}_{mode}_pfc_w_overlay.png"
     fig.savefig(output_dir / name, dpi=150)
     plt.close(fig)
     return name
@@ -1069,14 +1150,197 @@ def write_event_csv(groups: dict[tuple[str, str], list[dict]], switch: Optional[
     return path
 
 
+def build_random_event_rows(
+    groups: dict[tuple[str, str], list[dict]],
+    switch: Optional[dict],
+    window_sec: float,
+    seed: int = 20260526,
+) -> list[dict]:
+    if not switch:
+        return []
+    rng = random.Random(seed)
+    window_ns = int(window_sec * 1_000_000_000)
+    out: list[dict] = []
+    for (repeat, mode), rows in sorted(groups.items()):
+        decreases = [row for row in rows if row.get("action") == "decrease"]
+        if not decreases:
+            continue
+        ctrl_start_ns, switch_start_ns, switch_end_ns, marker_aligned = aligned_switch_window(repeat, mode, rows, switch)
+        if switch_end_ns <= switch_start_ns + 2 * window_ns:
+            continue
+        start = switch_start_ns + window_ns
+        end = switch_end_ns - window_ns
+        for idx in range(len(decreases)):
+            aligned_t_ns = rng.randint(start, end)
+            pfc_before = window_delta(switch["total_pfc"], aligned_t_ns - window_ns, aligned_t_ns)
+            pfc_after = window_delta(switch["total_pfc"], aligned_t_ns, aligned_t_ns + window_ns)
+            out.append(
+                {
+                    "repeat": repeat,
+                    "mode": mode,
+                    "event_type": "random",
+                    "event_idx": idx + 1,
+                    "aligned_switch_unix_ns": aligned_t_ns if marker_aligned else "",
+                    "relTimeS": (aligned_t_ns - switch_start_ns) / 1_000_000_000.0,
+                    "pfc_before": pfc_before,
+                    "pfc_after": pfc_after,
+                    "pfc_after_minus_before": pfc_after - pfc_before,
+                    "pfc_reduced_after": 1 if pfc_after < pfc_before else 0,
+                }
+            )
+    return out
+
+
+def write_random_event_csv(path: Path, rows: list[dict]) -> Path:
+    fields = [
+        "repeat",
+        "mode",
+        "event_type",
+        "event_idx",
+        "aligned_switch_unix_ns",
+        "relTimeS",
+        "pfc_before",
+        "pfc_after",
+        "pfc_after_minus_before",
+        "pfc_reduced_after",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def read_event_csv(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8", errors="replace", newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def build_w_decrease_compare_rows(event_csv: Path) -> list[dict]:
+    out: list[dict] = []
+    for idx, row in enumerate(read_event_csv(event_csv), start=1):
+        if row.get("action") != "decrease":
+            continue
+        before = to_float(row.get("pfc_before"))
+        after = to_float(row.get("pfc_after"))
+        if not math.isfinite(before) or not math.isfinite(after):
+            continue
+        out.append(
+            {
+                "repeat": row.get("repeat", ""),
+                "mode": row.get("mode", ""),
+                "event_type": "w_decrease",
+                "event_idx": idx,
+                "aligned_switch_unix_ns": row.get("aligned_switch_unix_ns", ""),
+                "relTimeS": row.get("relTimeS", ""),
+                "pfc_before": before,
+                "pfc_after": after,
+                "pfc_after_minus_before": after - before,
+                "pfc_reduced_after": 1 if after < before else 0,
+            }
+        )
+    return out
+
+
+def summarize_event_effect(rows: list[dict]) -> dict[str, dict[str, float]]:
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for row in rows:
+        grouped[str(row.get("event_type", ""))].append(row)
+    out: dict[str, dict[str, float]] = {}
+    for event_type, group in grouped.items():
+        deltas = [to_float(row.get("pfc_after_minus_before")) for row in group]
+        reduced = [to_float(row.get("pfc_reduced_after"), 0.0) for row in group]
+        before = [to_float(row.get("pfc_before")) for row in group]
+        after = [to_float(row.get("pfc_after")) for row in group]
+        vals = finite(deltas)
+        red_vals = finite(reduced)
+        out[event_type] = {
+            "events": float(len(group)),
+            "median_before": percentile(before, 50),
+            "median_after": percentile(after, 50),
+            "median_after_minus_before": percentile(vals, 50),
+            "p95_after_minus_before": percentile(vals, 95),
+            "reduction_ratio": sum(1.0 for value in red_vals if value > 0.0) / len(red_vals) if red_vals else math.nan,
+        }
+    return out
+
+
+def write_event_effect_summary(path: Path, rows: list[dict]) -> Path:
+    summary = summarize_event_effect(rows)
+    fields = [
+        "event_type",
+        "events",
+        "median_before",
+        "median_after",
+        "median_after_minus_before",
+        "p95_after_minus_before",
+        "reduction_ratio",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        for event_type, row in sorted(summary.items()):
+            writer.writerow({"event_type": event_type, **row})
+    return path
+
+
+def plot_w_vs_random_pfc_effect(rows: list[dict], output_dir: Path) -> list[str]:
+    grouped: dict[str, list[float]] = defaultdict(list)
+    for row in rows:
+        value = to_float(row.get("pfc_after_minus_before"))
+        if math.isfinite(value):
+            grouped[str(row.get("event_type", ""))].append(value)
+    order = [name for name in ("w_decrease", "random") if grouped.get(name)]
+    if not order:
+        return []
+
+    names: list[str] = []
+    fig, ax = plt.subplots(figsize=(9, 5))
+    ax.boxplot([grouped[name] for name in order], labels=order, showfliers=False)
+    ax.axhline(0, color="#111827", linewidth=1.0)
+    ax.set_ylabel("PFC after - before")
+    ax.set_title("PFC Change After Event: W Decrease vs Random")
+    ax.grid(True, axis="y", alpha=0.25)
+    fig.tight_layout()
+    name = "pfc_effect_w_decrease_vs_random_boxplot.png"
+    fig.savefig(output_dir / name, dpi=150)
+    plt.close(fig)
+    names.append(name)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    for event_type, color in (("w_decrease", "#1d4ed8"), ("random", "#6b7280")):
+        vals = grouped.get(event_type, [])
+        if vals:
+            ax.hist(vals, bins=60, alpha=0.55, label=event_type, color=color)
+    ax.axvline(0, color="#111827", linewidth=1.0)
+    ax.set_xlabel("PFC after - before")
+    ax.set_ylabel("event count")
+    ax.set_title("Distribution of PFC Change After Event")
+    ax.legend(loc="upper right")
+    ax.grid(True, axis="y", alpha=0.25)
+    fig.tight_layout()
+    name = "pfc_effect_w_decrease_vs_random_histogram.png"
+    fig.savefig(output_dir / name, dpi=150)
+    plt.close(fig)
+    names.append(name)
+    return names
+
+
 def write_html(
     output_dir: Path,
     raw_images: list[str],
     bucket_images: list[str],
+    pfc_spike_images: list[str],
+    pfc_w_images: list[str],
+    pfc_effect_images: list[str],
     w_event_images: list[str],
     component_images: list[str],
     event_images: list[str],
     event_csv: Path,
+    random_event_csv: Path,
+    event_effect_summary_csv: Path,
     bucket_csv: Path,
     switch: Optional[dict],
 ) -> Path:
@@ -1099,9 +1363,12 @@ code {{ background: #eef2f7; padding: 2px 5px; border-radius: 4px; }}
 <h1>Phase6 W Adjustment vs Network Congestion</h1>
 <p><code>{switch_msg}</code></p>
 <p>W decrease/increase events are separated into dedicated event-count plots so the main latency/PFC timeline remains readable. If <code>CTRL_ANCHOR</code> exists, NCCL monotonic time is converted to unix time and aligned to switch <code>mode_start</code>. Without anchor logs, the reporter falls back to first <code>CTRL_EPOCH</code> relative alignment.</p>
-<p>Analysis-bin metrics are in <code>{html.escape(bucket_csv.name)}</code>. Event before/after network deltas are in <code>{html.escape(event_csv.name)}</code>.</p>
+<p>Analysis-bin metrics are in <code>{html.escape(bucket_csv.name)}</code>. Event before/after network deltas are in <code>{html.escape(event_csv.name)}</code>. Random-event baseline is in <code>{html.escape(random_event_csv.name)}</code>; W-vs-random effect summary is in <code>{html.escape(event_effect_summary_csv.name)}</code>.</p>
 <p>PFC deadlock is plotted from <code>rackA_pfc_deadlock_aggregate.jsonl</code> and <code>rackB_pfc_deadlock_aggregate.jsonl</code> using <code>deadlock_count_total</code> deltas.</p>
 <p>The main timeline keeps <code>total_pfc = rackA + rackB + spine</code>. The component breakdown below plots rackA, rackB, and spine separately so switch-local congestion can be distinguished from total network pressure.</p>
+{image_section("PFC Delta vs Controller Spike Signal", pfc_spike_images)}
+{image_section("PFC Delta vs W Control", pfc_w_images)}
+{image_section("PFC Change After W Decrease vs Random Events", pfc_effect_images)}
 {image_section("Binned Timeline: POST-DONE p99/max, W, PFC, Deadlock", bucket_images)}
 {image_section("W Adjustment Event Counts", w_event_images)}
 {image_section("Switch PFC Component Breakdown", component_images)}
@@ -1128,6 +1395,10 @@ def main() -> None:
     switch_aligned_rows = apply_switch_relative_times(rows, switch)
     groups = group_rows(rows)
     event_csv = write_event_csv(groups, switch, output_dir, args.event_window_sec)
+    random_event_rows = build_random_event_rows(groups, switch, args.event_window_sec)
+    random_event_csv = write_random_event_csv(output_dir / "phase6_random_event_network_windows.csv", random_event_rows)
+    event_effect_rows = build_w_decrease_compare_rows(event_csv) + random_event_rows
+    event_effect_summary_csv = write_event_effect_summary(output_dir / "phase6_w_vs_random_pfc_effect_summary.csv", event_effect_rows)
     bucket_csv = write_bucket_csv(groups, switch, output_dir, args.bucket_ms, args.delay_plot_pct, args.delay_trim_top)
     raw_images = []
     if not args.skip_raw:
@@ -1153,6 +1424,37 @@ def main() -> None:
         if group
     ]
     bucket_images = [name for name in bucket_images if name]
+    pfc_spike_images = [
+        plot_pfc_spike_overlay(
+            repeat,
+            mode,
+            group,
+            switch,
+            output_dir,
+            args.bucket_ms,
+            args.delay_plot_pct,
+            args.delay_trim_top,
+        )
+        for (repeat, mode), group in sorted(groups.items())
+        if group
+    ]
+    pfc_spike_images = [name for name in pfc_spike_images if name]
+    pfc_w_images = [
+        plot_pfc_w_overlay(
+            repeat,
+            mode,
+            group,
+            switch,
+            output_dir,
+            args.bucket_ms,
+            args.delay_plot_pct,
+            args.delay_trim_top,
+        )
+        for (repeat, mode), group in sorted(groups.items())
+        if group
+    ]
+    pfc_w_images = [name for name in pfc_w_images if name]
+    pfc_effect_images = plot_w_vs_random_pfc_effect(event_effect_rows, output_dir)
     w_event_images = [
         plot_w_event_counts(
             repeat,
@@ -1197,7 +1499,22 @@ def main() -> None:
         if event_count >= args.max_event_plots:
             break
 
-    html_path = write_html(output_dir, raw_images, bucket_images, w_event_images, component_images, event_images, event_csv, bucket_csv, switch)
+    html_path = write_html(
+        output_dir,
+        raw_images,
+        bucket_images,
+        pfc_spike_images,
+        pfc_w_images,
+        pfc_effect_images,
+        w_event_images,
+        component_images,
+        event_images,
+        event_csv,
+        random_event_csv,
+        event_effect_summary_csv,
+        bucket_csv,
+        switch,
+    )
     worker_msg = "all" if workers is None else ",".join(sorted(workers))
     anchor_rows = sum(1 for row in rows if int(to_float(row.get("anchorAligned"), 0)) == 1)
     print(
