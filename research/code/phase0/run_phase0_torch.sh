@@ -24,7 +24,7 @@ WORKER_NAME=${WORKER_NAME:-$(hostname -s)}
 NODE_RANK=${NODE_RANK:-$(infer_node_rank "${WORKER_NAME}")}
 LOG_ROOT=${LOG_ROOT:-/mnt/nfs_share/cts_experiments/${RUN_ID}/${WORKER_NAME}}
 TARGET_SCRIPT=${TARGET_SCRIPT:-research/code/phase0/ring_allreduce_loop.py}
-TORCH_ENV=${TORCH_ENV:-/workspace/venvs/torch-cu121-custom/bin/activate}
+TORCH_ENV=${TORCH_ENV:-/workspace/venvs/torch-cu132-custom/bin/activate}
 
 mkdir -p "${LOG_ROOT}"
 

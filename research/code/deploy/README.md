@@ -1,12 +1,12 @@
 # Docker Deployment Scripts
 
-This directory packages a CUDA 12.1 development container for the custom NCCL
+This directory packages a CUDA 13.2 development container for the custom NCCL
 workflow discussed in `research/docs`.
 
 ## Files
 
 - `Dockerfile`
-  - CUDA 12.1 devel image with RDMA, OpenMPI, Python, and build dependencies.
+  - CUDA 13.2 cuDNN devel image with RDMA, OpenMPI, Python, and build dependencies.
 - `build_image.sh`
   - Builds the dev image with the current host UID/GID mapped into the image.
 - `run_dev_container.sh`
@@ -51,6 +51,6 @@ Or all at once:
 - `run_dev_container.sh` defaults to `NCCL_NET_GDR_LEVEL=0` because the target
   setup discussed so far is a RoCE v2 environment where GPUDirect RDMA may be
   unavailable.
-- The default PyTorch build target assumes GTX 1080 Ti, so
-  `TORCH_CUDA_ARCH_LIST=6.1` and
-  `NVCC_GENCODE=-gencode=arch=compute_61,code=sm_61`.
+- The default PyTorch build target assumes RTX 5070 Ti, so
+  `TORCH_CUDA_ARCH_LIST=12.0` and
+  `NVCC_GENCODE=-gencode=arch=compute_120,code=sm_120`.

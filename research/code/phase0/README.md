@@ -74,7 +74,7 @@ This writes:
 If you want a real model path after the all-reduce loop is stable:
 
 ```bash
-source /workspace/venvs/torch-cu121-custom/bin/activate
+source /workspace/venvs/torch-cu132-custom/bin/activate
 NCCL_ALGO=Ring NCCL_PROTO=Simple \
 NCCL_PHASE0_LOG=1 NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=NET \
 NCCL_DEBUG_FILE=/mnt/nfs_share/cts_experiments/${RUN_ID}/workerXX/nccl-phase0.%h.%p.log \

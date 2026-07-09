@@ -19,7 +19,7 @@
     "master_addr": "172.16.0.101",
     "master_port": 40000,
     "network_topology_file": "research/env/network_topology_internal_ips.txt",
-    "torch_env": "/workspace/venvs/torch-cu121-custom/bin/activate",
+    "torch_env": "/workspace/venvs/torch-cu132-custom/bin/activate",
     "target_script": "research/code/phase2/collective_b2.py",
     "execution_model": "master_orchestrated_single_port",
     "ssh_user_resolution": {
@@ -47,7 +47,7 @@
     },
     "container_model": {
       "helper_script": "research/code/deploy/run_dev_container.sh",
-      "container_name": "nccl-cu121-dev",
+      "container_name": "nccl-cu132-dev",
       "reset_at_matrix_start": true,
       "reset_per_experiment": false,
       "restart_on_failure": true

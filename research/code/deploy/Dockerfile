@@ -1,4 +1,5 @@
-FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
+ARG CUDA_IMAGE=nvidia/cuda:13.2.0-cudnn-devel-ubuntu22.04
+FROM ${CUDA_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG HOST_UID=1000
@@ -59,7 +60,7 @@ RUN groupadd --gid "${HOST_GID}" "${HOST_USER}" \
 ENV CUDA_HOME=/usr/local/cuda
 ENV PATH=/usr/local/cuda/bin:${PATH}
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH}
-ENV TORCH_CUDA_ARCH_LIST=6.1
+ENV TORCH_CUDA_ARCH_LIST=12.0
 ENV WORKSPACE_ROOT=/workspace
 
 USER ${HOST_USER}

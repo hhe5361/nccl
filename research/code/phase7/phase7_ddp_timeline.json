@@ -21,7 +21,7 @@
     "warmup_steps": 10,
     "mode_timeout_sec": 900,
     "mode_delay_sec": 0,
-    "torch_env": "/workspace/venvs/torch-cu121-custom/bin/activate",
+    "torch_env": "/workspace/venvs/torch-cu132-custom/bin/activate",
     "target_script": "research/code/phase7/ddp_phase7_timeline.py",
     "worker_script": "research/code/phase4/run_b4_mode_worker.sh",
     "compare_script": "research/code/phase4/compare_b4_vs_stock.py",
@@ -37,7 +37,7 @@
     "network_topology_file": "research/env/network_topology_internal_ips.txt"
   },
   "container": {
-    "name": "nccl-cu121-dev",
+    "name": "nccl-cu132-dev",
     "reset_at_start": 1,
     "restart_on_failure": 1
   },

@@ -9,14 +9,14 @@ CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 NCCL_HOME=${NCCL_HOME:-${REPO_ROOT}/build}
 NCCL_TESTS_DIR=${NCCL_TESTS_DIR:-${WORKSPACE_ROOT}/nccl-tests}
 PYTORCH_DIR=${PYTORCH_DIR:-${WORKSPACE_ROOT}/pytorch}
-PYTORCH_REF=${PYTORCH_REF:-v2.4.1}
-VENV_DIR=${VENV_DIR:-${WORKSPACE_ROOT}/venvs/torch-cu121-custom}
+PYTORCH_REF=${PYTORCH_REF:-main}
+VENV_DIR=${VENV_DIR:-${WORKSPACE_ROOT}/venvs/torch-cu132-custom}
 DEFAULT_MAX_JOBS=$(nproc)
 if [[ "${DEFAULT_MAX_JOBS}" -gt 4 ]]; then
   DEFAULT_MAX_JOBS=4
 fi
 MAX_JOBS=${MAX_JOBS:-${DEFAULT_MAX_JOBS}}
-NVCC_GENCODE_DEFAULT="-gencode=arch=compute_61,code=sm_61"
+NVCC_GENCODE_DEFAULT="-gencode=arch=compute_120,code=sm_120"
 NVCC_GENCODE=${NVCC_GENCODE:-${NVCC_GENCODE_DEFAULT}}
 MPI_HOME=${MPI_HOME:-}
 if [[ -z "${MPI_HOME}" ]]; then
@@ -39,7 +39,7 @@ fi
 export CUDA_HOME
 export PATH="${CUDA_HOME}/bin:${PATH}"
 export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${NCCL_HOME}/lib:${LD_LIBRARY_PATH:-}"
-export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-6.1}
+export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-12.0}
 export MAX_JOBS
 
 usage() {

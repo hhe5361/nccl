@@ -13,7 +13,7 @@ STEPS=${STEPS:-10}
 WARMUP_STEPS=${WARMUP_STEPS:-2}
 MODE_TIMEOUT_SEC=${MODE_TIMEOUT_SEC:-300}
 RUN_MODES=${RUN_MODES:-stock,stock_2,phase4}
-TORCH_ENV=${TORCH_ENV:-/workspace/venvs/torch-cu121-custom/bin/activate}
+TORCH_ENV=${TORCH_ENV:-/workspace/venvs/torch-cu132-custom/bin/activate}
 
 mkdir -p "${MATRIX_ROOT}"
 
